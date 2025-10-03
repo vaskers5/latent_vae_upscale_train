@@ -9,6 +9,7 @@ import gc
 from datetime import datetime
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import torchvision.transforms as transforms
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
@@ -42,7 +43,7 @@ save_model         = True
 use_decay          = True
 optimizer_type     = "adam8bit"
 dtype              = torch.bfloat16  # torch.float32, torch.float16, torch.bfloat16
-
+GLOBAL_SAMPLE_INTERVAL = 50
 model_resolution   = 256
 high_resolution    = 512
 limit              = 0
@@ -53,7 +54,7 @@ beta2              = 0.97
 eps                = 1e-6
 clip_grad_norm     = 1.0
 mixed_precision    = "no"
-gradient_accumulation_steps = 8
+gradient_accumulation_steps = 4
 generated_folder   = "samples"
 save_as            = "simple_vae2x_nightly"
 num_workers        = 0
@@ -309,6 +310,7 @@ optimizer = create_optimizer(optimizer_type, param_groups)
 batches_per_epoch = len(dataloader)
 steps_per_epoch = int(math.ceil(batches_per_epoch / float(gradient_accumulation_steps)))
 total_steps = steps_per_epoch * num_epochs
+print(f"[INFO] {batches_per_epoch} batches per epoch, {steps_per_epoch} optimizer steps per epoch, {total_steps} total steps sample interval {total_steps // sample_interval_share}")
 
 def lr_lambda(step):
     if not use_decay:
@@ -404,16 +406,22 @@ def _to_pil_uint8(img_tensor: torch.Tensor) -> Image.Image:
 
 @profile
 @torch.no_grad()
+@profile
+@torch.no_grad()
 def generate_and_save_samples(step=None):
     try:
         temp_vae = accelerator.unwrap_model(vae).eval()
         with torch.no_grad():
             orig_high = fixed_samples
-            orig_low = F.interpolate(orig_high, size=(model_resolution, model_resolution), mode="bilinear", align_corners=False)
+            orig_low = F.interpolate(
+                orig_high,
+                size=(model_resolution, model_resolution),
+                mode="bilinear",
+                align_corners=False
+            )
             model_dtype = next(temp_vae.parameters()).dtype
             orig_low = orig_low.to(dtype=model_dtype)
 
-            # QWEN: добавляем T=1 на encode/decode и снимаем при сравнении
             if is_video_vae(temp_vae):
                 x_in = orig_low.unsqueeze(2)           # [B,3,1,H,W]
                 enc = temp_vae.encode(x_in)
@@ -426,36 +434,68 @@ def generate_and_save_samples(step=None):
                 rec = temp_vae.decode(latents_mean).sample
 
         if rec.shape[-2:] != orig_high.shape[-2:]:
-            rec = F.interpolate(rec, size=orig_high.shape[-2:], mode="bilinear", align_corners=False)
+            rec = F.interpolate(
+                rec, size=orig_high.shape[-2:], 
+                mode="bilinear", align_corners=False
+            )
 
+        # Сохраняем первые две для quick-check
         first_real = _to_pil_uint8(orig_high[0])
         first_dec  = _to_pil_uint8(rec[0])
         first_real.save(f"{generated_folder}/sample_real.jpg", quality=95)
         first_dec.save(f"{generated_folder}/sample_decoded.jpg", quality=95)
 
+        # Сохраняем все по отдельности (как раньше)
         for i in range(rec.shape[0]):
             _to_pil_uint8(rec[i]).save(f"{generated_folder}/sample_{i}.jpg", quality=95)
 
+        # === NEW: создаём парный грид (real vs decoded) ===
+        n = rec.shape[0]
+        fig, axes = plt.subplots(2, n, figsize=(n * 2.5, 6))  # 2 строки (real/decoded)
+        
+        if n == 1:
+            axes = np.array([[axes[0]], [axes[1]]])  # фиксим для случая batch_size=1
+
+        for idx in range(n):
+            real_img = _to_pil_uint8(orig_high[idx])
+            rec_img  = _to_pil_uint8(rec[idx])
+
+            axes[0, idx].imshow(real_img)
+            axes[0, idx].axis("off")
+            axes[0, idx].set_title(f"Real {idx}")
+
+            axes[1, idx].imshow(rec_img)
+            axes[1, idx].axis("off")
+            axes[1, idx].set_title(f"Decoded {idx}")
+
+        plt.tight_layout()
+        fig.savefig(f"{generated_folder}/samples_pairs.jpg", dpi=150)
+        plt.close(fig)
+
+        # === LPIPS ===
         lpips_scores = []
         for i in range(rec.shape[0]):
             orig_full = orig_high[i:i+1].to(torch.float32)
             rec_full  = rec[i:i+1].to(torch.float32)
             if rec_full.shape[-2:] != orig_full.shape[-2:]:
-                rec_full = F.interpolate(rec_full, size=orig_full.shape[-2:], mode="bilinear", align_corners=False)
+                rec_full = F.interpolate(
+                    rec_full, size=orig_full.shape[-2:], 
+                    mode="bilinear", align_corners=False
+                )
             lpips_val = compute_lpips_loss(rec_full, orig_full).mean().item()
             lpips_scores.append(lpips_val)
         avg_lpips = float(np.mean(lpips_scores))
 
         if use_wandb and accelerator.is_main_process:
             wandb.log({"lpips_mean": avg_lpips}, step=step)
-            # ⬇️ логируем картинки в wandb (только первые две для компактности)
             wandb.log({
-                "sample/real": wandb.Image(first_real, caption="real"),
-                "sample/decoded": wandb.Image(first_dec, caption="decoded"),
+                "samples/pairs": wandb.Image(f"{generated_folder}/samples_pairs.jpg", caption=f"{n} pairs (real vs decoded)")
             }, step=step)
+
     finally:
         gc.collect()
         torch.cuda.empty_cache()
+
 
 if accelerator.is_main_process and save_model:
     print("Генерация сэмплов до старта обучения...")
@@ -469,7 +509,7 @@ def run_training():
     progress = tqdm(total=total_steps, disable=not accelerator.is_local_main_process)
     global_step = 0
     min_loss = float("inf")
-    sample_interval = max(1, total_steps // max(1, sample_interval_share * num_epochs))
+    sample_interval = GLOBAL_SAMPLE_INTERVAL
 
     for epoch in range(num_epochs):
         vae.train()
