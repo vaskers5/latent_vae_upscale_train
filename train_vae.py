@@ -23,23 +23,25 @@ from PIL import Image, UnidentifiedImageError
 from tqdm import tqdm
 import bitsandbytes as bnb
 import wandb
-import lpips   # pip install lpips
+import lpips
 from collections import deque
-from pytorch_memlab import MemReporter
+from contextlib import nullcontext
+from pytorch_memlab import profile
+
 
 # --------------------------- Параметры ---------------------------
 ds_path            = "./workspace/d23/d23/ae3/"
 project            = "simple_vae2x"
-batch_size         = 2
+batch_size         = 12
 base_learning_rate = 6e-6
 min_learning_rate  = 9e-7
-num_epochs         = 1000
+num_epochs         = 500
 sample_interval_share = 50
 use_wandb          = True
 save_model         = True
 use_decay          = True
 optimizer_type     = "adam8bit"
-dtype              = torch.float32
+dtype              = torch.bfloat16  # torch.float32, torch.float16, torch.bfloat16
 
 model_resolution   = 256
 high_resolution    = 512
@@ -56,11 +58,6 @@ generated_folder   = "samples"
 save_as            = "simple_vae2x_nightly"
 num_workers        = 0
 device = None
-
-# Мемпрофайлинг (pytorch_memlab)
-use_memlab_profiler     = False
-memlab_report_interval  = 100  # шагов между отчётами; 0 чтобы отключить автоматическое log'ирование
-memlab_report_on_sample = True
 
 # --- Режимы обучения ---
 # QWEN: учим только декодер
@@ -114,24 +111,6 @@ if use_wandb and accelerator.is_main_process:
         "kl_ratio": kl_ratio,
         "vae_kind": vae_kind,
     })
-
-def _init_memlab_reporter(model):
-    if not use_memlab_profiler:
-        return None
-    if MemReporter is None:
-        if accelerator.is_main_process:
-            print('[MEMLAB] pytorch_memlab is not installed; disable use_memlab_profiler to silence this message')
-        return None
-    try:
-        core_model = accelerator.unwrap_model(model) if hasattr(accelerator, 'unwrap_model') else model
-        reporter = MemReporter(core_model)
-        if accelerator.is_main_process:
-            print('[MEMLAB] MemReporter initialised')
-        return reporter
-    except Exception as exc:
-        if accelerator.is_main_process:
-            print(f'[MEMLAB] Failed to initialise reporter: {exc}')
-        return None
 
 # --------------------------- VAE ---------------------------
 def get_core_model(model):
@@ -348,10 +327,6 @@ scheduler = LambdaLR(optimizer, lr_lambda)
 dataloader, vae, optimizer, scheduler = accelerator.prepare(dataloader, vae, optimizer, scheduler)
 trainable_params = [p for p in vae.parameters() if p.requires_grad]
 
-memlab_reporter = _init_memlab_reporter(vae)
-if accelerator.is_main_process and memlab_reporter is not None:
-    _memlab_report(memlab_reporter, 'Initial state')
-
 # --------------------------- LPIPS и вспомогательные ---------------------------
 _lpips_net = None
 def _get_lpips():
@@ -378,17 +353,6 @@ def compute_lpips_loss(pred, target):
     pred_ds, target_ds = _prepare_for_lpips(pred, target)
     return _get_lpips()(pred_ds, target_ds)
 
-
-def _memlab_report(reporter, tag):
-    if reporter is None:
-        return
-    try:
-        print(f"\n[MEMLAB] {tag}")
-        reporter.report()
-        reporter.reset()
-        print("[MEMLAB] -----------------------------\n")
-    except Exception as exc:
-        print(f"[MEMLAB] report failed: {exc}")
 
 _sobel_kx = torch.tensor([[[[-1,0,1],[-2,0,2],[-1,0,1]]]], dtype=torch.float32)
 _sobel_ky = torch.tensor([[[[-1,-2,-1],[0,0,0],[1,2,1]]]], dtype=torch.float32)
@@ -438,6 +402,7 @@ def _to_pil_uint8(img_tensor: torch.Tensor) -> Image.Image:
     arr = ((img_tensor.float().clamp(-1, 1) + 1.0) * 127.5).clamp(0, 255).byte().cpu().numpy().transpose(1, 2, 0)
     return Image.fromarray(arr)
 
+@profile
 @torch.no_grad()
 def generate_and_save_samples(step=None):
     try:
@@ -483,11 +448,14 @@ def generate_and_save_samples(step=None):
 
         if use_wandb and accelerator.is_main_process:
             wandb.log({"lpips_mean": avg_lpips}, step=step)
+            # ⬇️ логируем картинки в wandb (только первые две для компактности)
+            wandb.log({
+                "sample/real": wandb.Image(first_real, caption="real"),
+                "sample/decoded": wandb.Image(first_dec, caption="decoded"),
+            }, step=step)
     finally:
         gc.collect()
         torch.cuda.empty_cache()
-        if accelerator.is_main_process and memlab_report_on_sample:
-            _memlab_report(memlab_reporter, f'Sample generation (step={step})')
 
 if accelerator.is_main_process and save_model:
     print("Генерация сэмплов до старта обучения...")
@@ -496,137 +464,148 @@ if accelerator.is_main_process and save_model:
 accelerator.wait_for_everyone()
 
 # --------------------------- Тренировка ---------------------------
-progress = tqdm(total=total_steps, disable=not accelerator.is_local_main_process)
-global_step = 0
-min_loss = float("inf")
-sample_interval = max(1, total_steps // max(1, sample_interval_share * num_epochs))
+@profile
+def run_training():
+    progress = tqdm(total=total_steps, disable=not accelerator.is_local_main_process)
+    global_step = 0
+    min_loss = float("inf")
+    sample_interval = max(1, total_steps // max(1, sample_interval_share * num_epochs))
 
-for epoch in range(num_epochs):
-    vae.train()
-    batch_losses, batch_grads = [], []
-    track_losses = {k: [] for k in loss_ratios.keys()}
+    for epoch in range(num_epochs):
+        vae.train()
+        batch_losses, batch_grads = [], []
+        track_losses = {k: [] for k in loss_ratios.keys()}
 
-    for imgs in dataloader:
-        with accelerator.accumulate(vae):
-            imgs = imgs.to(accelerator.device)
+        for imgs in dataloader:
+            with accelerator.accumulate(vae):
+                imgs = imgs.to(accelerator.device)
 
-            if high_resolution != model_resolution:
-                imgs_low = F.interpolate(imgs, size=(model_resolution, model_resolution), mode="bilinear", align_corners=False)
-            else:
-                imgs_low = imgs
+                if high_resolution != model_resolution:
+                    imgs_low = F.interpolate(imgs, size=(model_resolution, model_resolution), mode="bilinear", align_corners=False)
+                else:
+                    imgs_low = imgs
 
-            model_dtype = next(vae.parameters()).dtype
-            imgs_low_model = imgs_low.to(dtype=model_dtype) if imgs_low.dtype != model_dtype else imgs_low
+                model_dtype = next(vae.parameters()).dtype
+                imgs_low_model = imgs_low.to(dtype=model_dtype) if imgs_low.dtype != model_dtype else imgs_low
 
-            # QWEN: encode/decode с T=1
-            if is_video_vae(vae):
-                x_in = imgs_low_model.unsqueeze(2)             # [B,3,1,H,W]
-                enc = vae.encode(x_in)
-                latents = enc.latent_dist.mean if train_decoder_only else enc.latent_dist.sample()
-                dec = vae.decode(latents).sample               # [B,3,1,H,W]
-                rec = dec.squeeze(2)                           # [B,3,H,W]
-            else:
-                enc = vae.encode(imgs_low_model)
-                latents = enc.latent_dist.mean if train_decoder_only else enc.latent_dist.sample()
-                rec = vae.decode(latents).sample
+                encode_input = imgs_low_model.unsqueeze(2) if is_video_vae(vae) else imgs_low_model
+                encode_ctx = torch.no_grad() if train_decoder_only else nullcontext()
+                with encode_ctx:
+                    enc = vae.encode(encode_input)
+                latents_dist = enc.latent_dist
+                latents = latents_dist.mean if train_decoder_only else latents_dist.sample()
+                if train_decoder_only:
+                    latents = latents.detach()
 
-            if rec.shape[-2:] != imgs.shape[-2:]:
-                rec = F.interpolate(rec, size=imgs.shape[-2:], mode="bilinear", align_corners=False)
+                if is_video_vae(vae):
+                    dec = vae.decode(latents).sample
+                    rec = dec.squeeze(2)
+                else:
+                    rec = vae.decode(latents).sample
 
-            rec_f32 = rec.to(torch.float32)
-            imgs_f32 = imgs.to(torch.float32)
+                if train_decoder_only:
+                    del enc
 
-            lpips_loss = compute_lpips_loss(rec_f32, imgs_f32).mean()
-            abs_losses = {
-                "mae":   F.l1_loss(rec_f32, imgs_f32),
-                "mse":   F.mse_loss(rec_f32, imgs_f32),
-                "lpips": lpips_loss,
-                "edge":  F.l1_loss(sobel_edges(rec_f32), sobel_edges(imgs_f32)),
-            }
+                if rec.shape[-2:] != imgs.shape[-2:]:
+                    rec = F.interpolate(rec, size=imgs.shape[-2:], mode="bilinear", align_corners=False)
 
-            if full_training and not train_decoder_only:
-                mean   = enc.latent_dist.mean
-                logvar = enc.latent_dist.logvar
-                kl = -0.5 * torch.mean(1 + logvar - mean.pow(2) - logvar.exp())
-                abs_losses["kl"] = kl
-            else:
-                abs_losses["kl"] = torch.tensor(0.0, device=accelerator.device, dtype=torch.float32)
+                rec_f32 = rec.to(torch.float32)
+                imgs_f32 = imgs.to(torch.float32)
 
-            total_loss, coeffs, meds = normalizer.update_and_total(abs_losses)
+                lpips_loss = compute_lpips_loss(rec_f32, imgs_f32).mean()
+                abs_losses = {
+                    "mae":   F.l1_loss(rec_f32, imgs_f32),
+                    "mse":   F.mse_loss(rec_f32, imgs_f32),
+                    "lpips": lpips_loss,
+                    "edge":  F.l1_loss(sobel_edges(rec_f32), sobel_edges(imgs_f32)),
+                }
 
-            if torch.isnan(total_loss) or torch.isinf(total_loss):
-                raise RuntimeError("NaN/Inf loss")
+                if full_training and not train_decoder_only:
+                    mean = enc.latent_dist.mean
+                    logvar = enc.latent_dist.logvar
+                    kl = -0.5 * torch.mean(1 + logvar - mean.pow(2) - logvar.exp())
+                    abs_losses["kl"] = kl
+                else:
+                    abs_losses["kl"] = torch.tensor(0.0, device=accelerator.device, dtype=torch.float32)
 
-            accelerator.backward(total_loss)
+                total_loss, coeffs, meds = normalizer.update_and_total(abs_losses)
 
-            grad_norm = torch.tensor(0.0, device=accelerator.device)
-            if accelerator.sync_gradients:
-                grad_norm = accelerator.clip_grad_norm_(trainable_params, clip_grad_norm)
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
-                global_step += 1
-                progress.update(1)
-                if (memlab_report_interval and memlab_report_interval > 0 and
-                        memlab_reporter is not None and accelerator.is_main_process and
-                        global_step % memlab_report_interval == 0):
-                    _memlab_report(memlab_reporter, f'Train step {global_step}')
+                if torch.isnan(total_loss) or torch.isinf(total_loss):
+                    raise RuntimeError("NaN/Inf loss")
 
-            if accelerator.is_main_process:
-                try:
-                    current_lr = optimizer.param_groups[0]["lr"]
-                except Exception:
-                    current_lr = scheduler.get_last_lr()[0]
+                accelerator.backward(total_loss)
 
-                batch_losses.append(total_loss.detach().item())
-                batch_grads.append(float(grad_norm.detach().cpu().item()) if isinstance(grad_norm, torch.Tensor) else float(grad_norm))
-                for k, v in abs_losses.items():
-                    track_losses[k].append(float(v.detach().item()))
+                grad_norm = torch.tensor(0.0, device=accelerator.device)
+                if accelerator.sync_gradients:
+                    grad_norm = accelerator.clip_grad_norm_(trainable_params, clip_grad_norm)
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    global_step += 1
+                    progress.update(1)
 
-                if use_wandb and accelerator.sync_gradients:
-                    log_dict = {
-                        "total_loss": float(total_loss.detach().item()),
-                        "learning_rate": current_lr,
-                        "epoch": epoch,
-                        "grad_norm": batch_grads[-1],
-                    }
+                if accelerator.is_main_process:
+                    try:
+                        current_lr = optimizer.param_groups[0]["lr"]
+                    except Exception:
+                        current_lr = scheduler.get_last_lr()[0]
+
+                    batch_losses.append(total_loss.detach().item())
+                    batch_grads.append(float(grad_norm.detach().cpu().item()) if isinstance(grad_norm, torch.Tensor) else float(grad_norm))
                     for k, v in abs_losses.items():
-                        log_dict[f"loss_{k}"] = float(v.detach().item())
-                    for k in coeffs:
-                        log_dict[f"coeff_{k}"] = float(coeffs[k])
-                        log_dict[f"median_{k}"] = float(meds[k])
-                    wandb.log(log_dict, step=global_step)
+                        track_losses[k].append(float(v.detach().item()))
 
-            if global_step > 0 and global_step % sample_interval == 0:
-                if accelerator.is_main_process:
-                    generate_and_save_samples(global_step)
-                accelerator.wait_for_everyone()
+                    if use_wandb and accelerator.sync_gradients:
+                        log_dict = {
+                            "total_loss": float(total_loss.detach().item()),
+                            "learning_rate": current_lr,
+                            "epoch": epoch,
+                            "grad_norm": batch_grads[-1],
+                        }
+                        for k, v in abs_losses.items():
+                            log_dict[f"loss_{k}"] = float(v.detach().item())
+                        for k in coeffs:
+                            log_dict[f"coeff_{k}"] = float(coeffs[k])
+                            log_dict[f"median_{k}"] = float(meds[k])
+                        wandb.log(log_dict, step=global_step)
 
-                n_micro = sample_interval * gradient_accumulation_steps
-                avg_loss = float(np.mean(batch_losses[-n_micro:])) if len(batch_losses) >= n_micro else float(np.mean(batch_losses)) if batch_losses else float("nan")
-                avg_grad = float(np.mean(batch_grads[-n_micro:])) if len(batch_grads) >= 1 else float(np.mean(batch_grads)) if batch_grads else 0.0
+                if global_step > 0 and global_step % sample_interval == 0:
+                    if accelerator.is_main_process:
+                        generate_and_save_samples(global_step)
+                    accelerator.wait_for_everyone()
 
-                if accelerator.is_main_process:
-                    print(f"Epoch {epoch} step {global_step} loss: {avg_loss:.6f}, grad_norm: {avg_grad:.6f}, lr: {current_lr:.9f}")
-                    if save_model and avg_loss < min_loss * save_barrier:
-                        min_loss = avg_loss
-                        accelerator.unwrap_model(vae).save_pretrained(save_as)
-                    if use_wandb:
-                        wandb.log({"interm_loss": avg_loss, "interm_grad": avg_grad}, step=global_step)
+                    n_micro = sample_interval * gradient_accumulation_steps
+                    if batch_losses:
+                        avg_loss = float(np.mean(batch_losses[-n_micro:])) if len(batch_losses) >= n_micro else float(np.mean(batch_losses))
+                    else:
+                        avg_loss = float("nan")
+                    if batch_grads:
+                        avg_grad = float(np.mean(batch_grads[-n_micro:])) if len(batch_grads) >= 1 else float(np.mean(batch_grads))
+                    else:
+                        avg_grad = 0.0
+
+                    if accelerator.is_main_process:
+                        print(f"Epoch {epoch} step {global_step} loss: {avg_loss:.6f}, grad_norm: {avg_grad:.6f}, lr: {current_lr:.9f}")
+                        if save_model and avg_loss < min_loss * save_barrier:
+                            min_loss = avg_loss
+                            accelerator.unwrap_model(vae).save_pretrained(save_as)
+                        if use_wandb:
+                            wandb.log({"interm_loss": avg_loss, "interm_grad": avg_grad}, step=global_step)
+
+        if accelerator.is_main_process:
+            epoch_avg = float(np.mean(batch_losses)) if batch_losses else float("nan")
+            print(f"Epoch {epoch} done, avg loss {epoch_avg:.6f}")
+            if use_wandb:
+                wandb.log({"epoch_loss": epoch_avg, "epoch": epoch + 1}, step=global_step)
 
     if accelerator.is_main_process:
-        epoch_avg = float(np.mean(batch_losses)) if batch_losses else float("nan")
-        print(f"Epoch {epoch} done, avg loss {epoch_avg:.6f}")
-        if use_wandb:
-            wandb.log({"epoch_loss": epoch_avg, "epoch": epoch + 1}, step=global_step)
+        print("Training finished – saving final model")
+        if save_model:
+            accelerator.unwrap_model(vae).save_pretrained(save_as)
 
-# --------------------------- Финальное сохранение ---------------------------
-if accelerator.is_main_process:
-    print("Training finished – saving final model")
-    if save_model:
-        accelerator.unwrap_model(vae).save_pretrained(save_as)
+    accelerator.free_memory()
+    if torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
+    print("Готово!")
 
-accelerator.free_memory()
-if torch.distributed.is_initialized():
-    torch.distributed.destroy_process_group()
-print("Готово!")
+run_training()
