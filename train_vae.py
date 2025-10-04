@@ -31,18 +31,18 @@ from pytorch_memlab import profile
 
 
 # --------------------------- Параметры ---------------------------
-ds_path            = "./workspace/d23/d23/ae3/"
-project            = "simple_vae2x"
-batch_size         = 12
+ds_path            = "./workspace/d23/d23/"
+project            = "simple_vae2x_1024"
+batch_size         = 6
 base_learning_rate = 6e-6
 min_learning_rate  = 9e-7
-num_epochs         = 500
-sample_interval_share = 50
+num_epochs         = 1000
+sample_interval_share = 200
 use_wandb          = True
 save_model         = True
 use_decay          = True
 optimizer_type     = "adam8bit"
-dtype              = torch.bfloat16  # torch.float32, torch.float16, torch.bfloat16
+dtype              = torch.float32  # torch.float32, torch.float16, torch.bfloat16
 GLOBAL_SAMPLE_INTERVAL = 50
 model_resolution   = 256
 high_resolution    = 512
