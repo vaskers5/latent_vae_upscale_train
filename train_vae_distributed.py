@@ -29,21 +29,23 @@ import lpips
 from collections import deque
 from contextlib import nullcontext
 
-
+"""
+accelerate launch   --mixed_precision "no"   --num_processes 6   --gpu_ids "0,1,2,3,4,5"   --main_process_port 29500   train_vae_distributed.py
+"""
 # --------------------------- Параметры ---------------------------
-ds_path            = "./workspace/d23/d23/ae3/"
+ds_path            = "./workspace/d23/d23"
 project            = "simple_vae2x"
-batch_size         = 12
+batch_size         = 8
 base_learning_rate = 6e-6
 min_learning_rate  = 9e-7
-num_epochs         = 500
+num_epochs         = 50
 sample_interval_share = 50
 use_wandb          = True
 save_model         = True
 use_decay          = True
 optimizer_type     = "adam8bit"
-dtype              = torch.bfloat16  # torch.float32, torch.float16, torch.bfloat16
-GLOBAL_SAMPLE_INTERVAL = 50
+dtype              = torch.float32  # torch.float32, torch.float16, torch.bfloat16
+GLOBAL_SAMPLE_INTERVAL = 100
 GLOBAL_SAVE_INTERVAL = 500
 model_resolution   = 256
 high_resolution    = 512
@@ -165,43 +167,6 @@ else:
 
 vae = vae.to(dtype)
 
-# # torch.compile (опционально)
-# if hasattr(torch, "compile"):
-#     try:
-#         vae = torch.compile(vae)
-#     except Exception as e:
-#         print(f"[WARN] torch.compile failed: {e}")
-
-# --------------------------- Freeze/Unfreeze ---------------------------
-core = get_core_model(vae)
-
-for p in core.parameters():
-    p.requires_grad = False
-
-unfrozen_param_names = []
-
-if full_training and not train_decoder_only:
-    for name, p in core.named_parameters():
-        p.requires_grad = True
-        unfrozen_param_names.append(name)
-        loss_ratios["kl"] = float(kl_ratio)
-        trainable_module = core
-else:
-# учим только декодер + post_quant_conv на "ядре" модели
-    if hasattr(core, "decoder"):
-        for name, p in core.decoder.named_parameters():
-            p.requires_grad = True
-            unfrozen_param_names.append(f"decoder.{name}")
-    if hasattr(core, "post_quant_conv"):
-        for name, p in core.post_quant_conv.named_parameters():
-            p.requires_grad = True
-            unfrozen_param_names.append(f"post_quant_conv.{name}")
-            trainable_module = core.decoder if hasattr(core, "decoder") else core
-
-print(f"[INFO] Разморожено параметров: {len(unfrozen_param_names)}. Первые 200 имён:")
-for nm in unfrozen_param_names[:200]:
-    print(" ", nm)
-
 # --------------------------- Датасет ---------------------------
 class PngFolderDataset(Dataset):
     def __init__(self, root_dir, min_exts=('.png',), resolution=1024, limit=0):
@@ -316,9 +281,6 @@ def create_optimizer(name, param_groups):
         return bnb.optim.AdamW8bit(param_groups, lr=base_learning_rate, betas=(0.9, beta2), eps=eps)
     raise ValueError(name)
 
-param_groups = get_param_groups(get_core_model(vae), weight_decay=0.001)
-optimizer = create_optimizer(optimizer_type, param_groups)
-
 # --------------------------- LR schedule ---------------------------
 batches_per_epoch = len(dataloader)
 steps_per_epoch = int(math.ceil(batches_per_epoch / float(gradient_accumulation_steps)))
@@ -336,10 +298,55 @@ def lr_lambda(step):
     decay_ratio = (x - warmup) / (1.0 - warmup)
     return min_ratio + 0.5 * (1.0 - min_ratio) * (1.0 + math.cos(math.pi * decay_ratio))
 
+# --------------------------- Подготовка ---------------------------
+
+# Freeze/Unfreeze нужно делать до создания оптимизатора, но после получения "ядра" модели
+core = get_core_model(vae)
+
+for p in core.parameters():
+    p.requires_grad = False
+
+unfrozen_param_names = []
+
+if full_training and not train_decoder_only:
+    for name, p in core.named_parameters():
+        p.requires_grad = True
+        unfrozen_param_names.append(name)
+        loss_ratios["kl"] = float(kl_ratio)
+        trainable_module = core
+else:
+    # учим только декодер + post_quant_conv на "ядре" модели
+    if hasattr(core, "decoder"):
+        for name, p in core.decoder.named_parameters():
+            p.requires_grad = True
+            unfrozen_param_names.append(f"decoder.{name}")
+    if hasattr(core, "post_quant_conv"):
+        for name, p in core.post_quant_conv.named_parameters():
+            p.requires_grad = True
+            unfrozen_param_names.append(f"post_quant_conv.{name}")
+            trainable_module = core.decoder if hasattr(core, "decoder") else core
+
+print(f"[INFO] Разморожено параметров: {len(unfrozen_param_names)}. Первые 200 имён:")
+for nm in unfrozen_param_names[:200]:
+    print(" ", nm)
+    
+param_groups = get_param_groups(core, weight_decay=0.001)
+optimizer = create_optimizer(optimizer_type, param_groups)
 scheduler = LambdaLR(optimizer, lr_lambda)
 
-# Подготовка
+# Подготовка Accelerate
 dataloader, vae, optimizer, scheduler = accelerator.prepare(dataloader, vae, optimizer, scheduler)
+
+# >>>>>>>>>>>> ИЗМЕНЕНИЕ ЗДЕСЬ: КОМПИЛЯЦИЯ ПОСЛЕ PREPARE <<<<<<<<<<<<
+# torch.compile (опционально)
+if hasattr(torch, "compile"):
+    try:
+        vae = torch.compile(vae)
+        print("[INFO] Model compiled successfully after accelerate.prepare()")
+    except Exception as e:
+        print(f"[WARN] torch.compile failed: {e}")
+# >>>>>>>>>>>> КОНЕЦ ИЗМЕНЕНИЯ <<<<<<<<<<<<
+
 trainable_params = [p for p in vae.parameters() if p.requires_grad]
 
 # --------------------------- LPIPS и вспомогательные ---------------------------
