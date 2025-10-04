@@ -6,6 +6,7 @@ import torch
 import numpy as np
 import random
 import gc
+import shutil
 from datetime import datetime
 from pathlib import Path
 
@@ -32,18 +33,19 @@ from pytorch_memlab import profile
 
 # --------------------------- Параметры ---------------------------
 ds_path            = "./workspace/d23/d23/"
-project            = "simple_vae2x_1024"
+project            = "simple_vae2x"
 batch_size         = 6
 base_learning_rate = 6e-6
 min_learning_rate  = 9e-7
-num_epochs         = 1000
-sample_interval_share = 200
+num_epochs         = 50
+sample_interval_share = 1000
 use_wandb          = True
 save_model         = True
 use_decay          = True
 optimizer_type     = "adam8bit"
 dtype              = torch.float32  # torch.float32, torch.float16, torch.bfloat16
-GLOBAL_SAMPLE_INTERVAL = 50
+GLOBAL_SAMPLE_INTERVAL = 1000
+GLOBAL_SAVE_INTERVAL = 5000
 model_resolution   = 256
 high_resolution    = 512
 limit              = 0
@@ -55,8 +57,14 @@ eps                = 1e-6
 clip_grad_norm     = 1.0
 mixed_precision    = "no"
 gradient_accumulation_steps = 4
-generated_folder   = "samples"
-save_as            = "simple_vae2x_nightly"
+generated_folder_name = "samples"
+save_root_dir = Path("simple_vae2x_nightly")
+run_timestamp = datetime.now().strftime("%Y_%m_%d_%H")
+save_dir = save_root_dir / run_timestamp
+generated_folder = save_dir / generated_folder_name
+checkpoint_dir = save_dir / "checkpoints"
+best_checkpoint_dir = save_dir / "best"
+final_model_dir = save_dir / "final"
 num_workers        = 0
 device = None
 
@@ -84,7 +92,8 @@ resize_long_side = 1280  # ресайз длинной стороны исход
 # QWEN: конфиг загрузки модели
 vae_kind      = "kl"  # "qwen" или "kl" (обычный)
 
-Path(generated_folder).mkdir(parents=True, exist_ok=True)
+for directory in (save_root_dir, save_dir, generated_folder, checkpoint_dir, best_checkpoint_dir, final_model_dir):
+    directory.mkdir(parents=True, exist_ok=True)
 
 accelerator = Accelerator(
     mixed_precision=mixed_precision,
@@ -442,12 +451,15 @@ def generate_and_save_samples(step=None):
         # Сохраняем первые две для quick-check
         first_real = _to_pil_uint8(orig_high[0])
         first_dec  = _to_pil_uint8(rec[0])
-        first_real.save(f"{generated_folder}/sample_real.jpg", quality=95)
-        first_dec.save(f"{generated_folder}/sample_decoded.jpg", quality=95)
+        first_real_path = generated_folder / "sample_real.jpg"
+        first_dec_path = generated_folder / "sample_decoded.jpg"
+        first_real.save(first_real_path, quality=95)
+        first_dec.save(first_dec_path, quality=95)
 
         # Сохраняем все по отдельности (как раньше)
         for i in range(rec.shape[0]):
-            _to_pil_uint8(rec[i]).save(f"{generated_folder}/sample_{i}.jpg", quality=95)
+            sample_path = generated_folder / f"sample_{i}.jpg"
+            _to_pil_uint8(rec[i]).save(sample_path, quality=95)
 
         # === NEW: создаём парный грид (real vs decoded) ===
         n = rec.shape[0]
@@ -469,7 +481,8 @@ def generate_and_save_samples(step=None):
             axes[1, idx].set_title(f"Decoded {idx}")
 
         plt.tight_layout()
-        fig.savefig(f"{generated_folder}/samples_pairs.jpg", dpi=150)
+        pairs_path = generated_folder / "samples_pairs.jpg"
+        fig.savefig(pairs_path, dpi=150)
         plt.close(fig)
 
         # === LPIPS ===
@@ -489,7 +502,7 @@ def generate_and_save_samples(step=None):
         if use_wandb and accelerator.is_main_process:
             wandb.log({"lpips_mean": avg_lpips}, step=step)
             wandb.log({
-                "samples/pairs": wandb.Image(f"{generated_folder}/samples_pairs.jpg", caption=f"{n} pairs (real vs decoded)")
+                "samples/pairs": wandb.Image(str(pairs_path), caption=f"{n} pairs (real vs decoded)")
             }, step=step)
 
     finally:
@@ -508,8 +521,10 @@ accelerator.wait_for_everyone()
 def run_training():
     progress = tqdm(total=total_steps, disable=not accelerator.is_local_main_process)
     global_step = 0
-    min_loss = float("inf")
-    sample_interval = GLOBAL_SAMPLE_INTERVAL
+    best_loss = float("inf")
+    best_step = -1
+    sample_interval = max(1, GLOBAL_SAMPLE_INTERVAL)
+    save_interval = GLOBAL_SAVE_INTERVAL if GLOBAL_SAVE_INTERVAL and GLOBAL_SAVE_INTERVAL > 0 else None
 
     for epoch in range(num_epochs):
         vae.train()
@@ -609,6 +624,18 @@ def run_training():
                             log_dict[f"median_{k}"] = float(meds[k])
                         wandb.log(log_dict, step=global_step)
 
+                if (
+                    save_model
+                    and accelerator.is_main_process
+                    and save_interval
+                    and global_step > 0
+                    and global_step % save_interval == 0
+                ):
+                    ckpt_path = checkpoint_dir / f"step_{global_step:08d}"
+                    ckpt_path.mkdir(parents=True, exist_ok=True)
+                    accelerator.unwrap_model(vae).save_pretrained(str(ckpt_path))
+                    print(f"[CHECKPOINT] Saved periodic checkpoint at step {global_step} -> {ckpt_path}")
+
                 if global_step > 0 and global_step % sample_interval == 0:
                     if accelerator.is_main_process:
                         generate_and_save_samples(global_step)
@@ -626,9 +653,24 @@ def run_training():
 
                     if accelerator.is_main_process:
                         print(f"Epoch {epoch} step {global_step} loss: {avg_loss:.6f}, grad_norm: {avg_grad:.6f}, lr: {current_lr:.9f}")
-                        if save_model and avg_loss < min_loss * save_barrier:
-                            min_loss = avg_loss
-                            accelerator.unwrap_model(vae).save_pretrained(save_as)
+
+                        if (
+                            save_model
+                            and math.isfinite(avg_loss)
+                            and avg_loss < best_loss * save_barrier
+                        ):
+                            best_loss = avg_loss
+                            best_step = global_step
+                            if best_checkpoint_dir.exists():
+                                shutil.rmtree(best_checkpoint_dir)
+                            best_checkpoint_dir.mkdir(parents=True, exist_ok=True)
+                            accelerator.unwrap_model(vae).save_pretrained(str(best_checkpoint_dir))
+                            (best_checkpoint_dir / "best_summary.txt").write_text(
+                                f"step={best_step}\nloss={best_loss}\n",
+                                encoding="utf-8",
+                            )
+                            print(f"[CHECKPOINT] Saved new best checkpoint at step {best_step} (loss {best_loss:.6f})")
+
                         if use_wandb:
                             wandb.log({"interm_loss": avg_loss, "interm_grad": avg_grad}, step=global_step)
 
@@ -641,7 +683,10 @@ def run_training():
     if accelerator.is_main_process:
         print("Training finished – saving final model")
         if save_model:
-            accelerator.unwrap_model(vae).save_pretrained(save_as)
+            if final_model_dir.exists():
+                shutil.rmtree(final_model_dir)
+            final_model_dir.mkdir(parents=True, exist_ok=True)
+            accelerator.unwrap_model(vae).save_pretrained(str(final_model_dir))
 
     accelerator.free_memory()
     if torch.distributed.is_initialized():
