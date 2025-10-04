@@ -35,18 +35,21 @@ accelerate launch   --mixed_precision "no"   --num_processes 6   --gpu_ids "0,1,
 # --------------------------- Параметры ---------------------------
 ds_path            = "./workspace/d23/d23"
 project            = "simple_vae2x"
+# >>>>>>>>>>>> NEW: SET A PATH HERE TO LOAD WEIGHTS FROM A CHECKPOINT <<<<<<<<<<<<
+LOAD_FROM          = "simple_vae2x_nightly/2025_10_04_14/best"  # Example: "simple_vae2x_nightly/2025_10_04_21/best"
+# >>>>>>>>>>>> END OF CHANGE <<<<<<<<<<<<
 batch_size         = 8
 base_learning_rate = 6e-6
 min_learning_rate  = 9e-7
-num_epochs         = 50
+num_epochs         = 25
 sample_interval_share = 50
 use_wandb          = True
 save_model         = True
 use_decay          = True
 optimizer_type     = "adam8bit"
 dtype              = torch.float32  # torch.float32, torch.float16, torch.bfloat16
-GLOBAL_SAMPLE_INTERVAL = 100
-GLOBAL_SAVE_INTERVAL = 500
+GLOBAL_SAMPLE_INTERVAL = 1000
+GLOBAL_SAVE_INTERVAL = 5000
 model_resolution   = 256
 high_resolution    = 512
 limit              = 0
@@ -66,7 +69,7 @@ generated_folder = save_dir / generated_folder_name
 checkpoint_dir = save_dir / "checkpoints"
 best_checkpoint_dir = save_dir / "best"
 final_model_dir = save_dir / "final"
-num_workers        = 0
+num_workers = 24
 device = None
 
 # --- Режимы обучения ---
@@ -152,20 +155,38 @@ def is_video_vae(model) -> bool:
         pass
     return False
 
+# >>>>>>>>>>>> MODIFIED VAE LOADING LOGIC <<<<<<<<<<<<
+# Determine the source for loading the model.
+# If LOAD_FROM is set and points to a valid directory, it takes precedence.
+load_source = None
+if LOAD_FROM and Path(LOAD_FROM).exists():
+    print(f"[INFO] Loading VAE weights from global constant: {LOAD_FROM}")
+    load_source = LOAD_FROM
+
 # загрузка
 if vae_kind == "qwen":
-    vae = AutoencoderKLQwenImage.from_pretrained("Qwen/Qwen-Image", subfolder="vae")
+    # For Qwen, LOAD_FROM overrides the default hub ID.
+    source = load_source if load_source else "Qwen/Qwen-Image"
+    kwargs = {} if load_source else {"subfolder": "vae"}
+    print(f"[INFO] Loading Qwen VAE from: {source}")
+    vae = AutoencoderKLQwenImage.from_pretrained(source, **kwargs)
 else:
+    # For other types, the source is either LOAD_FROM or the 'project' name.
+    source = load_source if load_source else project
+    print(f"[INFO] Loading VAE from: {source}")
     if vae_kind == "wan":
-        vae = AutoencoderKLWan.from_pretrained(project)
-    else:
-        # старое поведение (пример)
-        if model_resolution==high_resolution:
-            vae = AutoencoderKL.from_pretrained(project)
+        vae = AutoencoderKLWan.from_pretrained(source)
+    else:  # 'kl' and asymmetric
+        if model_resolution == high_resolution:
+            vae = AutoencoderKL.from_pretrained(source)
         else:
-            vae = AsymmetricAutoencoderKL.from_pretrained(project)
+            vae = AsymmetricAutoencoderKL.from_pretrained(source)
+
+if not load_source:
+    print(f"[INFO] No valid LOAD_FROM path. Using default logic (project: '{project}', vae_kind: '{vae_kind}')")
 
 vae = vae.to(dtype)
+# >>>>>>>>>>>> END OF CHANGE <<<<<<<<<<<<
 
 # --------------------------- Датасет ---------------------------
 class PngFolderDataset(Dataset):
