@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 
 import matplotlib.pyplot as plt
-import torchvision.transforms as transforms
+import torchvision.transforms.v2 as transforms
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from torch.optim.lr_scheduler import LambdaLR
@@ -28,29 +28,24 @@ import wandb
 import lpips
 from collections import deque
 from contextlib import nullcontext
-from pytorch_memlab import profile
 
 
 # --------------------------- Параметры ---------------------------
-ds_path            = "./workspace/d23/d23/"
+ds_path            = "/mnt/h/realk30k/images"
 project            = "simple_vae2x"
-# >>>>>>>>>>>> NEW: SET A PATH HERE TO LOAD WEIGHTS FROM A CHECKPOINT <<<<<<<<<<<<
-LOAD_FROM          = "simple_vae2x_1024"  # Example: "simple_vae2x_nightly/2025_10_04_21/best"
-# >>>>>>>>>>>> END OF CHANGE <<<<<<<<<<<<
-batch_size         = 6
-base_learning_rate = 6e-6
-min_learning_rate  = 9e-7
-num_epochs         = 25
+batch_size         = 12
+base_learning_rate = 1e-4
+min_learning_rate  = 1e-4
+num_epochs         = 50
 sample_interval_share = 1000
-use_wandb          = True
+use_wandb          = False
 save_model         = True
 use_decay          = True
 optimizer_type     = "adam8bit"
-dtype              = torch.float32  # torch.float32, torch.float16, torch.bfloat16
-GLOBAL_SAMPLE_INTERVAL = 500
-GLOBAL_SAVE_INTERVAL = 1000
-model_resolution   = 256
-high_resolution    = 512
+GLOBAL_SAMPLE_INTERVAL = 10
+GLOBAL_SAVE_INTERVAL = 5000
+model_resolution   = 128
+high_resolution    = 256
 limit              = 0
 save_barrier       = 1.003
 warmup_percent     = 0.01
@@ -58,8 +53,8 @@ percentile_clipping = 95
 beta2              = 0.97
 eps                = 1e-6
 clip_grad_norm     = 1.0
-mixed_precision    = "no"
-gradient_accumulation_steps = 4
+mixed_precision    = "bf16"
+gradient_accumulation_steps = 1
 generated_folder_name = "samples"
 save_root_dir = Path("simple_vae2x_nightly")
 run_timestamp = datetime.now().strftime("%Y_%m_%d_%H")
@@ -68,7 +63,7 @@ generated_folder = save_dir / generated_folder_name
 checkpoint_dir = save_dir / "checkpoints"
 best_checkpoint_dir = save_dir / "best"
 final_model_dir = save_dir / "final"
-num_workers        = 10
+num_workers        = 8
 device = None
 
 # --- Режимы обучения ---
@@ -79,10 +74,10 @@ kl_ratio           = 0.00
 
 # Доли лоссов
 loss_ratios = {
-    "lpips": 0.75,
+    #"lpips": 0.75,
     "edge":  0.05,
-    "mse":   0.10,
-    "mae":   0.10,
+    "mse":   1,
+    "mae":   1,
     "kl":    0.00,  # активируем при full_training=True
 }
 median_coeff_steps = 256
@@ -149,39 +144,19 @@ def is_video_vae(model) -> bool:
         pass
     return False
 
-# >>>>>>>>>>>> MODIFIED VAE LOADING LOGIC <<<<<<<<<<<<
-# Determine the source for loading the model.
-# If LOAD_FROM is set and points to a valid directory, it takes precedence.
-load_source = None
-if LOAD_FROM and Path(LOAD_FROM).exists():
-    print(f"✅ Loading VAE weights from global constant: {LOAD_FROM}")
-    load_source = LOAD_FROM
-
 # загрузка
 if vae_kind == "qwen":
-    # For Qwen, LOAD_FROM overrides the default hub ID.
-    source = load_source if load_source else "Qwen/Qwen-Image"
-    kwargs = {} if load_source else {"subfolder": "vae"}
-    print(f"🚀 Loading Qwen VAE from: {source}")
-    vae = AutoencoderKLQwenImage.from_pretrained(source, **kwargs)
+    vae = AutoencoderKLQwenImage.from_pretrained("Qwen/Qwen-Image", subfolder="vae")
 else:
-    # For other types, the source is either LOAD_FROM or the 'project' name.
-    source = load_source if load_source else project
-    print(f"🚀 Loading VAE from: {source}")
     if vae_kind == "wan":
-        vae = AutoencoderKLWan.from_pretrained(source)
-    else:  # 'kl' and asymmetric
-        if model_resolution == high_resolution:
-            vae = AutoencoderKL.from_pretrained(source)
+        vae = AutoencoderKLWan.from_pretrained(project)
+    else:
+        # старое поведение (пример)
+        if model_resolution==high_resolution:
+            vae = AutoencoderKL.from_pretrained(project)
         else:
-            vae = AsymmetricAutoencoderKL.from_pretrained(source)
-
-if not load_source:
-    print(f"💡 No valid LOAD_FROM path. Using default logic (project: '{project}', vae_kind: '{vae_kind}')")
-
-vae = vae.to(dtype)
-# >>>>>>>>>>>> END OF CHANGE <<<<<<<<<<<<
-
+            vae = AsymmetricAutoencoderKL.from_pretrained(project)
+vae = vae.float()
 # torch.compile (опционально)
 if hasattr(torch, "compile"):
     try:
@@ -214,35 +189,28 @@ else:
             p.requires_grad = True
             unfrozen_param_names.append(f"post_quant_conv.{name}")
             trainable_module = core.decoder if hasattr(core, "decoder") else core
-
-print(f"[INFO] Разморожено параметров: {len(unfrozen_param_names)}. Первые 200 имён:")
-for nm in unfrozen_param_names[:200]:
-    print(" ", nm)
-
+tfm = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+    transforms.Resize((high_resolution)),
+    transforms.RandomCrop((high_resolution, high_resolution))
+])
 # --------------------------- Датасет ---------------------------
+from tqdm import tqdm
 class PngFolderDataset(Dataset):
     def __init__(self, root_dir, min_exts=('.png',), resolution=1024, limit=0):
         self.root_dir = root_dir
         self.resolution = resolution
         self.paths = []
-        for root, _, files in os.walk(root_dir):
-            for fname in files:
+        for root, _, files in tqdm(os.walk(root_dir)):
+            for fname in tqdm(files):
                 if fname.lower().endswith(tuple(ext.lower() for ext in min_exts)):
                     self.paths.append(os.path.join(root, fname))
         if limit:
             self.paths = self.paths[:limit]
-        valid = []
-        for p in self.paths:
-            try:
-                with Image.open(p) as im:
-                    im.verify()
-                valid.append(p)
-            except (OSError, UnidentifiedImageError):
-                continue
-        self.paths = valid
+        
         if len(self.paths) == 0:
             raise RuntimeError(f"No valid PNG images found under {root_dir}")
-        random.shuffle(self.paths)
 
     def __len__(self):
         return len(self.paths)
@@ -251,46 +219,19 @@ class PngFolderDataset(Dataset):
         p = self.paths[idx % len(self.paths)]
         with Image.open(p) as img:
             img = img.convert("RGB")
-            if not resize_long_side or resize_long_side <= 0:
-                return img
-            w, h = img.size
-            long = max(w, h)
-            if long <= resize_long_side:
-                return img
-            scale = resize_long_side / float(long)
-            new_w = int(round(w * scale))
-            new_h = int(round(h * scale))
-            return img.resize((new_w, new_h), Image.LANCZOS)
+            img = tfm(img)
+            return img
 
-def random_crop(img, sz):
-    w, h = img.size
-    if w < sz or h < sz:
-        img = img.resize((max(sz, w), max(sz, h)), Image.LANCZOS)
-    x = random.randint(0, max(1, img.width - sz))
-    y = random.randint(0, max(1, img.height - sz))
-    return img.crop((x, y, x + sz, y + sz))
-
-tfm = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
-])
-
-dataset = PngFolderDataset(ds_path, min_exts=('.png',), resolution=high_resolution, limit=limit)
+dataset = PngFolderDataset(ds_path, min_exts=('.png','.jpg'), resolution=high_resolution, limit=limit)
+print(f'Created dataset: {len(dataset)}')
 if len(dataset) < batch_size:
     raise RuntimeError(f"Not enough valid images ({len(dataset)}) to form a batch of size {batch_size}")
 
-def collate_fn(batch):
-    imgs = []
-    for img in batch:
-        img = random_crop(img, high_resolution)
-        imgs.append(tfm(img))
-    return torch.stack(imgs)
 
 dataloader = DataLoader(
     dataset,
     batch_size=batch_size,
     shuffle=True,
-    collate_fn=collate_fn,
     num_workers=num_workers,
     pin_memory=True,
     drop_last=True
@@ -416,27 +357,22 @@ if full_training and not train_decoder_only:
     loss_ratios["kl"] = float(kl_ratio)
 normalizer = MedianLossNormalizer(loss_ratios, median_coeff_steps)
 
+
+
 # --------------------------- Сэмплы ---------------------------
 @torch.no_grad()
 def get_fixed_samples(n=3):
     idx = random.sample(range(len(dataset)), min(n, len(dataset)))
-    pil_imgs = [dataset[i] for i in idx]
-    tensors = []
-    for img in pil_imgs:
-        img = random_crop(img, high_resolution)
-        tensors.append(tfm(img))
-    return torch.stack(tensors).to(accelerator.device, dtype)
+    tensors = [dataset[i] for i in idx]
+    return torch.stack(tensors).to(accelerator.device, tensors[0].dtype)
 
 fixed_samples = get_fixed_samples()
 
 @torch.no_grad()
 def _to_pil_uint8(img_tensor: torch.Tensor) -> Image.Image:
-    arr = ((img_tensor.float().clamp(-1, 1) + 1.0) * 127.5).clamp(0, 255).byte().cpu().numpy().transpose(1, 2, 0)
+    arr = ((img_tensor.float() * 0.5 + 0.5) * 255).clamp(0, 255).byte().cpu().numpy().transpose(1, 2, 0)
     return Image.fromarray(arr)
 
-@profile
-@torch.no_grad()
-@profile
 @torch.no_grad()
 def generate_and_save_samples(step=None):
     try:
@@ -538,7 +474,6 @@ if accelerator.is_main_process and save_model:
 accelerator.wait_for_everyone()
 
 # --------------------------- Тренировка ---------------------------
-@profile
 def run_training():
     progress = tqdm(total=total_steps, disable=not accelerator.is_local_main_process)
     global_step = 0
@@ -554,45 +489,41 @@ def run_training():
 
         for imgs in dataloader:
             with accelerator.accumulate(vae):
-                imgs = imgs.to(accelerator.device)
+                with accelerator.autocast():
+                    if high_resolution != model_resolution:
+                        imgs_low = F.interpolate(imgs, size=(model_resolution, model_resolution), mode="bilinear", align_corners=False)
+                    else:
+                        imgs_low = imgs
 
-                if high_resolution != model_resolution:
-                    imgs_low = F.interpolate(imgs, size=(model_resolution, model_resolution), mode="bilinear", align_corners=False)
-                else:
-                    imgs_low = imgs
+                    encode_input = imgs_low.unsqueeze(2) if is_video_vae(vae) else imgs_low
+                    encode_ctx = torch.no_grad() if train_decoder_only else nullcontext()
+                    with encode_ctx:
+                        enc = vae.encode(encode_input)
+                    latents_dist = enc.latent_dist
+                    latents = latents_dist.mean if train_decoder_only else latents_dist.sample()
+                    if train_decoder_only:
+                        latents = latents.detach()
 
-                model_dtype = next(vae.parameters()).dtype
-                imgs_low_model = imgs_low.to(dtype=model_dtype) if imgs_low.dtype != model_dtype else imgs_low
+                    if is_video_vae(vae):
+                        dec = vae.decode(latents).sample
+                        rec = dec.squeeze(2)
+                    else:
+                        rec = vae.decode(latents).sample
 
-                encode_input = imgs_low_model.unsqueeze(2) if is_video_vae(vae) else imgs_low_model
-                encode_ctx = torch.no_grad() if train_decoder_only else nullcontext()
-                with encode_ctx:
-                    enc = vae.encode(encode_input)
-                latents_dist = enc.latent_dist
-                latents = latents_dist.mean if train_decoder_only else latents_dist.sample()
-                if train_decoder_only:
-                    latents = latents.detach()
+                    if train_decoder_only:
+                        del enc
 
-                if is_video_vae(vae):
-                    dec = vae.decode(latents).sample
-                    rec = dec.squeeze(2)
-                else:
-                    rec = vae.decode(latents).sample
-
-                if train_decoder_only:
-                    del enc
-
-                if rec.shape[-2:] != imgs.shape[-2:]:
-                    rec = F.interpolate(rec, size=imgs.shape[-2:], mode="bilinear", align_corners=False)
+                    if rec.shape[-2:] != imgs.shape[-2:]:
+                        rec = F.interpolate(rec, size=imgs.shape[-2:], mode="bilinear", align_corners=False)
 
                 rec_f32 = rec.to(torch.float32)
                 imgs_f32 = imgs.to(torch.float32)
 
-                lpips_loss = compute_lpips_loss(rec_f32, imgs_f32).mean()
+                #lpips_loss = compute_lpips_loss(rec_f32, imgs_f32).mean()
                 abs_losses = {
                     "mae":   F.l1_loss(rec_f32, imgs_f32),
                     "mse":   F.mse_loss(rec_f32, imgs_f32),
-                    "lpips": lpips_loss,
+                    #"lpips": lpips_loss,
                     "edge":  F.l1_loss(sobel_edges(rec_f32), sobel_edges(imgs_f32)),
                 }
 
