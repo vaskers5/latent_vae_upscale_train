@@ -1,8 +1,8 @@
 # Baseline single-node configuration. Override values via additional YAML files
 # or the CLI --override flag.
 
-# ds_path: "./datasets/test_dataset" # test dataset path
-ds_path: "./datasets/full_dataset" # test dataset path
+ds_path: "./datasets/test_dataset" # test dataset path
+# ds_path: "./datasets/full_dataset" # test dataset path
 
 project: "simple_latent_solo_model"
 save_root_dir: "simple_latent_solo_model"
