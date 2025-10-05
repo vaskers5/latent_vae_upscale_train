@@ -1,0 +1,18 @@
+# Overrides for multi-GPU 6×A100 training.
+
+ds_path: "./workspace/d23/d23"
+project: "simple_vae2x"
+save_root_dir: "simple_vae2x_nightly"
+
+optimizer:
+  batch_size: 12
+  gradient_accumulation_steps: 2
+
+logging:
+  sample_interval_share: 50
+  global_sample_interval: 1000
+  global_save_interval: 5000
+
+latent_upscaler:
+  enabled: true
+  width_multiplier: 2

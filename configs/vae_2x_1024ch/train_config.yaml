@@ -1,0 +1,67 @@
+# Baseline single-node configuration. Override values via additional YAML files
+# or the CLI --override flag.
+
+ds_path: "./workspace/d23/d23/ae3/"
+project: "simple_latent_solo_model"
+save_root_dir: "simple_latent_solo_model"
+
+dataset:
+  model_resolution: 256
+  high_resolution: 512
+  resize_long_side: 1280
+  limit: 0
+  num_workers: 10
+  horizontal_flip_prob: 0.5
+
+model:
+  load_from: ""
+  hf_repo: null
+  dtype: "bfloat16"
+  mixed_precision: "bf16"
+  train_decoder_only: false
+  full_training: false
+  vae_kind: "kl"
+  kl_ratio: 0.0
+
+optimizer:
+  batch_size: 2
+  base_learning_rate: 6e-6
+  min_learning_rate: 9e-7
+  num_epochs: 25
+  optimizer_type: "adam8bit"
+  beta2: 0.97
+  eps: 1e-6
+  clip_grad_norm: 1.0
+  use_decay: true
+  weight_decay: 0.01
+  warmup_percent: 0.01
+  gradient_accumulation_steps: 4
+  scheduler: "cosine"
+  cosine_min_ratio: 0.1
+
+loss:
+  ratios:
+    mae: 0.35
+    mse: 0.05
+    edge: 0.10
+    lpips: 0.35
+    kl: 0.00
+  median_coeff_steps: 256
+  lpips_backbone: "vgg"
+  lpips_eval_resolution: 256
+
+logging:
+  use_wandb: true
+  sample_interval_share: 1000
+  global_sample_interval: 500
+  global_save_interval: 1000
+  save_model: true
+  save_barrier: 1.003
+  log_grad_norm: true
+
+latent_upscaler:
+  enabled: true
+  width_multiplier: 2
+
+augmentation:
+  horizontal_flip_prob: 0.5
