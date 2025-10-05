@@ -5,12 +5,14 @@ from __future__ import annotations
 import os
 import random
 from pathlib import Path
-from typing import Iterable, List
+from typing import Iterable, List, Optional, Tuple
 
 from PIL import Image, UnidentifiedImageError
 import torch
 import torchvision.transforms.functional as TF
 from torch.utils.data import Dataset
+
+from .embeddings import EmbeddingCache, TransformParams
 
 __all__ = ["ImageFolderDataset"]
 
@@ -25,12 +27,14 @@ class ImageFolderDataset(Dataset):
         resize_long_side: int = 0,
         limit: int = 0,
         horizontal_flip_prob: float = 0.0,
+        embedding_cache: Optional[EmbeddingCache] = None,
     ) -> None:
         self.root = root
         self.high_resolution = high_resolution
         self.resize_long_side = resize_long_side
         self.horizontal_flip_prob = horizontal_flip_prob
         self.paths: List[Path] = []
+        self.embedding_cache = embedding_cache
 
         exts = {".png", ".jpg", ".jpeg", ".webp"}
         for current_root, _dirs, files in os.walk(root):
@@ -44,6 +48,9 @@ class ImageFolderDataset(Dataset):
         if not self.paths:
             raise RuntimeError(f"No valid images found under '{root}'")
         random.shuffle(self.paths)
+
+    def set_embedding_cache(self, cache: Optional[EmbeddingCache]) -> None:
+        self.embedding_cache = cache
 
     @staticmethod
     def _filter_valid_images(paths: Iterable[Path]) -> List[Path]:
@@ -60,16 +67,38 @@ class ImageFolderDataset(Dataset):
     def __len__(self) -> int:
         return len(self.paths)
 
-    def __getitem__(self, index: int) -> torch.Tensor:
+    def __getitem__(self, index: int):
         path = self.paths[index % len(self.paths)]
+        if self.embedding_cache is None or not self.embedding_cache.cfg.enabled:
+            tensor, _params = self.build_tensor_sample(path)
+            return tensor
+
+        record = self.embedding_cache.choose_record(path)
+        tensor, params = self.build_tensor_sample(path, params=record.params)
+        sample = {
+            "image": tensor,
+            "latents": record.latents,
+            "path": str(path),
+            "variant_index": record.variant_index,
+        }
+        if record.mean is not None:
+            sample["latent_mean"] = record.mean
+        if record.logvar is not None:
+            sample["latent_logvar"] = record.logvar
+        return sample
+
+    def build_tensor_sample(
+        self,
+        path: Path,
+        rng: Optional[random.Random] = None,
+        params: Optional[TransformParams] = None,
+    ) -> Tuple[torch.Tensor, TransformParams]:
         with Image.open(path) as img:
             img = img.convert("RGB")
-            img = self._resize_if_needed(img)
-            img = self._maybe_flip(img)
-            img = self._crop_to_resolution(img)
-            tensor = TF.to_tensor(img)
-            tensor = TF.normalize(tensor, mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
-            return tensor
+            transformed, used_params = self._apply_transforms(img, rng=rng, params=params)
+        tensor = TF.to_tensor(transformed)
+        tensor = TF.normalize(tensor, mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+        return tensor, used_params
 
     def _resize_if_needed(self, img: Image.Image) -> Image.Image:
         if self.resize_long_side <= 0:
@@ -82,20 +111,49 @@ class ImageFolderDataset(Dataset):
         new_size = (int(round(width * scale)), int(round(height * scale)))
         return img.resize(new_size, Image.LANCZOS)
 
-    def _maybe_flip(self, img: Image.Image) -> Image.Image:
-        if self.horizontal_flip_prob > 0 and random.random() < self.horizontal_flip_prob:
-            return img.transpose(Image.FLIP_LEFT_RIGHT)
-        return img
-
-    def _crop_to_resolution(self, img: Image.Image) -> Image.Image:
+    def _apply_transforms(
+        self,
+        img: Image.Image,
+        rng: Optional[random.Random] = None,
+        params: Optional[TransformParams] = None,
+    ) -> Tuple[Image.Image, TransformParams]:
         if self.high_resolution <= 0:
-            return img
+            return img, TransformParams(flip=False, crop_x=0, crop_y=0)
+
+        gen = rng if rng is not None else random
+
+        img = self._resize_if_needed(img)
+
+        if params is None:
+            flip = False
+            if self.horizontal_flip_prob > 0 and gen.random() < self.horizontal_flip_prob:
+                img = img.transpose(Image.FLIP_LEFT_RIGHT)
+                flip = True
+            img, crop_x, crop_y = self._random_crop(img, gen)
+            return img, TransformParams(flip=flip, crop_x=crop_x, crop_y=crop_y)
+
+        if params.flip:
+            img = img.transpose(Image.FLIP_LEFT_RIGHT)
+
+        img = self._ensure_minimum_size(img)
+        width, height = img.size
+        crop_x = max(0, min(width - self.high_resolution, params.crop_x)) if width > self.high_resolution else 0
+        crop_y = max(0, min(height - self.high_resolution, params.crop_y)) if height > self.high_resolution else 0
+        img = img.crop((crop_x, crop_y, crop_x + self.high_resolution, crop_y + self.high_resolution))
+        return img, TransformParams(flip=params.flip, crop_x=crop_x, crop_y=crop_y)
+
+    def _ensure_minimum_size(self, img: Image.Image) -> Image.Image:
         width, height = img.size
         if width < self.high_resolution or height < self.high_resolution:
             img = img.resize((max(width, self.high_resolution), max(height, self.high_resolution)), Image.LANCZOS)
-            width, height = img.size
+        return img
+
+    def _random_crop(self, img: Image.Image, gen: random.Random) -> Tuple[Image.Image, int, int]:
+        img = self._ensure_minimum_size(img)
+        width, height = img.size
         if width == self.high_resolution and height == self.high_resolution:
-            return img
-        x = random.randint(0, width - self.high_resolution)
-        y = random.randint(0, height - self.high_resolution)
-        return img.crop((x, y, x + self.high_resolution, y + self.high_resolution))
+            return img, 0, 0
+        crop_x = gen.randint(0, width - self.high_resolution)
+        crop_y = gen.randint(0, height - self.high_resolution)
+        img = img.crop((crop_x, crop_y, crop_x + self.high_resolution, crop_y + self.high_resolution))
+        return img, crop_x, crop_y

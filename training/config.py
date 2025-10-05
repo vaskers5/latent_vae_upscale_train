@@ -21,6 +21,7 @@ __all__ = [
     "LossConfig",
     "LoggingConfig",
     "LatentUpscalerConfig",
+    "EmbeddingsConfig",
     "TrainingConfig",
 ]
 
@@ -396,6 +397,46 @@ class LatentUpscalerConfig:
 
 
 @dataclass
+class EmbeddingsConfig:
+    enabled: bool
+    cache_dir: Path
+    dtype: torch.dtype
+    variants_per_sample: int
+    overwrite: bool
+    precompute_batch_size: int
+    num_workers: int
+    store_distribution: bool
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any], dataset_root: Path) -> "EmbeddingsConfig":
+        section = data.get("embeddings", {})
+        enabled = _resolve_bool(section.get("enabled", data.get("embeddings_enabled", False)))
+        cache_dir_raw = section.get("cache_dir") or data.get("embeddings_cache_dir")
+        if cache_dir_raw:
+            cache_dir = Path(cache_dir_raw)
+            if not cache_dir.is_absolute():
+                cache_dir = dataset_root / cache_dir
+        else:
+            cache_dir = dataset_root / "_precomputed_latents"
+        dtype = _resolve_dtype(section.get("dtype", data.get("embeddings_dtype", "float16")))
+        variants_per_sample = int(section.get("variants_per_sample", data.get("embeddings_variants", 1)))
+        overwrite = _resolve_bool(section.get("overwrite", data.get("embeddings_overwrite", False)))
+        precompute_batch_size = int(section.get("precompute_batch_size", data.get("embeddings_precompute_batch_size", 16)))
+        num_workers = int(section.get("precompute_num_workers", data.get("embeddings_precompute_num_workers", 4)))
+        store_distribution = _resolve_bool(section.get("store_distribution", data.get("embeddings_store_distribution", True)), default=True)
+        return cls(
+            enabled=enabled,
+            cache_dir=cache_dir,
+            dtype=dtype,
+            variants_per_sample=max(1, variants_per_sample),
+            overwrite=overwrite,
+            precompute_batch_size=max(1, precompute_batch_size),
+            num_workers=max(0, num_workers),
+            store_distribution=store_distribution,
+        )
+
+
+@dataclass
 class TrainingConfig:
     paths: PathsConfig
     dataset: DatasetConfig
@@ -404,6 +445,7 @@ class TrainingConfig:
     losses: LossConfig
     logging: LoggingConfig
     latent_upscaler: LatentUpscalerConfig
+    embeddings: EmbeddingsConfig
     ema: EMAConfig
     seed: int
 
@@ -416,6 +458,7 @@ class TrainingConfig:
         losses = LossConfig.from_dict(data, dataset.model_resolution, model.kl_ratio)
         logging = LoggingConfig.from_dict(data, timestamp=paths.timestamp)
         latent_upscaler = LatentUpscalerConfig.from_dict(data)
+        embeddings = EmbeddingsConfig.from_dict(data, dataset_root=paths.dataset_root)
         ema = EMAConfig.from_dict(data)
         seed = int(data.get("seed", int(datetime.now().strftime("%Y%m%d"))))
         return cls(
@@ -426,6 +469,7 @@ class TrainingConfig:
             losses=losses,
             logging=logging,
             latent_upscaler=latent_upscaler,
+            embeddings=embeddings,
             ema=ema,
             seed=seed,
         )

@@ -16,6 +16,16 @@ dataset:
   horizontal_flip_prob: 0.5
   persistent_workers: true
 
+embeddings:
+  enabled: false
+  cache_dir: "./cache/vae_latents"
+  dtype: "float32"
+  variants_per_sample: 1
+  overwrite: false
+  precompute_batch_size: 256
+  precompute_num_workers: 12
+  store_distribution: true
+
 model:
   load_from: ""
   hf_repo: "AuraDiffusion/16ch-vae"

@@ -8,6 +8,7 @@ import random
 import shutil
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
 import bitsandbytes as bnb
@@ -32,6 +33,7 @@ from tqdm import tqdm
 
 from .config import TrainingConfig
 from .dataset import ImageFolderDataset
+from .embeddings import EmbeddingCache
 from .helpers import FocalFrequencyLoss, LatentUpscaler, MedianLossNormalizer
 
 __all__ = ["VAETrainer", "run"]
@@ -49,17 +51,41 @@ class VAETrainer:
         self.device = self.accelerator.device
         self._seed_everything(config.seed)
 
+        self.embedding_cache: Optional[EmbeddingCache] = None
+        if self.cfg.embeddings.enabled:
+            if self.cfg.model.full_training and not self.cfg.model.train_decoder_only:
+                raise ValueError(
+                    "Embedding cache is only supported when the encoder is frozen (train_decoder_only or latent upscaler mode)."
+                )
+            self.embedding_cache = EmbeddingCache(self.cfg.embeddings, self.cfg.dataset, self.cfg.paths.dataset_root)
+
         self.dataset = ImageFolderDataset(
             root=self.cfg.paths.dataset_root,
             high_resolution=self.cfg.dataset.high_resolution,
             resize_long_side=self.cfg.dataset.resize_long_side,
             limit=self.cfg.dataset.limit,
             horizontal_flip_prob=self.cfg.dataset.horizontal_flip_prob,
+            embedding_cache=self.embedding_cache,
         )
         if len(self.dataset) < self.cfg.optimiser.batch_size:
             raise RuntimeError(
                 f"Found only {len(self.dataset)} images but batch_size is {self.cfg.optimiser.batch_size}."
             )
+
+        self.vae = self._load_vae()
+        self.latent_upscaler: Optional[LatentUpscaler] = self._build_latent_upscaler(self.vae)
+        self._freeze_parameters()
+
+        if self.embedding_cache is not None:
+            self.embedding_cache.ensure_populated(
+                self.dataset,
+                self.vae,
+                device=self.device,
+                encode_dtype=next(self.vae.parameters()).dtype,
+                seed=self.cfg.seed,
+                accelerator=self.accelerator,
+            )
+            self.accelerator.wait_for_everyone()
 
         self.dataloader = DataLoader(
             self.dataset,
@@ -69,10 +95,6 @@ class VAETrainer:
             num_workers=self.cfg.dataset.num_workers,
             pin_memory=True,
         )
-
-        self.vae = self._load_vae()
-        self.latent_upscaler: Optional[LatentUpscaler] = self._build_latent_upscaler(self.vae)
-        self._freeze_parameters()
 
         self.optimizer = self._build_optimizer()
         self.scheduler = self._build_scheduler()
@@ -369,6 +391,29 @@ class VAETrainer:
 
         return LambdaLR(self.optimizer, schedule)
 
+    def _prepare_batch(
+        self, batch: Any
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        dtype = next(self.vae.parameters()).dtype
+        if torch.is_tensor(batch):
+            return batch.to(self.device), None, None, None
+        if isinstance(batch, dict):
+            image = batch["image"].to(self.device)
+            latents = self._convert_optional_tensor(batch.get("latents"), dtype)
+            mean = self._convert_optional_tensor(batch.get("latent_mean"), dtype)
+            logvar = self._convert_optional_tensor(batch.get("latent_logvar"), dtype)
+            return image, latents, mean, logvar
+        raise TypeError(f"Unsupported batch type: {type(batch)!r}")
+
+    def _convert_optional_tensor(self, value: Any, dtype: torch.dtype) -> Optional[torch.Tensor]:
+        if value is None:
+            return None
+        if isinstance(value, list) and value and torch.is_tensor(value[0]):
+            value = torch.stack(value)
+        if torch.is_tensor(value):
+            return value.to(self.device, dtype=dtype)
+        return None
+
     def _update_ema(self, step: int) -> None:
         if self.ema_vae is None:
             return
@@ -384,7 +429,14 @@ class VAETrainer:
 
     def _sample_fixed_batch(self, count: int = 4) -> torch.Tensor:
         indices = random.sample(range(len(self.dataset)), min(count, len(self.dataset)))
-        samples = torch.stack([self.dataset[idx] for idx in indices])
+        tensors: List[torch.Tensor] = []
+        for idx in indices:
+            sample = self.dataset[idx]
+            if isinstance(sample, dict):
+                tensors.append(sample["image"])
+            else:
+                tensors.append(sample)
+        samples = torch.stack(tensors)
         return samples.to(self.device)
 
     def _wandb_payload(self) -> Dict[str, Any]:
@@ -427,12 +479,17 @@ class VAETrainer:
 
             for batch in self.dataloader:
                 with self.accelerator.accumulate(self.vae):
-                    batch = batch.to(self.device)
+                    high_res, cached_latents, cached_mean, cached_logvar = self._prepare_batch(batch)
                     with self.accelerator.autocast():
-                        low_res = self._downsample_for_model(batch)
-                        reconstruction, encode_out = self._forward(latents_input=low_res)
-                        reconstruction = self._match_spatial(reconstruction, batch)
-                        losses = self._compute_losses(reconstruction, batch, encode_out)
+                        low_res = self._downsample_for_model(high_res)
+                        reconstruction, encode_out = self._forward(
+                            latents_input=low_res,
+                            precomputed_latents=cached_latents,
+                            cached_mean=cached_mean,
+                            cached_logvar=cached_logvar,
+                        )
+                        reconstruction = self._match_spatial(reconstruction, high_res)
+                        losses = self._compute_losses(reconstruction, high_res, encode_out)
                         total_loss, coeffs, medians = self.loss_normalizer.update(losses)
                     if not torch.isfinite(total_loss):
                         raise RuntimeError("Encountered NaN/Inf loss")
@@ -527,17 +584,39 @@ class VAETrainer:
             align_corners=False,
         )
 
-    def _forward(self, latents_input: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, Any]]:
-        encode_input = latents_input.unsqueeze(2) if self._is_video_vae(self.vae) else latents_input
+    def _forward(
+        self,
+        latents_input: torch.Tensor,
+        precomputed_latents: Optional[torch.Tensor] = None,
+        cached_mean: Optional[torch.Tensor] = None,
+        cached_logvar: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         dtype = next(self.vae.parameters()).dtype
-        encode_input = encode_input.to(dtype)
-        freeze_encoder = self.cfg.model.train_decoder_only or self.latent_upscaler is not None
-        ctx = torch.no_grad() if freeze_encoder else nullcontext()
-        with ctx:
-            encoding = self.vae.encode(encode_input)
-        latents = encoding.latent_dist.mean if freeze_encoder else encoding.latent_dist.sample()
-        if freeze_encoder:
-            latents = latents.detach()
+        is_video = self._is_video_vae(self.vae)
+
+        if precomputed_latents is None:
+            encode_input = latents_input.unsqueeze(2) if is_video else latents_input
+            encode_input = encode_input.to(dtype)
+            freeze_encoder = self.cfg.model.train_decoder_only or self.latent_upscaler is not None
+            ctx = torch.no_grad() if freeze_encoder else nullcontext()
+            with ctx:
+                encoding = self.vae.encode(encode_input)
+            latents = encoding.latent_dist.mean if freeze_encoder else encoding.latent_dist.sample()
+            if freeze_encoder:
+                latents = latents.detach()
+            encoding_result: Any = encoding
+        else:
+            latents = precomputed_latents.to(self.device, dtype=dtype)
+            mean = cached_mean.to(self.device, dtype=dtype) if cached_mean is not None else None
+            logvar = cached_logvar.to(self.device, dtype=dtype) if cached_logvar is not None else None
+            if is_video:
+                latents = latents.unsqueeze(2)
+                if mean is not None:
+                    mean = mean.unsqueeze(2)
+                if logvar is not None:
+                    logvar = logvar.unsqueeze(2)
+            encoding_result = self._build_cached_encoding(latents, mean, logvar)
+
         if self.latent_upscaler is not None:
             compiler_mod = getattr(torch, "compiler", None)
             mark_step = getattr(compiler_mod, "cudagraph_mark_step_begin", None)
@@ -545,11 +624,23 @@ class VAETrainer:
                 mark_step()
             latents = self.latent_upscaler(latents.clone())
         latents = latents.to(dtype)
-        if self._is_video_vae(self.vae):
+        if is_video:
             decoded = self.vae.decode(latents).sample.squeeze(2)
         else:
             decoded = self.vae.decode(latents).sample
-        return decoded, {"encoding": encoding, "latents": latents}
+        return decoded, {"encoding": encoding_result, "latents": latents}
+
+    @staticmethod
+    def _build_cached_encoding(
+        latents: torch.Tensor,
+        mean: Optional[torch.Tensor],
+        logvar: Optional[torch.Tensor],
+    ) -> SimpleNamespace:
+        effective_mean = mean if mean is not None else latents.detach()
+        if logvar is None:
+            logvar = torch.zeros_like(effective_mean, device=effective_mean.device, dtype=effective_mean.dtype)
+        dist = SimpleNamespace(mean=effective_mean, logvar=logvar)
+        return SimpleNamespace(latent_dist=dist)
 
     def _match_spatial(self, tensor: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
         if tensor.shape[-2:] == reference.shape[-2:]:
