@@ -7,8 +7,8 @@ project: "simple_latent_solo_model"
 save_root_dir: "simple_latent_solo_model"
 
 dataset:
-  model_resolution: 128
-  high_resolution: 256
+  model_resolution: 64
+  high_resolution: 128
   resize_long_side: 1280
   limit: 0
   num_workers: 24
@@ -30,7 +30,7 @@ model:
   torch_compile_fullgraph: false
 
 optimizer:
-  batch_size: 24
+  batch_size: 90
   base_learning_rate: 1.0
   min_learning_rate: 9e-7
   num_epochs: 750
@@ -53,13 +53,15 @@ loss:
     lpips: true
     ffl: true
     kl: true
+    adv: true
   ratios:
     mae: 0.35
     mse: 0.05
     edge: 0.10
     lpips: 0.25
     ffl: 0.15
-    kl: 0.10
+    kl: 0.0
+    adv: 0.10
   median_coeff_steps: 256
   lpips_backbone: "vgg"
   lpips_eval_resolution: 256
@@ -71,10 +73,28 @@ loss:
     normalize: true
     eps: 1.0e-08
 
+adversarial:
+  enabled: false
+  loss_type: "ragan"
+  update_frequency: 1
+  warmup_steps: 1000
+  discriminator:
+    base_channels: 64
+    max_channels: 512
+    num_layers: 4
+    norm: "instance"
+    spectral_norm: true
+  optimizer:
+    lr: 1.5e-4
+    beta1: 0.9
+    beta2: 0.99
+    weight_decay: 0.0
+    clip_grad_norm: 1.0
+
 logging:
   use_wandb: true
   sample_interval_share: 1000
-  global_sample_interval: 100
+  global_sample_interval: 25
   global_save_interval: 1000
   save_model: true
   save_barrier: 1.003
@@ -91,7 +111,7 @@ augmentation:
   horizontal_flip_prob: 0.5
 
 ema:
-  enabled: true
+  enabled: false
   decay: 0.999
   update_after_step: 100
   update_interval: 1

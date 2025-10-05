@@ -222,7 +222,7 @@ class ModelConfig:
     hf_subfolder: Optional[str]
     hf_revision: Optional[str]
     hf_auth_token: Optional[str]
-    dtype: torch.dtype
+    weights_dtype: torch.dtype
     mixed_precision: str
     train_decoder_only: bool
     full_training: bool
@@ -251,8 +251,8 @@ class ModelConfig:
             hf_subfolder=section.get("hf_subfolder") or data.get("hf_subfolder"),
             hf_revision=section.get("hf_revision") or data.get("hf_revision"),
             hf_auth_token=section.get("hf_auth_token") or data.get("hf_auth_token"),
-            dtype=_resolve_dtype(section.get("dtype", data.get("dtype", "float32"))),
-            mixed_precision=str(section.get("mixed_precision", data.get("mixed_precision", "no"))),
+            weights_dtype=_resolve_dtype(section.get("weights_dtype", data.get("weights_dtype", "float32"))),
+            mixed_precision=str(section.get("mixed_precision", data.get("mixed_precision", "no"))).strip().lower(),
             train_decoder_only=_resolve_bool(section.get("train_decoder_only", data.get("train_decoder_only", True))),
             full_training=_resolve_bool(section.get("full_training", data.get("full_training", False))),
             vae_kind=str(section.get("vae_kind", data.get("vae_kind", "kl"))),
@@ -840,7 +840,7 @@ class VAETrainer:
                         vae = AsymmetricAutoencoderKL.from_pretrained(source, **kwargs)
         display_source = source if not path_exists else str(load_path)
         self.accelerator.print(f"[INFO] Loading VAE from: {display_source}")
-        return vae.to(cfg.dtype)
+        return vae.to(cfg.weights_dtype)
 
     def _determine_latent_channels(self, vae: nn.Module) -> Optional[int]:
         core = self._unwrap_model(vae)
@@ -867,7 +867,7 @@ class VAETrainer:
         if latent_channels is None:
             raise RuntimeError("Unable to determine latent channels for upscaler")
         upscaler = LatentUpscaler(latent_channels, scale_factor=scale_factor, hidden_multiplier=cfg.latent_upscaler.width_multiplier)
-        return upscaler.to(self.device, dtype=self.cfg.model.dtype)
+        return upscaler.to(self.device, dtype=self.cfg.model.weights_dtype)
 
     def _freeze_parameters(self) -> None:
         core = self._unwrap_model(self.vae)
@@ -1029,12 +1029,12 @@ class VAETrainer:
             for batch in self.dataloader:
                 with self.accelerator.accumulate(self.vae):
                     batch = batch.to(self.device)
-                    low_res = self._downsample_for_model(batch)
-                    reconstruction, encode_out = self._forward(latents_input=low_res)
-                    reconstruction = self._match_spatial(reconstruction, batch)
-
-                    losses = self._compute_losses(reconstruction, batch, encode_out)
-                    total_loss, coeffs, medians = self.loss_normalizer.update(losses)
+                    with self.accelerator.autocast():
+                        low_res = self._downsample_for_model(batch)
+                        reconstruction, encode_out = self._forward(latents_input=low_res)
+                        reconstruction = self._match_spatial(reconstruction, batch)
+                        losses = self._compute_losses(reconstruction, batch, encode_out)
+                        total_loss, coeffs, medians = self.loss_normalizer.update(losses)
                     if not torch.isfinite(total_loss):
                         raise RuntimeError("Encountered NaN/Inf loss")
 
