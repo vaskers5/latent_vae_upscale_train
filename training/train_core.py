@@ -143,7 +143,6 @@ class DatasetConfig:
     limit: int
     num_workers: int
     horizontal_flip_prob: float
-    persistent_workers: bool
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "DatasetConfig":
@@ -155,9 +154,6 @@ class DatasetConfig:
             limit=int(section.get("limit", data.get("limit", 0))),
             num_workers=int(section.get("num_workers", data.get("num_workers", 4))),
             horizontal_flip_prob=float(section.get("horizontal_flip_prob", data.get("horizontal_flip_prob", 0.0))),
-            persistent_workers=_resolve_bool(
-                section.get("persistent_workers", data.get("persistent_workers", True))
-            ),
         )
 
 
@@ -403,9 +399,6 @@ class LatentUpscalerConfig:
     enabled: bool
     width_multiplier: int
     scale_factor: Optional[int]
-    rrdb_blocks: int
-    growth_channels: int
-    residual_scaling: float
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "LatentUpscalerConfig":
@@ -415,9 +408,6 @@ class LatentUpscalerConfig:
             enabled=bool(section.get("enabled", data.get("train_latent_upscaler", False))),
             width_multiplier=int(section.get("width_multiplier", data.get("latent_upscaler_width", 2))),
             scale_factor=int(scale) if scale is not None else None,
-            rrdb_blocks=int(section.get("rrdb_blocks", section.get("num_blocks", 6))),
-            growth_channels=int(section.get("growth_channels", 32)),
-            residual_scaling=float(section.get("residual_scaling", 0.2)),
         )
 
 
@@ -551,76 +541,20 @@ class ImageFolderDataset(Dataset):
 # Helper modules
 
 
-class ResidualDenseBlock(nn.Module):
-    def __init__(self, channels: int, growth_channels: int, residual_scaling: float) -> None:
-        super().__init__()
-        self.residual_scaling = residual_scaling
-        self.conv1 = nn.Conv2d(channels, growth_channels, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv2d(channels + growth_channels, growth_channels, kernel_size=3, padding=1)
-        self.conv3 = nn.Conv2d(channels + 2 * growth_channels, growth_channels, kernel_size=3, padding=1)
-        self.conv4 = nn.Conv2d(channels + 3 * growth_channels, growth_channels, kernel_size=3, padding=1)
-        self.conv5 = nn.Conv2d(channels + 4 * growth_channels, channels, kernel_size=3, padding=1)
-        self.act = nn.LeakyReLU(negative_slope=0.2, inplace=True)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x1 = self.act(self.conv1(x))
-        x2 = self.act(self.conv2(torch.cat((x, x1), dim=1)))
-        x3 = self.act(self.conv3(torch.cat((x, x1, x2), dim=1)))
-        x4 = self.act(self.conv4(torch.cat((x, x1, x2, x3), dim=1)))
-        x5 = self.conv5(torch.cat((x, x1, x2, x3, x4), dim=1))
-        return x + x5 * self.residual_scaling
-
-
-class ResidualInResidualDenseBlock(nn.Module):
-    def __init__(self, channels: int, growth_channels: int, residual_scaling: float) -> None:
-        super().__init__()
-        self.rdb1 = ResidualDenseBlock(channels, growth_channels, residual_scaling)
-        self.rdb2 = ResidualDenseBlock(channels, growth_channels, residual_scaling)
-        self.rdb3 = ResidualDenseBlock(channels, growth_channels, residual_scaling)
-        self.residual_scaling = residual_scaling
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = self.rdb1(x)
-        out = self.rdb2(out)
-        out = self.rdb3(out)
-        return out * self.residual_scaling + x
-
-
 class LatentUpscaler(nn.Module):
-    def __init__(
-        self,
-        channels: int,
-        scale_factor: int,
-        hidden_multiplier: int,
-        num_blocks: int,
-        growth_channels: int,
-        residual_scaling: float,
-    ) -> None:
+    def __init__(self, channels: int, scale_factor: int, hidden_multiplier: int) -> None:
         super().__init__()
         if scale_factor < 2:
             raise ValueError("Latent upscaler requires scale_factor >= 2")
         hidden_channels = max(channels * hidden_multiplier, channels)
-        growth_channels = max(1, growth_channels)
-        residual_scaling = float(residual_scaling)
         self.scale_factor = scale_factor
-        body_blocks = [
-            ResidualInResidualDenseBlock(
-                hidden_channels,
-                growth_channels,
-                residual_scaling,
-            )
-            for _ in range(max(1, num_blocks))
-        ]
-        self.trunk = nn.Sequential(*body_blocks)
-        self.conv_first = nn.Conv2d(channels, hidden_channels, kernel_size=3, padding=1)
-        self.conv_trunk = nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1)
-        self.upsample = nn.Sequential(
-            nn.Conv2d(hidden_channels, hidden_channels * (scale_factor ** 2), kernel_size=3, padding=1),
-            nn.PixelShuffle(scale_factor),
-            nn.LeakyReLU(negative_slope=0.2, inplace=True),
-            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
+        self.net = nn.Sequential(
+            nn.Conv2d(channels, hidden_channels, kernel_size=3, padding=1),
             nn.SiLU(inplace=True),
-            nn.Conv2d(hidden_channels, channels, kernel_size=3, padding=1),
+            nn.Conv2d(hidden_channels, channels * (scale_factor ** 2), kernel_size=3, padding=1),
+            nn.SiLU(inplace=True),
+            nn.PixelShuffle(scale_factor),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
         )
         self.act = nn.SiLU(inplace=True)
 
@@ -638,10 +572,7 @@ class LatentUpscaler(nn.Module):
 
     def _forward_2d(self, latents: torch.Tensor) -> torch.Tensor:
         residual = F.interpolate(latents, scale_factor=self.scale_factor, mode="nearest")
-        features = self.conv_first(latents)
-        trunk_out = self.conv_trunk(self.trunk(features))
-        features = features + trunk_out
-        out = self.upsample(features)
+        out = self.net(latents)
         return self.act(out + residual.to(out.dtype))
 
 
@@ -720,8 +651,6 @@ class VAETrainer:
         self.cfg = config
         self.cfg.paths.ensure_directories()
 
-        torch.backends.cudnn.benchmark = True
-
         self.accelerator = Accelerator(
             mixed_precision=config.model.mixed_precision,
             gradient_accumulation_steps=config.optimiser.gradient_accumulation_steps,
@@ -741,7 +670,6 @@ class VAETrainer:
                 f"Found only {len(self.dataset)} images but batch_size is {self.cfg.optimiser.batch_size}."
             )
 
-        persistent_workers = self.cfg.dataset.persistent_workers and self.cfg.dataset.num_workers > 0
         self.dataloader = DataLoader(
             self.dataset,
             batch_size=self.cfg.optimiser.batch_size,
@@ -749,7 +677,6 @@ class VAETrainer:
             drop_last=True,
             num_workers=self.cfg.dataset.num_workers,
             pin_memory=True,
-            persistent_workers=persistent_workers,
         )
 
         self.vae = self._load_vae()
@@ -764,13 +691,13 @@ class VAETrainer:
             prepare_items.append(self.latent_upscaler)
         prepare_items.extend([self.optimizer, self.scheduler])
         prepared = self.accelerator.prepare(*prepare_items)
-        idx = 0
-        self.dataloader = prepared[idx]; idx += 1
-        self.vae = prepared[idx]; idx += 1
+        iterator = iter(prepared)
+        self.dataloader = next(iterator)
+        self.vae = next(iterator)
         if self.latent_upscaler is not None:
-            self.latent_upscaler = prepared[idx]; idx += 1
-        self.optimizer = prepared[idx]; idx += 1
-        self.scheduler = prepared[idx]; idx += 1
+            self.latent_upscaler = next(iterator)
+        self.optimizer = next(iterator)
+        self.scheduler = next(iterator)
 
         self.compile_enabled = False
         if self.cfg.model.use_torch_compile and hasattr(torch, "compile"):
@@ -939,14 +866,7 @@ class VAETrainer:
         latent_channels = self._determine_latent_channels(vae)
         if latent_channels is None:
             raise RuntimeError("Unable to determine latent channels for upscaler")
-        upscaler = LatentUpscaler(
-            latent_channels,
-            scale_factor=scale_factor,
-            hidden_multiplier=cfg.latent_upscaler.width_multiplier,
-            num_blocks=cfg.latent_upscaler.rrdb_blocks,
-            growth_channels=cfg.latent_upscaler.growth_channels,
-            residual_scaling=cfg.latent_upscaler.residual_scaling,
-        )
+        upscaler = LatentUpscaler(latent_channels, scale_factor=scale_factor, hidden_multiplier=cfg.latent_upscaler.width_multiplier)
         return upscaler.to(self.device, dtype=self.cfg.model.dtype)
 
     def _freeze_parameters(self) -> None:
@@ -1107,12 +1027,12 @@ class VAETrainer:
             batch_grads: List[float] = []
 
             for batch in self.dataloader:
-                batch = batch.to(self.device)
-                low_res = self._downsample_for_model(batch)
-                reconstruction, encode_out = self._forward(latents_input=low_res)
-                reconstruction = self._match_spatial(reconstruction, batch)
-
                 with self.accelerator.accumulate(self.vae):
+                    batch = batch.to(self.device)
+                    low_res = self._downsample_for_model(batch)
+                    reconstruction, encode_out = self._forward(latents_input=low_res)
+                    reconstruction = self._match_spatial(reconstruction, batch)
+
                     losses = self._compute_losses(reconstruction, batch, encode_out)
                     total_loss, coeffs, medians = self.loss_normalizer.update(losses)
                     if not torch.isfinite(total_loss):
@@ -1123,9 +1043,7 @@ class VAETrainer:
                     grad_norm = torch.tensor(0.0, device=self.device)
                     if self.accelerator.sync_gradients:
                         if self.cfg.optimiser.clip_grad_norm > 0:
-                            grad_norm = self.accelerator.clip_grad_norm_(
-                                self.trainable_params, self.cfg.optimiser.clip_grad_norm
-                            )
+                            grad_norm = self.accelerator.clip_grad_norm_(self.trainable_params, self.cfg.optimiser.clip_grad_norm)
                         self.optimizer.step()
                         self.scheduler.step()
                         self.optimizer.zero_grad(set_to_none=True)
