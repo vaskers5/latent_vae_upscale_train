@@ -102,6 +102,9 @@ logging:
 latent_upscaler:
   enabled: true
   width_multiplier: 2
+  rrdb_blocks: 8
+  growth_channels: 32
+  residual_scaling: 0.2
 
 augmentation:
   horizontal_flip_prob: 0.5
