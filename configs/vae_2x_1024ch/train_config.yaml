@@ -1,7 +1,8 @@
 # Baseline single-node configuration. Override values via additional YAML files
 # or the CLI --override flag.
 
-ds_path: "./datasets/test_dataset" # test dataset path
+# ds_path: "./datasets/test_dataset" # test dataset path
+ds_path: "./datasets/full_dataset" # test dataset path
 
 project: "simple_latent_solo_model"
 save_root_dir: "simple_latent_solo_model"
@@ -33,7 +34,7 @@ optimizer:
   batch_size: 24
   base_learning_rate: 1.0
   min_learning_rate: 9e-7
-  num_epochs: 750
+  num_epochs: 50
   optimizer_type: "dadapt_adam"
   beta2: 0.97
   eps: 1e-6
@@ -74,8 +75,8 @@ loss:
 logging:
   use_wandb: true
   sample_interval_share: 1000
-  global_sample_interval: 100
-  global_save_interval: 1000
+  global_sample_interval: 500
+  global_save_interval: 2500
   save_model: true
   save_barrier: 1.003
   log_grad_norm: true
