@@ -13,7 +13,7 @@ import random
 import re
 import shutil
 from collections import deque
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -37,6 +37,7 @@ from diffusers import (
 from PIL import Image, UnidentifiedImageError
 from torch import nn
 from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR
+from torch.optim.swa_utils import AveragedModel
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
@@ -69,6 +70,18 @@ def _resolve_dtype(value: Any) -> torch.dtype:
         return mapping[str(value).lower()]
     except KeyError as exc:  # pragma: no cover - config guard
         raise ValueError(f"Unsupported dtype value: {value!r}") from exc
+
+
+def _resolve_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "yes", "y"}:
+            return True
+        if lowered in {"false", "0", "no", "n"}:
+            return False
+    return bool(value)
 
 
 @dataclass
@@ -183,6 +196,26 @@ class OptimizerConfig:
 
 
 @dataclass
+class EMAConfig:
+    enabled: bool
+    decay: float
+    update_after_step: int
+    update_interval: int
+    device: Optional[str]
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "EMAConfig":
+        section = data.get("ema", {})
+        return cls(
+            enabled=_resolve_bool(section.get("enabled", data.get("ema_enabled", False))),
+            decay=float(section.get("decay", data.get("ema_decay", 0.999))),
+            update_after_step=int(section.get("update_after_step", data.get("ema_update_after_step", 0))),
+            update_interval=max(1, int(section.get("update_interval", data.get("ema_update_interval", 1)))),
+            device=section.get("device") or data.get("ema_device"),
+        )
+
+
+@dataclass
 class ModelConfig:
     load_from: Optional[str]
     hf_repo: Optional[str]
@@ -195,12 +228,23 @@ class ModelConfig:
     full_training: bool
     vae_kind: str
     kl_ratio: float
+    use_torch_compile: bool
+    torch_compile_backend: Optional[str]
+    torch_compile_mode: Optional[str]
+    torch_compile_fullgraph: Optional[bool]
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any], project: str) -> "ModelConfig":
         section = data.get("model", {})
         load_from = section.get("LOAD_FROM") or section.get("load_from") or data.get("LOAD_FROM") or data.get("load_from")
         load_from = str(load_from) if load_from else None
+        compile_fullgraph = section.get("torch_compile_fullgraph")
+        if compile_fullgraph is None:
+            compile_fullgraph = data.get("torch_compile_fullgraph")
+        if isinstance(compile_fullgraph, str):
+            compile_fullgraph = _resolve_bool(compile_fullgraph, default=False)
+        elif compile_fullgraph is not None:
+            compile_fullgraph = bool(compile_fullgraph)
         return cls(
             load_from=load_from,
             hf_repo=section.get("hf_repo") or data.get("hf_repo"),
@@ -209,10 +253,14 @@ class ModelConfig:
             hf_auth_token=section.get("hf_auth_token") or data.get("hf_auth_token"),
             dtype=_resolve_dtype(section.get("dtype", data.get("dtype", "float32"))),
             mixed_precision=str(section.get("mixed_precision", data.get("mixed_precision", "no"))),
-            train_decoder_only=bool(section.get("train_decoder_only", data.get("train_decoder_only", True))),
-            full_training=bool(section.get("full_training", data.get("full_training", False))),
+            train_decoder_only=_resolve_bool(section.get("train_decoder_only", data.get("train_decoder_only", True))),
+            full_training=_resolve_bool(section.get("full_training", data.get("full_training", False))),
             vae_kind=str(section.get("vae_kind", data.get("vae_kind", "kl"))),
             kl_ratio=float(section.get("kl_ratio", data.get("kl_ratio", 0.0))),
+            use_torch_compile=_resolve_bool(section.get("use_torch_compile", data.get("use_torch_compile", True))),
+            torch_compile_backend=section.get("torch_compile_backend") or data.get("torch_compile_backend"),
+            torch_compile_mode=section.get("torch_compile_mode") or data.get("torch_compile_mode"),
+            torch_compile_fullgraph=compile_fullgraph,
         )
 
 
@@ -222,6 +270,12 @@ class LossConfig:
     median_coeff_steps: int
     lpips_backbone: str
     lpips_eval_resolution: int
+    focal_frequency_alpha: float
+    focal_frequency_patch_factor: int
+    focal_frequency_log_weight: bool
+    focal_frequency_ave_spectrum: bool
+    focal_frequency_normalize: bool
+    focal_frequency_eps: float
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any], default_resolution: int, default_kl: float) -> "LossConfig":
@@ -232,6 +286,7 @@ class LossConfig:
             "edge": float(section.get("ratios", {}).get("edge", data.get("loss_ratios", {}).get("edge", 0.1))),
             "lpips": float(section.get("ratios", {}).get("lpips", data.get("loss_ratios", {}).get("lpips", 0.0))),
             "kl": float(section.get("ratios", {}).get("kl", data.get("loss_ratios", {}).get("kl", default_kl))),
+            "ffl": float(section.get("ratios", {}).get("ffl", data.get("loss_ratios", {}).get("ffl", 0.0))),
         }
         ratios = {k: v for k, v in ratios.items() if v != 0}
         return cls(
@@ -239,6 +294,12 @@ class LossConfig:
             median_coeff_steps=int(section.get("median_coeff_steps", data.get("median_coeff_steps", 256))),
             lpips_backbone=str(section.get("lpips_backbone", data.get("lpips_backbone", "vgg"))),
             lpips_eval_resolution=int(section.get("lpips_eval_resolution", data.get("lpips_eval_resolution", default_resolution))),
+            focal_frequency_alpha=float(section.get("focal_frequency", {}).get("alpha", data.get("focal_frequency_alpha", 1.0))),
+            focal_frequency_patch_factor=int(section.get("focal_frequency", {}).get("patch_factor", data.get("focal_frequency_patch_factor", 1))),
+            focal_frequency_log_weight=_resolve_bool(section.get("focal_frequency", {}).get("log_weight", data.get("focal_frequency_log_weight", True))),
+            focal_frequency_ave_spectrum=_resolve_bool(section.get("focal_frequency", {}).get("ave_spectrum", data.get("focal_frequency_ave_spectrum", False))),
+            focal_frequency_normalize=_resolve_bool(section.get("focal_frequency", {}).get("normalize", data.get("focal_frequency_normalize", True))),
+            focal_frequency_eps=float(section.get("focal_frequency", {}).get("eps", data.get("focal_frequency_eps", 1e-8))),
         )
 
 
@@ -295,6 +356,7 @@ class TrainingConfig:
     losses: LossConfig
     logging: LoggingConfig
     latent_upscaler: LatentUpscalerConfig
+    ema: EMAConfig
     seed: int
 
     @classmethod
@@ -306,6 +368,7 @@ class TrainingConfig:
         losses = LossConfig.from_dict(data, dataset.model_resolution, model.kl_ratio)
         logging = LoggingConfig.from_dict(data, timestamp=paths.timestamp)
         latent_upscaler = LatentUpscalerConfig.from_dict(data)
+        ema = EMAConfig.from_dict(data)
         seed = int(data.get("seed", int(datetime.now().strftime("%Y%m%d"))))
         return cls(
             paths=paths,
@@ -315,6 +378,7 @@ class TrainingConfig:
             losses=losses,
             logging=logging,
             latent_upscaler=latent_upscaler,
+            ema=ema,
             seed=seed,
         )
 
@@ -464,6 +528,46 @@ class MedianLossNormalizer:
         return total_loss, coeffs, medians
 
 
+class FocalFrequencyLoss(nn.Module):
+    def __init__(
+        self,
+        alpha: float = 1.0,
+        patch_factor: int = 1,
+        ave_spectrum: bool = False,
+        log_weight: bool = True,
+        normalize: bool = True,
+        eps: float = 1e-8,
+    ) -> None:
+        super().__init__()
+        self.alpha = alpha
+        self.patch_factor = max(1, patch_factor)
+        self.ave_spectrum = ave_spectrum
+        self.log_weight = log_weight
+        self.normalize = normalize
+        self.eps = eps
+
+    def forward(self, prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        pred = prediction.to(torch.float32)
+        ref = target.to(torch.float32)
+        pred_freq = torch.fft.rfft2(pred, dim=(-2, -1), norm="ortho")
+        ref_freq = torch.fft.rfft2(ref, dim=(-2, -1), norm="ortho")
+        diff = pred_freq - ref_freq
+        magnitude = diff.abs()
+        if self.patch_factor > 1:
+            magnitude = magnitude[..., :: self.patch_factor, :: self.patch_factor]
+        if self.ave_spectrum:
+            weight = magnitude.mean(dim=(0, 1), keepdim=True)
+        else:
+            weight = magnitude
+        if self.log_weight:
+            weight = torch.log1p(weight)
+        weight = torch.pow(weight + self.eps, self.alpha)
+        loss_matrix = weight * (magnitude ** 2)
+        if self.normalize:
+            return loss_matrix.mean()
+        return loss_matrix.sum() / loss_matrix.numel()
+
+
 # ---------------------------------------------------------------------------
 # Trainer implementation
 
@@ -521,23 +625,66 @@ class VAETrainer:
         self.optimizer = next(iterator)
         self.scheduler = next(iterator)
 
-        if hasattr(torch, "compile"):
+        self.compile_enabled = False
+        if self.cfg.model.use_torch_compile and hasattr(torch, "compile"):
+            compile_kwargs: Dict[str, Any] = {}
+            if self.cfg.model.torch_compile_backend:
+                compile_kwargs["backend"] = self.cfg.model.torch_compile_backend
+            if self.cfg.model.torch_compile_mode:
+                compile_kwargs["mode"] = self.cfg.model.torch_compile_mode
+            if self.cfg.model.torch_compile_fullgraph is not None:
+                compile_kwargs["fullgraph"] = self.cfg.model.torch_compile_fullgraph
             try:
-                self.vae = torch.compile(self.vae)
+                self.vae = torch.compile(self.vae, **compile_kwargs)
+                self.compile_enabled = True
             except Exception as exc:  # pragma: no cover - diagnostic only
-                self.accelerator.print(f"[WARN] torch.compile failed: {exc}")
+                self.accelerator.print(f"[WARN] torch.compile failed for VAE: {exc}")
+            if self.latent_upscaler is not None:
+                # Compiling the upscaler tends to capture CUDA graph state that later
+                # replays with stale buffers, so keep it eager for stability.
+                self.accelerator.print("[INFO] Skipping torch.compile for latent upscaler (eager mode forced)")
 
         self.trainable_params = [p for p in self.vae.parameters() if p.requires_grad]
         if self.latent_upscaler is not None:
             self.trainable_params.extend(p for p in self.latent_upscaler.parameters() if p.requires_grad)
 
         self.loss_normalizer = MedianLossNormalizer(self.cfg.losses.ratios, self.cfg.losses.median_coeff_steps)
+        self.ffl_module: Optional[FocalFrequencyLoss] = None
+        if self.cfg.losses.ratios.get("ffl", 0.0) > 0:
+            self.ffl_module = FocalFrequencyLoss(
+                alpha=self.cfg.losses.focal_frequency_alpha,
+                patch_factor=self.cfg.losses.focal_frequency_patch_factor,
+                ave_spectrum=self.cfg.losses.focal_frequency_ave_spectrum,
+                log_weight=self.cfg.losses.focal_frequency_log_weight,
+                normalize=self.cfg.losses.focal_frequency_normalize,
+                eps=self.cfg.losses.focal_frequency_eps,
+            )
+
         self.lpips_module: Optional[lpips.LPIPS] = None
         if self.cfg.losses.ratios.get("lpips", 0.0) > 0:
             self.lpips_module = lpips.LPIPS(net=self.cfg.losses.lpips_backbone, verbose=False)
             self.lpips_module = self.lpips_module.to(self.device).eval()
             for p in self.lpips_module.parameters():
                 p.requires_grad_(False)
+
+        self.ema_vae: Optional[AveragedModel] = None
+        self.ema_latent_upscaler: Optional[AveragedModel] = None
+        if self.cfg.ema.enabled:
+            if self.cfg.ema.device:
+                try:
+                    ema_device = torch.device(self.cfg.ema.device)
+                except (TypeError, RuntimeError):  # pragma: no cover - config fallback
+                    self.accelerator.print(
+                        f"[WARN] Invalid EMA device '{self.cfg.ema.device}', falling back to training device"
+                    )
+                    ema_device = self.device
+            else:
+                ema_device = self.device
+            base_vae = self._unwrap_model(self.vae)
+            self.ema_vae = AveragedModel(base_vae, avg_fn=self._ema_avg_fn, device=ema_device)
+            if self.latent_upscaler is not None:
+                base_up = self._unwrap_model(self.latent_upscaler)
+                self.ema_latent_upscaler = AveragedModel(base_up, avg_fn=self._ema_avg_fn, device=ema_device)
 
         self.fixed_samples = self._sample_fixed_batch()
 
@@ -572,7 +719,9 @@ class VAETrainer:
             hf_source = cfg.load_from
 
         vae: nn.Module
-        if cfg.vae_kind == "qwen":
+        kind = (cfg.vae_kind or "").strip().lower()
+
+        if kind == "qwen":
             if path_exists:
                 source = str(load_path)
                 kwargs: Dict[str, Any] = {}
@@ -599,13 +748,18 @@ class VAETrainer:
                     kwargs["revision"] = cfg.hf_revision
                 if cfg.hf_auth_token:
                     kwargs["use_auth_token"] = cfg.hf_auth_token
-            if cfg.vae_kind == "wan":
+            if kind == "wan":
                 vae = AutoencoderKLWan.from_pretrained(source, **kwargs)
             else:
-                if self.cfg.dataset.model_resolution == self.cfg.dataset.high_resolution:
+                if kind in {"kl", "autoencoderkl", "autoencoder_kl"}:
                     vae = AutoencoderKL.from_pretrained(source, **kwargs)
-                else:
+                elif kind in {"asymmetric_kl", "kl_asymmetric", "kl_asym", "asym_kl"}:
                     vae = AsymmetricAutoencoderKL.from_pretrained(source, **kwargs)
+                else:
+                    if self.cfg.dataset.model_resolution == self.cfg.dataset.high_resolution:
+                        vae = AutoencoderKL.from_pretrained(source, **kwargs)
+                    else:
+                        vae = AsymmetricAutoencoderKL.from_pretrained(source, **kwargs)
         display_source = source if not path_exists else str(load_path)
         self.accelerator.print(f"[INFO] Loading VAE from: {display_source}")
         return vae.to(cfg.dtype)
@@ -680,6 +834,12 @@ class VAETrainer:
             {"params": no_decay, "weight_decay": 0.0},
         ]
 
+    def _ema_avg_fn(self, averaged_param: torch.Tensor, model_param: torch.Tensor, _num_averaged: int) -> torch.Tensor:
+        decay = self.cfg.ema.decay
+        if averaged_param is None:
+            return model_param.detach()
+        return averaged_param * decay + model_param.detach() * (1.0 - decay)
+
     def _build_optimizer(self) -> torch.optim.Optimizer:
         groups = self._collect_param_groups()
         cfg = self.cfg.optimiser
@@ -690,6 +850,22 @@ class VAETrainer:
             return torch.optim.AdamW(groups, lr=cfg.base_learning_rate, betas=(0.9, cfg.beta2), eps=cfg.eps)
         if name == "adam":
             return torch.optim.Adam(groups, lr=cfg.base_learning_rate, betas=(0.9, cfg.beta2), eps=cfg.eps)
+        if name in {"dadapt", "dadaptadam", "d_adapt_adam", "dadapt_adam"}:
+            try:
+                from dadaptation import DAdaptAdam
+            except ImportError as exc:  # pragma: no cover - optional dependency guard
+                raise ImportError(
+                    "Optimizer type 'dadapt_adam' requested but the 'dadaptation' package is not installed. "
+                    "Install it with 'pip install dadaptation'."
+                ) from exc
+            return DAdaptAdam(
+                groups,
+                lr=max(cfg.base_learning_rate, 1e-12),
+                betas=(0.9, cfg.beta2),
+                eps=cfg.eps,
+                weight_decay=cfg.weight_decay if cfg.use_decay else 0.0,
+                decouple=cfg.use_decay,
+            )
         raise ValueError(f"Unsupported optimizer type: {self.cfg.optimiser.optimizer_type}")
 
     def _total_steps(self) -> int:
@@ -719,6 +895,19 @@ class VAETrainer:
             return max(min_ratio, 0.5 * (1.0 + math.cos(math.pi * progress)))
 
         return LambdaLR(self.optimizer, schedule)
+
+    def _update_ema(self, step: int) -> None:
+        if self.ema_vae is None:
+            return
+        if step < self.cfg.ema.update_after_step:
+            return
+        if (step - self.cfg.ema.update_after_step) % self.cfg.ema.update_interval != 0:
+            return
+        base_vae = self._unwrap_model(self.vae)
+        self.ema_vae.update_parameters(base_vae)
+        if self.ema_latent_upscaler is not None and self.latent_upscaler is not None:
+            base_up = self._unwrap_model(self.latent_upscaler)
+            self.ema_latent_upscaler.update_parameters(base_up)
 
     def _sample_fixed_batch(self, count: int = 4) -> torch.Tensor:
         indices = random.sample(range(len(self.dataset)), min(count, len(self.dataset)))
@@ -781,6 +970,7 @@ class VAETrainer:
                         self.scheduler.step()
                         self.optimizer.zero_grad(set_to_none=True)
                         global_step += 1
+                        self._update_ema(global_step)
                         progress.update(1)
 
                     if self.accelerator.is_main_process:
@@ -870,7 +1060,12 @@ class VAETrainer:
         if freeze_encoder:
             latents = latents.detach()
         if self.latent_upscaler is not None:
-            latents = self.latent_upscaler(latents)
+            compiler_mod = getattr(torch, "compiler", None)
+            mark_step = getattr(compiler_mod, "cudagraph_mark_step_begin", None)
+            if callable(mark_step):
+                mark_step()
+            # Clone avoids the upstream compiled graph reusing the input buffer across iterations.
+            latents = self.latent_upscaler(latents.clone())
         latents = latents.to(dtype)
         if self._is_video_vae(self.vae):
             decoded = self.vae.decode(latents).sample.squeeze(2)
@@ -891,6 +1086,10 @@ class VAETrainer:
             "mse": F.mse_loss(rec, tgt),
             "edge": F.l1_loss(self._sobel(rec), self._sobel(tgt)),
         }
+        if self.ffl_module is not None:
+            losses["ffl"] = self.ffl_module(rec, tgt)
+        else:
+            losses["ffl"] = torch.tensor(0.0, device=self.device)
         if "lpips" in self.cfg.losses.ratios and self.cfg.losses.ratios["lpips"] > 0:
             losses["lpips"] = self._lpips_loss(rec, tgt)
         else:
@@ -928,28 +1127,54 @@ class VAETrainer:
         grad_y = F.conv2d(tensor, kernel_y, padding=1, groups=channels)
         return torch.sqrt(grad_x * grad_x + grad_y * grad_y + 1e-12)
 
+    @contextmanager
+    def _evaluation_context(self, module: Optional[nn.Module]):
+        if module is None:
+            yield None
+            return
+        prev_mode = module.training
+        first_param = next((p for p in module.parameters()), None)
+        original_device = first_param.device if first_param is not None else self.device
+        if original_device != self.device:
+            module = module.to(self.device)
+        module.eval()
+        try:
+            yield module
+        finally:
+            module.train(prev_mode)
+            if original_device != self.device:
+                module.to(original_device)
+
     def _generate_and_log_samples(self, step: int) -> None:
         try:
-            vae = self._unwrap_model(self.vae).eval()
-            upscaler = self._unwrap_model(self.latent_upscaler).eval() if self.latent_upscaler is not None else None
-            with torch.no_grad():
-                high = self.fixed_samples
-                low = self._downsample_for_model(high)
-                dtype = next(vae.parameters()).dtype
-                low = low.to(dtype)
-                if self._is_video_vae(vae):
-                    latents = vae.encode(low.unsqueeze(2)).latent_dist.mean
-                    if upscaler is not None:
-                        latents = upscaler(latents)
-                    latents = latents.to(dtype)
-                    recon = vae.decode(latents).sample.squeeze(2)
-                else:
-                    latents = vae.encode(low).latent_dist.mean
-                    if upscaler is not None:
-                        latents = upscaler(latents)
-                    latents = latents.to(dtype)
-                    recon = vae.decode(latents).sample
-                recon = self._match_spatial(recon, high)
+            vae_source = self.ema_vae.module if self.ema_vae is not None else self._unwrap_model(self.vae)
+            upscaler_source: Optional[nn.Module]
+            if self.ema_latent_upscaler is not None:
+                upscaler_source = self.ema_latent_upscaler.module
+            else:
+                upscaler_source = self._unwrap_model(self.latent_upscaler)
+            with self._evaluation_context(vae_source) as vae, self._evaluation_context(upscaler_source) as upscaler:
+                if vae is None:
+                    return
+                with torch.no_grad():
+                    high = self.fixed_samples
+                    low = self._downsample_for_model(high)
+                    first_param = next((p for p in vae.parameters()), None)
+                    dtype = first_param.dtype if first_param is not None else torch.float32
+                    low = low.to(dtype)
+                    if self._is_video_vae(vae):
+                        latents = vae.encode(low.unsqueeze(2)).latent_dist.mean
+                        if upscaler is not None:
+                            latents = upscaler(latents)
+                        latents = latents.to(dtype)
+                        recon = vae.decode(latents).sample.squeeze(2)
+                    else:
+                        latents = vae.encode(low).latent_dist.mean
+                        if upscaler is not None:
+                            latents = upscaler(latents)
+                        latents = latents.to(dtype)
+                        recon = vae.decode(latents).sample
+                    recon = self._match_spatial(recon, high)
 
             self.cfg.paths.samples_dir.mkdir(parents=True, exist_ok=True)
             grid_path = self._save_sample_grid(high, recon, step)
@@ -1001,6 +1226,26 @@ class VAETrainer:
                 },
                 directory / "latent_upscaler.pt",
             )
+        if self.ema_vae is not None:
+            torch.save(
+                {
+                    "state_dict": self.ema_vae.module.state_dict(),
+                    "decay": self.cfg.ema.decay,
+                    "update_after_step": self.cfg.ema.update_after_step,
+                    "update_interval": self.cfg.ema.update_interval,
+                },
+                directory / "ema_vae.pt",
+            )
+            if self.ema_latent_upscaler is not None:
+                torch.save(
+                    {
+                        "state_dict": self.ema_latent_upscaler.module.state_dict(),
+                        "decay": self.cfg.ema.decay,
+                        "update_after_step": self.cfg.ema.update_after_step,
+                        "update_interval": self.cfg.ema.update_interval,
+                    },
+                    directory / "ema_latent_upscaler.pt",
+                )
 
     def _save_best_checkpoint(self, loss: float, step: int) -> None:
         if self.cfg.paths.best_dir.exists():
