@@ -17,7 +17,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import bitsandbytes as bnb
 import lpips
@@ -267,6 +267,8 @@ class ModelConfig:
 @dataclass
 class LossConfig:
     ratios: Dict[str, float]
+    enabled: Dict[str, bool]
+    active_losses: Tuple[str, ...]
     median_coeff_steps: int
     lpips_backbone: str
     lpips_eval_resolution: int
@@ -280,17 +282,79 @@ class LossConfig:
     @classmethod
     def from_dict(cls, data: Dict[str, Any], default_resolution: int, default_kl: float) -> "LossConfig":
         section = data.get("loss", {})
-        ratios = {
-            "mae": float(section.get("ratios", {}).get("mae", data.get("loss_ratios", {}).get("mae", 1.0))),
-            "mse": float(section.get("ratios", {}).get("mse", data.get("loss_ratios", {}).get("mse", 1.0))),
-            "edge": float(section.get("ratios", {}).get("edge", data.get("loss_ratios", {}).get("edge", 0.1))),
-            "lpips": float(section.get("ratios", {}).get("lpips", data.get("loss_ratios", {}).get("lpips", 0.0))),
-            "kl": float(section.get("ratios", {}).get("kl", data.get("loss_ratios", {}).get("kl", default_kl))),
-            "ffl": float(section.get("ratios", {}).get("ffl", data.get("loss_ratios", {}).get("ffl", 0.0))),
+
+        ratio_section_raw = section.get("ratios") if isinstance(section.get("ratios"), dict) else {}
+        fallback_ratio_raw = data.get("loss_ratios") if isinstance(data.get("loss_ratios"), dict) else {}
+
+        ratio_section = {str(key).lower(): value for key, value in ratio_section_raw.items()}
+        fallback_ratio_section = {str(key).lower(): value for key, value in fallback_ratio_raw.items()}
+
+        defaults = {
+            "mae": 1.0,
+            "mse": 1.0,
+            "edge": 0.1,
+            "lpips": 0.0,
+            "kl": default_kl,
+            "ffl": 0.0,
         }
-        ratios = {k: v for k, v in ratios.items() if v != 0}
+
+        def resolve_ratio(name: str, default: float) -> float:
+            raw = ratio_section.get(name, fallback_ratio_section.get(name, default))
+            try:
+                return float(raw)
+            except (TypeError, ValueError):  # pragma: no cover - config guard
+                return default
+
+        ratios_full: Dict[str, float] = {}
+        for key, default in defaults.items():
+            ratios_full[key] = resolve_ratio(key, default)
+
+        global_enabled = True
+        toggles: Dict[str, bool] = {}
+
+        raw_enabled = section.get("enabled")
+        if isinstance(raw_enabled, dict):
+            for key, value in raw_enabled.items():
+                toggles[str(key).lower()] = _resolve_bool(value, default=True)
+        elif raw_enabled is not None:
+            global_enabled = _resolve_bool(raw_enabled, default=True)
+
+        raw_enable = section.get("enable")
+        if isinstance(raw_enable, dict):
+            for key, value in raw_enable.items():
+                toggles[str(key).lower()] = _resolve_bool(value, default=True)
+        elif raw_enable is not None and not isinstance(raw_enable, dict):
+            global_enabled = _resolve_bool(raw_enable, default=global_enabled)
+
+        disabled_raw = section.get("disabled")
+        if disabled_raw is None:
+            disabled_raw = section.get("disable")
+        if isinstance(disabled_raw, str):
+            disabled = {disabled_raw.lower()}
+        elif isinstance(disabled_raw, (list, tuple, set)):
+            disabled = {str(item).lower() for item in disabled_raw}
+        elif disabled_raw is None:
+            disabled = set()
+        else:  # pragma: no cover - config guard
+            disabled = {str(disabled_raw).lower()}
+
+        enabled_map: Dict[str, bool] = {}
+        filtered_ratios: Dict[str, float] = {}
+        active_losses: List[str] = []
+
+        for key, value in ratios_full.items():
+            enabled = global_enabled and key not in disabled
+            if key in toggles:
+                enabled = toggles[key]
+            enabled_map[key] = bool(enabled)
+            if enabled and value != 0.0:
+                filtered_ratios[key] = value
+                active_losses.append(key)
+
         return cls(
-            ratios=ratios,
+            ratios=filtered_ratios,
+            enabled=enabled_map,
+            active_losses=tuple(active_losses),
             median_coeff_steps=int(section.get("median_coeff_steps", data.get("median_coeff_steps", 256))),
             lpips_backbone=str(section.get("lpips_backbone", data.get("lpips_backbone", "vgg"))),
             lpips_eval_resolution=int(section.get("lpips_eval_resolution", data.get("lpips_eval_resolution", default_resolution))),
@@ -513,18 +577,28 @@ class LatentUpscaler(nn.Module):
 
 
 class MedianLossNormalizer:
-    def __init__(self, desired_ratios: Dict[str, float], window_steps: int) -> None:
+    def __init__(self, desired_ratios: Dict[str, float], window_steps: int, device: Optional[torch.device] = None) -> None:
         total = sum(desired_ratios.values()) or 1.0
         self.target = {k: v / total for k, v in desired_ratios.items()}
         self.buffers = {k: deque(maxlen=window_steps) for k in desired_ratios.keys()}
+        self.device = device
 
     def update(self, losses: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, float], Dict[str, float]]:
+        if not losses:
+            zero = torch.zeros((), device=self.device) if self.device is not None else torch.tensor(0.0)
+            return zero, {}, {}
         for key, value in losses.items():
             if key in self.buffers:
                 self.buffers[key].append(float(value.detach().abs().cpu()))
         medians = {k: (np.median(buf) if buf else 1.0) for k, buf in self.buffers.items()}
-        coeffs = {k: self.target.get(k, 0.0) / max(medians.get(k, 1.0), 1e-12) for k in losses.keys()}
-        total_loss = sum(coeffs[k] * losses[k] for k in losses.keys())
+        coeffs: Dict[str, float] = {}
+        for key in losses.keys():
+            denom = max(medians.get(key, 1.0), 1e-12)
+            coeffs[key] = self.target.get(key, 0.0) / denom
+        first_loss = next(iter(losses.values()))
+        total_loss = torch.zeros((), device=first_loss.device, dtype=first_loss.dtype)
+        for key, value in losses.items():
+            total_loss = total_loss + coeffs[key] * value
         return total_loss, coeffs, medians
 
 
@@ -648,7 +722,11 @@ class VAETrainer:
         if self.latent_upscaler is not None:
             self.trainable_params.extend(p for p in self.latent_upscaler.parameters() if p.requires_grad)
 
-        self.loss_normalizer = MedianLossNormalizer(self.cfg.losses.ratios, self.cfg.losses.median_coeff_steps)
+        self.loss_normalizer = MedianLossNormalizer(
+            self.cfg.losses.ratios,
+            self.cfg.losses.median_coeff_steps,
+            device=self.device,
+        )
         self.ffl_module: Optional[FocalFrequencyLoss] = None
         if self.cfg.losses.ratios.get("ffl", 0.0) > 0:
             self.ffl_module = FocalFrequencyLoss(
@@ -1081,27 +1159,33 @@ class VAETrainer:
     def _compute_losses(self, reconstruction: torch.Tensor, target: torch.Tensor, encode_result: Dict[str, Any]) -> Dict[str, torch.Tensor]:
         rec = reconstruction.to(torch.float32)
         tgt = target.to(torch.float32)
-        losses: Dict[str, torch.Tensor] = {
-            "mae": F.l1_loss(rec, tgt),
-            "mse": F.mse_loss(rec, tgt),
-            "edge": F.l1_loss(self._sobel(rec), self._sobel(tgt)),
-        }
-        if self.ffl_module is not None:
-            losses["ffl"] = self.ffl_module(rec, tgt)
-        else:
-            losses["ffl"] = torch.tensor(0.0, device=self.device)
-        if "lpips" in self.cfg.losses.ratios and self.cfg.losses.ratios["lpips"] > 0:
-            losses["lpips"] = self._lpips_loss(rec, tgt)
-        else:
-            losses["lpips"] = torch.tensor(0.0, device=self.device)
+        active = set(self.cfg.losses.active_losses)
+        losses: Dict[str, torch.Tensor] = {}
 
-        if self.cfg.model.full_training and not self.cfg.model.train_decoder_only:
-            dist = encode_result["encoding"].latent_dist
-            mean = dist.mean
-            logvar = dist.logvar
-            losses["kl"] = -0.5 * torch.mean(1 + logvar - mean.pow(2) - logvar.exp())
-        else:
-            losses["kl"] = torch.tensor(0.0, device=self.device)
+        if "mae" in active:
+            losses["mae"] = F.l1_loss(rec, tgt)
+        if "mse" in active:
+            losses["mse"] = F.mse_loss(rec, tgt)
+        if "edge" in active:
+            losses["edge"] = F.l1_loss(self._sobel(rec), self._sobel(tgt))
+
+        if "ffl" in active:
+            if self.ffl_module is None:
+                losses["ffl"] = torch.zeros((), device=self.device, dtype=rec.dtype)
+            else:
+                losses["ffl"] = self.ffl_module(rec, tgt)
+
+        if "lpips" in active:
+            losses["lpips"] = self._lpips_loss(rec, tgt)
+
+        if "kl" in active:
+            if self.cfg.model.full_training and not self.cfg.model.train_decoder_only:
+                dist = encode_result["encoding"].latent_dist
+                mean = dist.mean
+                logvar = dist.logvar
+                losses["kl"] = -0.5 * torch.mean(1 + logvar - mean.pow(2) - logvar.exp())
+            else:
+                losses["kl"] = torch.zeros((), device=self.device, dtype=rec.dtype)
         return losses
 
     def _lpips_loss(self, prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:

@@ -14,21 +14,25 @@ dataset:
   horizontal_flip_prob: 0.5
 
 model:
-  load_from: ""
-  hf_repo: null
+  load_from: "simple_latent_solo_model/2025_10_05_08_new_loss_exp/final/"
+  hf_repo: "AuraDiffusion/16ch-vae"
   dtype: "bfloat16"
   mixed_precision: "bf16"
   train_decoder_only: false
   full_training: false
-  vae_kind: "kl"
+  vae_kind: "kl"  # use "asymmetric_kl" to opt into diffusers.AsymmetricAutoencoderKL
   kl_ratio: 0.0
+  use_torch_compile: true
+  torch_compile_backend: "inductor"
+  torch_compile_mode: "max-autotune"
+  torch_compile_fullgraph: false
 
 optimizer:
-  batch_size: 2
-  base_learning_rate: 6e-6
+  batch_size: 14
+  base_learning_rate: 1.0
   min_learning_rate: 9e-7
   num_epochs: 25
-  optimizer_type: "adam8bit"
+  optimizer_type: "dadapt_adam"
   beta2: 0.97
   eps: 1e-6
   clip_grad_norm: 1.0
@@ -40,21 +44,36 @@ optimizer:
   cosine_min_ratio: 0.1
 
 loss:
+  enabled:
+    mae: true
+    mse: true
+    edge: true
+    lpips: true
+    ffl: true
+    kl: true
   ratios:
     mae: 0.35
     mse: 0.05
     edge: 0.10
     lpips: 0.35
+    ffl: 0.15
     kl: 0.00
   median_coeff_steps: 256
   lpips_backbone: "vgg"
   lpips_eval_resolution: 256
+  focal_frequency:
+    alpha: 1.0
+    patch_factor: 1
+    log_weight: true
+    ave_spectrum: false
+    normalize: true
+    eps: 1.0e-08
 
 logging:
   use_wandb: true
   sample_interval_share: 1000
-  global_sample_interval: 500
-  global_save_interval: 1000
+  global_sample_interval: 50
+  global_save_interval: 500
   save_model: true
   save_barrier: 1.003
   log_grad_norm: true
@@ -65,3 +84,9 @@ latent_upscaler:
 
 augmentation:
   horizontal_flip_prob: 0.5
+
+ema:
+  enabled: true
+  decay: 0.999
+  update_after_step: 100
+  update_interval: 1
