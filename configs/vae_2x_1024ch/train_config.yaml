@@ -1,21 +1,22 @@
 # Baseline single-node configuration. Override values via additional YAML files
 # or the CLI --override flag.
 
-ds_path: "./workspace/d23/d23/ae3/"
+ds_path: "./workspace/d23/test_dataset" # test dataset path
+
 project: "simple_latent_solo_model"
 save_root_dir: "simple_latent_solo_model"
 
 dataset:
-  model_resolution: 256
-  high_resolution: 512
+  model_resolution: 64
+  high_resolution: 128
   resize_long_side: 1280
   limit: 0
-  num_workers: 10
+  num_workers: 24
   horizontal_flip_prob: 0.5
   persistent_workers: true
 
 model:
-  load_from: "simple_latent_solo_model/2025_10_05_08_new_loss_exp/final/"
+  load_from: ""
   hf_repo: "AuraDiffusion/16ch-vae"
   dtype: "bfloat16"
   mixed_precision: "bf16"
@@ -29,10 +30,10 @@ model:
   torch_compile_fullgraph: false
 
 optimizer:
-  batch_size: 14
+  batch_size: 102
   base_learning_rate: 1.0
   min_learning_rate: 9e-7
-  num_epochs: 25
+  num_epochs: 750
   optimizer_type: "dadapt_adam"
   beta2: 0.97
   eps: 1e-6
@@ -57,9 +58,9 @@ loss:
     mae: 0.35
     mse: 0.05
     edge: 0.10
-    lpips: 0.35
+    lpips: 0.25
     ffl: 0.15
-    kl: 0.00
+    kl: 0.10
     adv: 0.10
   median_coeff_steps: 256
   lpips_backbone: "vgg"
@@ -93,8 +94,8 @@ adversarial:
 logging:
   use_wandb: true
   sample_interval_share: 1000
-  global_sample_interval: 50
-  global_save_interval: 500
+  global_sample_interval: 100
+  global_save_interval: 1000
   save_model: true
   save_barrier: 1.003
   log_grad_norm: true

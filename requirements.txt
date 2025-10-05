@@ -11,3 +11,4 @@ dadaptation>=3.1
 # Experiment tracking and visualization
 wandb==0.22.1
 matplotlib==3.10.6
+tqdm>=4.66.0
