@@ -53,7 +53,6 @@ loss:
     lpips: true
     ffl: true
     kl: true
-    adv: true
   ratios:
     mae: 0.35
     mse: 0.05
@@ -61,7 +60,6 @@ loss:
     lpips: 0.25
     ffl: 0.15
     kl: 0.10
-    adv: 0.10
   median_coeff_steps: 256
   lpips_backbone: "vgg"
   lpips_eval_resolution: 256
@@ -72,24 +70,6 @@ loss:
     ave_spectrum: false
     normalize: true
     eps: 1.0e-08
-
-adversarial:
-  enabled: true
-  loss_type: "ragan"
-  update_frequency: 1
-  warmup_steps: 1000
-  discriminator:
-    base_channels: 64
-    max_channels: 512
-    num_layers: 4
-    norm: "instance"
-    spectral_norm: true
-  optimizer:
-    lr: 1.5e-4
-    beta1: 0.9
-    beta2: 0.99
-    weight_decay: 0.0
-    clip_grad_norm: 1.0
 
 logging:
   use_wandb: true

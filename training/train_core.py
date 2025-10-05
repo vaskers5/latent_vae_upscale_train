@@ -39,7 +39,6 @@ from torch import nn
 from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR
 from torch.optim.swa_utils import AveragedModel
 from torch.utils.data import DataLoader, Dataset
-from torch.nn.utils import spectral_norm as apply_spectral_norm
 from tqdm import tqdm
 
 
@@ -301,7 +300,6 @@ class LossConfig:
             "lpips": 0.0,
             "kl": default_kl,
             "ffl": 0.0,
-            "adv": 0.0,
         }
 
         def resolve_ratio(name: str, default: float) -> float:
@@ -424,44 +422,6 @@ class LatentUpscalerConfig:
 
 
 @dataclass
-class AdversarialConfig:
-    enabled: bool
-    loss_type: str
-    discriminator_channels: int
-    discriminator_max_channels: int
-    discriminator_layers: int
-    discriminator_norm: str
-    spectral_norm: bool
-    lr: float
-    beta1: float
-    beta2: float
-    weight_decay: float
-    clip_grad_norm: float
-    update_frequency: int
-    warmup_steps: int
-
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "AdversarialConfig":
-        section = data.get("adversarial", {})
-        return cls(
-            enabled=_resolve_bool(section.get("enabled", data.get("adversarial_enabled", False))),
-            loss_type=str(section.get("loss_type", data.get("adversarial_loss", "ragan"))).lower(),
-            discriminator_channels=int(section.get("discriminator", {}).get("base_channels", 64)),
-            discriminator_max_channels=int(section.get("discriminator", {}).get("max_channels", 512)),
-            discriminator_layers=int(section.get("discriminator", {}).get("num_layers", 4)),
-            discriminator_norm=str(section.get("discriminator", {}).get("norm", "instance")).lower(),
-            spectral_norm=_resolve_bool(section.get("discriminator", {}).get("spectral_norm", True)),
-            lr=float(section.get("optimizer", {}).get("lr", section.get("lr", 1e-4))),
-            beta1=float(section.get("optimizer", {}).get("beta1", 0.9)),
-            beta2=float(section.get("optimizer", {}).get("beta2", 0.99)),
-            weight_decay=float(section.get("optimizer", {}).get("weight_decay", 0.0)),
-            clip_grad_norm=float(section.get("optimizer", {}).get("clip_grad_norm", 1.0)),
-            update_frequency=int(section.get("update_frequency", 1)),
-            warmup_steps=int(section.get("warmup_steps", 0)),
-        )
-
-
-@dataclass
 class TrainingConfig:
     paths: PathsConfig
     dataset: DatasetConfig
@@ -471,7 +431,6 @@ class TrainingConfig:
     logging: LoggingConfig
     latent_upscaler: LatentUpscalerConfig
     ema: EMAConfig
-    adversarial: AdversarialConfig
     seed: int
 
     @classmethod
@@ -484,7 +443,6 @@ class TrainingConfig:
         logging = LoggingConfig.from_dict(data, timestamp=paths.timestamp)
         latent_upscaler = LatentUpscalerConfig.from_dict(data)
         ema = EMAConfig.from_dict(data)
-        adversarial = AdversarialConfig.from_dict(data)
         seed = int(data.get("seed", int(datetime.now().strftime("%Y%m%d"))))
         return cls(
             paths=paths,
@@ -495,7 +453,6 @@ class TrainingConfig:
             logging=logging,
             latent_upscaler=latent_upscaler,
             ema=ema,
-            adversarial=adversarial,
             seed=seed,
         )
 
@@ -754,66 +711,6 @@ class FocalFrequencyLoss(nn.Module):
         return loss_matrix.sum() / loss_matrix.numel()
 
 
-class PatchDiscriminator(nn.Module):
-    def __init__(
-        self,
-        in_channels: int = 3,
-        base_channels: int = 64,
-        max_channels: int = 512,
-        num_layers: int = 4,
-        norm: str = "instance",
-        use_spectral_norm: bool = True,
-    ) -> None:
-        super().__init__()
-        layers: List[nn.Module] = []
-        current_in = in_channels
-        current_out = base_channels
-        norm = norm.lower()
-
-        for layer_idx in range(max(1, num_layers)):
-            stride = 1 if layer_idx == 0 else 2
-            conv = nn.Conv2d(current_in, current_out, kernel_size=3, stride=stride, padding=1)
-            if use_spectral_norm:
-                conv = apply_spectral_norm(conv)
-            block: List[nn.Module] = [conv]
-            if norm == "instance":
-                block.append(nn.InstanceNorm2d(current_out))
-            elif norm == "layer":
-                block.append(nn.GroupNorm(1, current_out))
-            block.append(nn.LeakyReLU(0.2, inplace=True))
-            layers.append(nn.Sequential(*block))
-            current_in = current_out
-            current_out = min(current_out * 2, max_channels)
-
-        final = nn.Conv2d(current_in, 1, kernel_size=3, padding=1)
-        if use_spectral_norm:
-            final = apply_spectral_norm(final)
-        layers.append(final)
-        self.net = nn.Sequential(*layers)
-
-    def forward(self, images: torch.Tensor) -> torch.Tensor:
-        return self.net(images)
-
-
-class RaGANLoss:
-    def __init__(self) -> None:
-        self.criterion = nn.BCEWithLogitsLoss()
-
-    def discriminator_loss(self, real_pred: torch.Tensor, fake_pred: torch.Tensor) -> torch.Tensor:
-        real_labels = torch.ones_like(real_pred)
-        fake_labels = torch.zeros_like(fake_pred)
-        loss_real = self.criterion(real_pred - fake_pred.mean(), real_labels)
-        loss_fake = self.criterion(fake_pred - real_pred.mean(), fake_labels)
-        return 0.5 * (loss_real + loss_fake)
-
-    def generator_loss(self, real_pred: torch.Tensor, fake_pred: torch.Tensor) -> torch.Tensor:
-        real_labels = torch.zeros_like(real_pred)
-        fake_labels = torch.ones_like(fake_pred)
-        loss_fake = self.criterion(fake_pred - real_pred.mean(), fake_labels)
-        loss_real = self.criterion(real_pred - fake_pred.mean(), real_labels)
-        return 0.5 * (loss_fake + loss_real)
-
-
 # ---------------------------------------------------------------------------
 # Trainer implementation
 
@@ -859,51 +756,21 @@ class VAETrainer:
         self.latent_upscaler: Optional[LatentUpscaler] = self._build_latent_upscaler(self.vae)
         self._freeze_parameters()
 
-        self.discriminator: Optional[PatchDiscriminator] = None
-        self.discriminator_optimizer: Optional[torch.optim.Optimizer] = None
-        self.adversarial_loss: Optional[RaGANLoss] = None
-
-        adv_ratio = self.cfg.losses.ratios.get("adv", 0.0)
-        self.adv_active = self.cfg.adversarial.enabled and adv_ratio > 0.0
-        if adv_ratio > 0.0 and not self.cfg.adversarial.enabled:
-            self.accelerator.print(
-                "[WARN] Adversarial loss ratio set but adversarial training disabled; ignoring adversarial loss"
-            )
-        if not self.adv_active and "adv" in self.cfg.losses.ratios:
-            self.cfg.losses.ratios.pop("adv")
-            self.cfg.losses.enabled["adv"] = False
-            self.cfg.losses.active_losses = tuple(
-                key for key in self.cfg.losses.active_losses if key != "adv"
-            )
-
-        if self.adv_active:
-            self.discriminator = self._build_discriminator()
-            self.adversarial_loss = self._build_adversarial_loss()
-            self.discriminator_optimizer = self._build_discriminator_optimizer()
-
         self.optimizer = self._build_optimizer()
         self.scheduler = self._build_scheduler()
 
         prepare_items: List[Any] = [self.dataloader, self.vae]
         if self.latent_upscaler is not None:
             prepare_items.append(self.latent_upscaler)
-        if self.discriminator is not None:
-            prepare_items.append(self.discriminator)
         prepare_items.extend([self.optimizer, self.scheduler])
-        if self.discriminator_optimizer is not None:
-            prepare_items.append(self.discriminator_optimizer)
         prepared = self.accelerator.prepare(*prepare_items)
         idx = 0
         self.dataloader = prepared[idx]; idx += 1
         self.vae = prepared[idx]; idx += 1
         if self.latent_upscaler is not None:
             self.latent_upscaler = prepared[idx]; idx += 1
-        if self.discriminator is not None:
-            self.discriminator = prepared[idx]; idx += 1
         self.optimizer = prepared[idx]; idx += 1
         self.scheduler = prepared[idx]; idx += 1
-        if self.discriminator_optimizer is not None:
-            self.discriminator_optimizer = prepared[idx]
 
         self.compile_enabled = False
         if self.cfg.model.use_torch_compile and hasattr(torch, "compile"):
@@ -927,8 +794,6 @@ class VAETrainer:
         self.trainable_params = [p for p in self.vae.parameters() if p.requires_grad]
         if self.latent_upscaler is not None:
             self.trainable_params.extend(p for p in self.latent_upscaler.parameters() if p.requires_grad)
-        if self.discriminator is not None:
-            self.discriminator_optimizer.zero_grad(set_to_none=True)
 
         self.loss_normalizer = MedianLossNormalizer(
             self.cfg.losses.ratios,
@@ -952,8 +817,6 @@ class VAETrainer:
             self.lpips_module = self.lpips_module.to(self.device).eval()
             for p in self.lpips_module.parameters():
                 p.requires_grad_(False)
-
-        self.discriminator_steps = 0
 
         self.ema_vae: Optional[AveragedModel] = None
         self.ema_latent_upscaler: Optional[AveragedModel] = None
@@ -1163,35 +1026,6 @@ class VAETrainer:
             )
         raise ValueError(f"Unsupported optimizer type: {self.cfg.optimiser.optimizer_type}")
 
-    def _build_discriminator(self) -> PatchDiscriminator:
-        cfg = self.cfg.adversarial
-        return PatchDiscriminator(
-            in_channels=3,
-            base_channels=cfg.discriminator_channels,
-            max_channels=cfg.discriminator_max_channels,
-            num_layers=cfg.discriminator_layers,
-            norm=cfg.discriminator_norm,
-            use_spectral_norm=cfg.spectral_norm,
-        )
-
-    def _build_discriminator_optimizer(self) -> torch.optim.Optimizer:
-        if self.discriminator is None:
-            raise RuntimeError("Discriminator not initialised")
-        cfg = self.cfg.adversarial
-        return torch.optim.Adam(
-            self.discriminator.parameters(),
-            lr=cfg.lr,
-            betas=(cfg.beta1, cfg.beta2),
-            weight_decay=cfg.weight_decay,
-        )
-
-    def _build_adversarial_loss(self) -> RaGANLoss:
-        if self.cfg.adversarial.loss_type not in {"ragan", "relativistic", "relativistic-average"}:
-            raise ValueError(
-                f"Unsupported adversarial loss type '{self.cfg.adversarial.loss_type}'. Only 'ragan' is implemented."
-            )
-        return RaGANLoss()
-
     def _total_steps(self) -> int:
         batches_per_epoch = len(self.dataloader)
         effective_batches = batches_per_epoch / max(1, self.cfg.optimiser.gradient_accumulation_steps)
@@ -1219,49 +1053,6 @@ class VAETrainer:
             return max(min_ratio, 0.5 * (1.0 + math.cos(math.pi * progress)))
 
         return LambdaLR(self.optimizer, schedule)
-
-    def _toggle_discriminator_grad(self, enabled: bool) -> None:
-        if self.discriminator is None:
-            return
-        for param in self.discriminator.parameters():
-            param.requires_grad_(enabled)
-
-    def _should_train_discriminator(self) -> bool:
-        frequency = max(1, self.cfg.adversarial.update_frequency)
-        return self.discriminator_steps % frequency == 0
-
-    def _discriminator_step(self, real_images: torch.Tensor, fake_images: torch.Tensor) -> Tuple[Optional[float], Optional[float]]:
-        if self.discriminator is None or self.discriminator_optimizer is None or self.adversarial_loss is None:
-            return None, None
-        self._toggle_discriminator_grad(True)
-        disc_loss_value: Optional[float] = None
-        grad_norm_value: Optional[float] = None
-        with self.accelerator.accumulate(self.discriminator):
-            real_pred = self.discriminator(real_images.to(torch.float32))
-            fake_pred = self.discriminator(fake_images.to(torch.float32))
-            loss = self.adversarial_loss.discriminator_loss(real_pred, fake_pred)
-            self.accelerator.backward(loss)
-            disc_loss_value = float(loss.detach().item())
-            grad_norm = torch.tensor(0.0, device=self.device)
-            if self.accelerator.sync_gradients:
-                if self.cfg.adversarial.clip_grad_norm > 0:
-                    grad_norm = self.accelerator.clip_grad_norm_(
-                        self.discriminator.parameters(), self.cfg.adversarial.clip_grad_norm
-                    )
-                self.discriminator_optimizer.step()
-                self.discriminator_optimizer.zero_grad(set_to_none=True)
-                grad_norm_value = float(grad_norm.detach().item()) if isinstance(grad_norm, torch.Tensor) else 0.0
-        return disc_loss_value, grad_norm_value
-
-    def _generator_adversarial_loss(self, real_images: torch.Tensor, fake_images: torch.Tensor) -> torch.Tensor:
-        if self.discriminator is None or self.adversarial_loss is None:
-            return torch.zeros((), device=self.device)
-        self._toggle_discriminator_grad(False)
-        with torch.no_grad():
-            real_pred = self.discriminator(real_images.to(torch.float32))
-        fake_pred = self.discriminator(fake_images.to(torch.float32))
-        loss = self.adversarial_loss.generator_loss(real_pred.detach(), fake_pred)
-        return loss
 
     def _update_ema(self, step: int) -> None:
         if self.ema_vae is None:
@@ -1295,8 +1086,6 @@ class VAETrainer:
             "full_training": cfg.model.full_training,
             "vae_kind": cfg.model.vae_kind,
             "latent_upscaler_enabled": cfg.latent_upscaler.enabled,
-            "adversarial_enabled": self.adv_active,
-            "adversarial_loss_type": cfg.adversarial.loss_type,
         }
 
     # ---------------------------------------------------------------- training
@@ -1314,12 +1103,8 @@ class VAETrainer:
             self.vae.train()
             if self.latent_upscaler is not None:
                 self.latent_upscaler.train()
-            if self.discriminator is not None:
-                self.discriminator.train()
             batch_losses: List[float] = []
             batch_grads: List[float] = []
-            disc_losses: List[float] = []
-            disc_grads: List[float] = []
 
             for batch in self.dataloader:
                 batch = batch.to(self.device)
@@ -1327,22 +1112,8 @@ class VAETrainer:
                 reconstruction, encode_out = self._forward(latents_input=low_res)
                 reconstruction = self._match_spatial(reconstruction, batch)
 
-                disc_loss_value = None
-                disc_grad_value = None
-                if (
-                    self.adv_active
-                    and self.discriminator is not None
-                    and global_step >= self.cfg.adversarial.warmup_steps
-                    and self._should_train_discriminator()
-                ):
-                    disc_loss_value, disc_grad_value = self._discriminator_step(
-                        batch, reconstruction.detach()
-                    )
-
                 with self.accelerator.accumulate(self.vae):
                     losses = self._compute_losses(reconstruction, batch, encode_out)
-                    if self.adv_active and global_step >= self.cfg.adversarial.warmup_steps:
-                        losses["adv"] = self._generator_adversarial_loss(batch, reconstruction)
                     total_loss, coeffs, medians = self.loss_normalizer.update(losses)
                     if not torch.isfinite(total_loss):
                         raise RuntimeError("Encountered NaN/Inf loss")
@@ -1366,9 +1137,6 @@ class VAETrainer:
                         lr = self.optimizer.param_groups[0]["lr"]
                         batch_losses.append(float(total_loss.detach().item()))
                         batch_grads.append(float(grad_norm.detach().item()) if isinstance(grad_norm, torch.Tensor) else 0.0)
-                        if disc_loss_value is not None:
-                            disc_losses.append(disc_loss_value)
-                            disc_grads.append(disc_grad_value or 0.0)
                         if self.cfg.logging.use_wandb and self.accelerator.sync_gradients:
                             log = {
                                 "total_loss": float(total_loss.detach().item()),
@@ -1377,15 +1145,11 @@ class VAETrainer:
                             }
                             if self.cfg.logging.log_grad_norm:
                                 log["grad_norm"] = batch_grads[-1]
-                                if disc_loss_value is not None:
-                                    log["grad_norm_discriminator"] = disc_grad_value or 0.0
                             for key, value in losses.items():
                                 log[f"loss_{key}"] = float(value.detach().item())
                             for key, value in coeffs.items():
                                 log[f"coeff_{key}"] = float(value)
                                 log[f"median_{key}"] = float(medians.get(key, 0.0))
-                            if disc_loss_value is not None:
-                                log["loss_discriminator"] = disc_loss_value
                             wandb.log(log, step=global_step)
 
                     if (
@@ -1417,9 +1181,6 @@ class VAETrainer:
                                 self._save_best_checkpoint(best_loss, best_step)
                             if self.cfg.logging.use_wandb:
                                 wandb.log({"interm_loss": avg_loss, "interm_grad": avg_grad}, step=global_step)
-
-                if self.adv_active:
-                    self.discriminator_steps += 1
 
             if self.accelerator.is_main_process:
                 epoch_loss = float(np.mean(batch_losses)) if batch_losses else float("nan")
