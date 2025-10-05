@@ -10,7 +10,7 @@ Example usage:
     python pack_and_upload_dataset.py \
         --dataset-root ./workspace/d23/d23 \
         --output-dir ./workspace/d23_archives \
-        --repo-id username/dataset-name \
+        --repo-id vaskers5/latent_vae_upscale_ds \
         --max-files-per-archive 50000 \
         --max-archive-bytes 3221225472 \
         --commit-message "Add compressed dataset shards"
@@ -23,6 +23,7 @@ import argparse
 import os
 import shutil
 import tarfile
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Iterable, List, NamedTuple, Optional, Sequence
 
@@ -232,22 +233,41 @@ def chunk_files(
         yield current
 
 
+def _create_archive(dataset_root: str, archive_path: str, compress_level: int, batch: Sequence[str]) -> str:
+    root_path = Path(dataset_root)
+    with tarfile.open(archive_path, mode="w:gz", compresslevel=compress_level) as tar:
+        for src in batch:
+            src_path = Path(src)
+            arcname = src_path.relative_to(root_path)
+            tar.add(str(src_path), arcname=arcname.as_posix())
+    return archive_path
+
+
 def create_archives(config: ArchivingConfig, files: Sequence[Path]) -> List[Path]:
     archives: List[Path] = []
     file_progress = tqdm(total=len(files), desc="Archiving", unit="file")
 
-    for index, batch in enumerate(
-        chunk_files(files, config.max_files_per_archive, config.max_archive_bytes),
-        start=1,
-    ):
-        archive_path = config.output_dir / f"{config.archive_prefix}_{index:04d}.tar.gz"
-        with tarfile.open(archive_path, mode="w:gz", compresslevel=config.compress_level) as tar:
-            for src in batch:
-                arcname = src.relative_to(config.dataset_root)
-                tar.add(str(src), arcname=arcname.as_posix())
-                file_progress.update(1)
+    with ProcessPoolExecutor() as executor:
+        futures: dict = {}
+        for index, batch in enumerate(
+            chunk_files(files, config.max_files_per_archive, config.max_archive_bytes),
+            start=1,
+        ):
+            archive_path = config.output_dir / f"{config.archive_prefix}_{index:04d}.tar.gz"
+            archives.append(archive_path)
+            futures[
+                executor.submit(
+                    _create_archive,
+                    str(config.dataset_root),
+                    str(archive_path),
+                    config.compress_level,
+                    [str(path) for path in batch],
+                )
+            ] = len(batch)
 
-        archives.append(archive_path)
+        for future in as_completed(futures):
+            file_progress.update(futures[future])
+            future.result()
 
     file_progress.close()
     return archives
