@@ -595,27 +595,21 @@ class VAETrainer:
         is_video = self._is_video_vae(self.vae)
 
         if precomputed_latents is None:
-            encode_input = latents_input.unsqueeze(2) if is_video else latents_input
-            encode_input = encode_input.to(dtype)
-            freeze_encoder = self.cfg.model.train_decoder_only or self.latent_upscaler is not None
-            ctx = torch.no_grad() if freeze_encoder else nullcontext()
-            with ctx:
-                encoding = self.vae.encode(encode_input)
-            latents = encoding.latent_dist.mean if freeze_encoder else encoding.latent_dist.sample()
-            if freeze_encoder:
-                latents = latents.detach()
-            encoding_result: Any = encoding
-        else:
-            latents = precomputed_latents.to(self.device, dtype=dtype)
-            mean = cached_mean.to(self.device, dtype=dtype) if cached_mean is not None else None
-            logvar = cached_logvar.to(self.device, dtype=dtype) if cached_logvar is not None else None
-            if is_video:
-                latents = latents.unsqueeze(2)
-                if mean is not None:
-                    mean = mean.unsqueeze(2)
-                if logvar is not None:
-                    logvar = logvar.unsqueeze(2)
-            encoding_result = self._build_cached_encoding(latents, mean, logvar)
+            raise RuntimeError(
+                "Precomputed latents are required but missing. Generate embeddings before training and "
+                "ensure the dataloader returns cached latents."
+            )
+
+        latents = precomputed_latents.to(self.device, dtype=dtype)
+        mean = cached_mean.to(self.device, dtype=dtype) if cached_mean is not None else None
+        logvar = cached_logvar.to(self.device, dtype=dtype) if cached_logvar is not None else None
+        if is_video:
+            latents = latents.unsqueeze(2)
+            if mean is not None:
+                mean = mean.unsqueeze(2)
+            if logvar is not None:
+                logvar = logvar.unsqueeze(2)
+        encoding_result = self._build_cached_encoding(latents, mean, logvar)
 
         if self.latent_upscaler is not None:
             compiler_mod = getattr(torch, "compiler", None)

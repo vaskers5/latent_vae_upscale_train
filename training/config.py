@@ -417,7 +417,7 @@ class EmbeddingsConfig:
             if not cache_dir.is_absolute():
                 cache_dir = dataset_root / cache_dir
         else:
-            cache_dir = dataset_root / "_precomputed_latents"
+            cache_dir = dataset_root / "cache_embeddings"
         dtype = _resolve_dtype(section.get("dtype", data.get("embeddings_dtype", "float16")))
         variants_per_sample = int(section.get("variants_per_sample", data.get("embeddings_variants", 1)))
         overwrite = _resolve_bool(section.get("overwrite", data.get("embeddings_overwrite", False)))
