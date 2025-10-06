@@ -77,14 +77,14 @@ class ImageFolderDataset(Dataset):
             tensor, _params = self.build_tensor_sample(path)
             return {
                 "image": tensor,
-                "model_input": self._downsample_for_model(tensor),
+                "model_input": self.prepare_model_input(tensor),
             }
 
         record = self.embedding_cache.choose_record(path)
         tensor, params = self.build_tensor_sample(path, params=record.params)
         sample = {
             "image": tensor,
-            "model_input": self._downsample_for_model(tensor),
+            "model_input": self.prepare_model_input(tensor),
             "latents": record.latents,
             "path": str(path),
             "variant_index": record.variant_index,
@@ -107,6 +107,11 @@ class ImageFolderDataset(Dataset):
         tensor = TF.to_tensor(transformed)
         tensor = TF.normalize(tensor, mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
         return tensor, used_params
+
+    def prepare_model_input(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Produce the tensor fed into the model, applying downsampling if needed."""
+
+        return self._downsample_for_model(tensor)
 
     def _downsample_for_model(self, tensor: torch.Tensor) -> torch.Tensor:
         if not self._needs_model_downsample:
