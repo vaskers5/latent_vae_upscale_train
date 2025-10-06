@@ -4,41 +4,53 @@
 # be encoded. Lists like `[128, 256, 512, 1024, 2048]` are accepted directly.
 
 # Optional global dataset root. Can be overridden via --dataset-root.
-dataset_root: /path/to/dataset
+dataset_root: datasets/test_dataset
 
 # Base cache directory. If omitted the tool will use
 # <dataset_root>/<defaults.cache_subdir>.
-cache_root: cache/latent_embeddings
+cache_root: cache_vae_embeddings
 
 # Settings used when a VAE entry does not override the value.
 defaults:
   cache_subdir: cache_embeddings
   variants_per_sample: 1
-  batch_size: 16
+  batch_size: 512
   num_workers: 8
   resize_long_side: 0
   limit: 0
   store_distribution: true
-  embeddings_dtype: float16
   device: cuda
 
 # Define the list (or mapping) of VAE backends to precompute.
 models:
-  qwen_image_vae:
-    hf_repo: Qwen/Qwen-Image
-    hf_subfolder: vae
-    vae_kind: qwen
-    weights_dtype: float16
-    resolutions: [128, 256, 512, 1024, 2048]
 
-  wan_autoencoder:
-    hf_repo: Wan-Labs/Wan-VAE
-    vae_kind: wan
-    variants_per_sample: 2
-    batch_size: 8
-    cache_subdir: wan_family
-    resolutions:
-      - high_resolution: 512
-        model_resolution: 512
-      - high_resolution: 1024
-        model_resolution: 512
+  # TAESD:
+  #   hf_repo: madebyollin/TAESD
+  #   weights_dtype: float32
+  #   vae_kind: stabble_diffusion_4x
+  #   cache_subdir: wan_family
+  #   resolutions: [128, 256, 512, 1024]
+
+
+  sd_vae:
+    hf_repo: stabilityai/sd-vae-ft-mse
+    weights_dtype: float32
+    vae_kind: stabble_diffusion_4x
+    cache_subdir: sd_vae
+    resolutions_with_batchsize:
+      - [128, 512]
+      - [256, 224]
+      - [512, 100]
+      - [1024, 32]
+
+  TAESDXL:
+    hf_repo: madebyollin/TAESDXL
+    weights_dtype: float32
+    vae_kind: stabble_diffusion_4x
+    batch_size: 512
+    cache_subdir: TAESDXL
+    resolutions_with_batchsize:
+      - [128, 512]
+      - [256, 224]
+      - [512, 100]
+      - [1024, 32]

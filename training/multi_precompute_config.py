@@ -24,12 +24,30 @@ class ResolutionSpec:
     high_resolution: int
     model_resolution: int
     resize_long_side: Optional[int] = None
+    batch_size: Optional[int] = None
 
     @classmethod
     def from_raw(cls, raw: Any) -> "ResolutionSpec":
         if isinstance(raw, int):
             value = int(raw)
             return cls(high_resolution=value, model_resolution=value, resize_long_side=None)
+        if isinstance(raw, (list, tuple)):
+            if not raw:
+                raise ValueError("Resolution list entries must include at least the resolution value")
+            high = int(raw[0])
+            if len(raw) == 1:
+                return cls(high_resolution=high, model_resolution=high)
+            if len(raw) == 2:
+                return cls(high_resolution=high, model_resolution=high, batch_size=int(raw[1]))
+            model = int(raw[1])
+            batch = int(raw[2])
+            resize = int(raw[3]) if len(raw) > 3 and raw[3] is not None else None
+            return cls(
+                high_resolution=high,
+                model_resolution=model,
+                resize_long_side=resize,
+                batch_size=batch,
+            )
         if isinstance(raw, dict):
             high = (
                 raw.get("high_resolution")
@@ -46,10 +64,12 @@ class ResolutionSpec:
                 or high
             )
             resize = raw.get("resize_long_side") or raw.get("resize")
+            batch = raw.get("batch_size") or raw.get("batch")
             return cls(
                 high_resolution=int(high),
                 model_resolution=int(model),
                 resize_long_side=int(resize) if resize is not None else None,
+                batch_size=int(batch) if batch is not None else None,
             )
         raise TypeError(f"Unsupported resolution specification: {raw!r}")
 
@@ -128,9 +148,15 @@ class MultiVaeConfig:
 
     @classmethod
     def from_mapping(cls, name: str, data: Dict[str, Any]) -> "MultiVaeConfig":
-        resolutions_raw = data.get("resolutions") or data.get("resolutions_list")
+        resolutions_raw = (
+            data.get("resolutions_with_batchsize")
+            or data.get("resolutions")
+            or data.get("resolutions_list")
+        )
         if not resolutions_raw:
-            raise ValueError(f"VAE entry '{name}' must define a 'resolutions' list")
+            raise ValueError(
+                f"VAE entry '{name}' must define a 'resolutions' or 'resolutions_with_batchsize' list"
+            )
         if isinstance(resolutions_raw, dict):
             iterable: Iterable[Any] = resolutions_raw.values()
         else:
@@ -307,7 +333,10 @@ class MultiPrecomputeConfig:
                 if last_high_resolution is not None and resolution.high_resolution > last_high_resolution:
                     reductions_applied += 1
 
-                effective_batch = max(1, base_batch // (2**reductions_applied))
+                if resolution.batch_size is not None:
+                    effective_batch = max(1, int(resolution.batch_size))
+                else:
+                    effective_batch = max(1, base_batch // (2**reductions_applied))
 
                 resize_long_side = (
                     resolution.resize_long_side
