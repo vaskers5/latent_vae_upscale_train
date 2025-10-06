@@ -64,7 +64,6 @@ class VAETrainer:
             high_resolution=self.cfg.dataset.high_resolution,
             resize_long_side=self.cfg.dataset.resize_long_side,
             limit=self.cfg.dataset.limit,
-            horizontal_flip_prob=self.cfg.dataset.horizontal_flip_prob,
             embedding_cache=self.embedding_cache,
             model_resolution=self.cfg.dataset.model_resolution,
         )

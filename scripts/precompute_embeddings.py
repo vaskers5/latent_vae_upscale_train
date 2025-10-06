@@ -180,7 +180,6 @@ def main() -> None:
         high_resolution=config.dataset.high_resolution,
         resize_long_side=config.dataset.resize_long_side,
         limit=config.dataset.limit,
-        horizontal_flip_prob=config.dataset.horizontal_flip_prob,
         embedding_cache=None,
         model_resolution=config.dataset.model_resolution,
     )

@@ -24,7 +24,7 @@ _CACHE_VERSION = 1
 
 @dataclass(frozen=True)
 class TransformParams:
-    """Deterministic description of spatial augmentations applied to an image."""
+    """Metadata describing how an image tensor was prepared for the model."""
 
     flip: bool
     crop_x: int

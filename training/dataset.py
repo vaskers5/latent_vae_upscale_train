@@ -7,7 +7,7 @@ import random
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageOps, UnidentifiedImageError
 import torch
 import torch.nn.functional as F
 import torchvision.transforms.functional as TF
@@ -19,7 +19,7 @@ __all__ = ["ImageFolderDataset"]
 
 
 class ImageFolderDataset(Dataset):
-    """Recursively reads images and returns random crops normalised to [-1, 1]."""
+    """Recursively reads images and returns centred crops normalised to [-1, 1]."""
 
     def __init__(
         self,
@@ -27,14 +27,12 @@ class ImageFolderDataset(Dataset):
         high_resolution: int,
         resize_long_side: int = 0,
         limit: int = 0,
-        horizontal_flip_prob: float = 0.0,
         embedding_cache: Optional[EmbeddingCache] = None,
         model_resolution: int = 0,
     ) -> None:
         self.root = root
         self.high_resolution = high_resolution
         self.resize_long_side = resize_long_side
-        self.horizontal_flip_prob = horizontal_flip_prob
         self.paths: List[Path] = []
         self.embedding_cache = embedding_cache
         self.model_resolution = model_resolution
@@ -139,43 +137,16 @@ class ImageFolderDataset(Dataset):
         rng: Optional[random.Random] = None,
         params: Optional[TransformParams] = None,
     ) -> Tuple[Image.Image, TransformParams]:
+        del rng, params
+
         if self.high_resolution <= 0:
             return img, TransformParams(flip=False, crop_x=0, crop_y=0)
 
-        gen = rng if rng is not None else random
-
         img = self._resize_if_needed(img)
-
-        if params is None:
-            flip = False
-            if self.horizontal_flip_prob > 0 and gen.random() < self.horizontal_flip_prob:
-                img = img.transpose(Image.FLIP_LEFT_RIGHT)
-                flip = True
-            img, crop_x, crop_y = self._random_crop(img, gen)
-            return img, TransformParams(flip=flip, crop_x=crop_x, crop_y=crop_y)
-
-        if params.flip:
-            img = img.transpose(Image.FLIP_LEFT_RIGHT)
-
-        img = self._ensure_minimum_size(img)
-        width, height = img.size
-        crop_x = max(0, min(width - self.high_resolution, params.crop_x)) if width > self.high_resolution else 0
-        crop_y = max(0, min(height - self.high_resolution, params.crop_y)) if height > self.high_resolution else 0
-        img = img.crop((crop_x, crop_y, crop_x + self.high_resolution, crop_y + self.high_resolution))
-        return img, TransformParams(flip=params.flip, crop_x=crop_x, crop_y=crop_y)
-
-    def _ensure_minimum_size(self, img: Image.Image) -> Image.Image:
-        width, height = img.size
-        if width < self.high_resolution or height < self.high_resolution:
-            img = img.resize((max(width, self.high_resolution), max(height, self.high_resolution)), Image.LANCZOS)
-        return img
-
-    def _random_crop(self, img: Image.Image, gen: random.Random) -> Tuple[Image.Image, int, int]:
-        img = self._ensure_minimum_size(img)
-        width, height = img.size
-        if width == self.high_resolution and height == self.high_resolution:
-            return img, 0, 0
-        crop_x = gen.randint(0, width - self.high_resolution)
-        crop_y = gen.randint(0, height - self.high_resolution)
-        img = img.crop((crop_x, crop_y, crop_x + self.high_resolution, crop_y + self.high_resolution))
-        return img, crop_x, crop_y
+        img = ImageOps.fit(
+            img,
+            (self.high_resolution, self.high_resolution),
+            Image.LANCZOS,
+            centering=(0.5, 0.5),
+        )
+        return img, TransformParams(flip=False, crop_x=0, crop_y=0)

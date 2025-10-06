@@ -122,7 +122,6 @@ class DatasetConfig:
     resize_long_side: int
     limit: int
     num_workers: int
-    horizontal_flip_prob: float
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "DatasetConfig":
@@ -133,7 +132,6 @@ class DatasetConfig:
             resize_long_side=int(section.get("resize_long_side", data.get("resize_long_side", 0))),
             limit=int(section.get("limit", data.get("limit", 0))),
             num_workers=int(section.get("num_workers", data.get("num_workers", 4))),
-            horizontal_flip_prob=float(section.get("horizontal_flip_prob", data.get("horizontal_flip_prob", 0.0))),
         )
 
 
