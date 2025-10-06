@@ -64,8 +64,8 @@ class VAETrainer:
             high_resolution=self.cfg.dataset.high_resolution,
             resize_long_side=self.cfg.dataset.resize_long_side,
             limit=self.cfg.dataset.limit,
-            horizontal_flip_prob=self.cfg.dataset.horizontal_flip_prob,
             embedding_cache=self.embedding_cache,
+            model_resolution=self.cfg.dataset.model_resolution,
         )
         if len(self.dataset) < self.cfg.optimiser.batch_size:
             raise RuntimeError(
@@ -77,14 +77,7 @@ class VAETrainer:
         self._freeze_parameters()
 
         if self.embedding_cache is not None:
-            self.embedding_cache.ensure_populated(
-                self.dataset,
-                self.vae,
-                device=self.device,
-                encode_dtype=next(self.vae.parameters()).dtype,
-                seed=self.cfg.seed,
-                accelerator=self.accelerator,
-            )
+            self.embedding_cache.validate_dataset(self.dataset)
             self.accelerator.wait_for_everyone()
 
         self.dataloader = DataLoader(
@@ -128,6 +121,8 @@ class VAETrainer:
                 self.accelerator.print(f"[WARN] torch.compile failed for VAE: {exc}")
             if self.latent_upscaler is not None:
                 self.accelerator.print("[INFO] Skipping torch.compile for latent upscaler (eager mode forced)")
+
+        self._offload_unused_encoder()
 
         self.trainable_params = [p for p in self.vae.parameters() if p.requires_grad]
         if self.latent_upscaler is not None:
@@ -310,6 +305,26 @@ class VAETrainer:
                     names.append(f"post_quant_conv.{name}")
         self.accelerator.print(f"[INFO] Unfrozen {len(names)} parameter tensors")
 
+    def _offload_unused_encoder(self) -> None:
+        if not self.cfg.embeddings.enabled:
+            return
+
+        core = self._unwrap_model(self.vae)
+        modules = [("encoder", getattr(core, "encoder", None)), ("quant_conv", getattr(core, "quant_conv", None))]
+        freed_any = False
+        for name, module in modules:
+            if module is None:
+                continue
+            module.to("cpu")
+            module.eval()
+            for param in module.parameters():
+                param.requires_grad_(False)
+            freed_any = True
+            self.accelerator.print(f"[INFO] Offloaded VAE {name} to CPU")
+
+        if freed_any and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     def _collect_param_groups(self) -> List[Dict[str, Any]]:
         modules: List[nn.Module] = [self.vae]
         if self.latent_upscaler is not None:
@@ -393,16 +408,22 @@ class VAETrainer:
 
     def _prepare_batch(
         self, batch: Any
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
         dtype = next(self.vae.parameters()).dtype
         if torch.is_tensor(batch):
-            return batch.to(self.device), None, None, None
+            tensor = batch.to(self.device)
+            return tensor, tensor, None, None, None
         if isinstance(batch, dict):
             image = batch["image"].to(self.device)
+            model_input = batch.get("model_input")
+            if model_input is None:
+                model_input = image
+            else:
+                model_input = model_input.to(self.device)
             latents = self._convert_optional_tensor(batch.get("latents"), dtype)
             mean = self._convert_optional_tensor(batch.get("latent_mean"), dtype)
             logvar = self._convert_optional_tensor(batch.get("latent_logvar"), dtype)
-            return image, latents, mean, logvar
+            return model_input, image, latents, mean, logvar
         raise TypeError(f"Unsupported batch type: {type(batch)!r}")
 
     def _convert_optional_tensor(self, value: Any, dtype: torch.dtype) -> Optional[torch.Tensor]:
@@ -427,17 +448,24 @@ class VAETrainer:
             base_up = self._unwrap_model(self.latent_upscaler)
             self.ema_latent_upscaler.update_parameters(base_up)
 
-    def _sample_fixed_batch(self, count: int = 4) -> torch.Tensor:
+    def _sample_fixed_batch(self, count: int = 4) -> Dict[str, torch.Tensor]:
         indices = random.sample(range(len(self.dataset)), min(count, len(self.dataset)))
-        tensors: List[torch.Tensor] = []
+        high_tensors: List[torch.Tensor] = []
+        model_inputs: List[torch.Tensor] = []
         for idx in indices:
             sample = self.dataset[idx]
             if isinstance(sample, dict):
-                tensors.append(sample["image"])
+                high_tensors.append(sample["image"])
+                model_inputs.append(sample.get("model_input", sample["image"]))
             else:
-                tensors.append(sample)
-        samples = torch.stack(tensors)
-        return samples.to(self.device)
+                high_tensors.append(sample)
+                model_inputs.append(sample)
+        high_batch = torch.stack(high_tensors)
+        model_batch = torch.stack(model_inputs)
+        return {
+            "image": high_batch.to(self.device),
+            "model_input": model_batch.to(self.device),
+        }
 
     def _wandb_payload(self) -> Dict[str, Any]:
         cfg = self.cfg
@@ -479,11 +507,9 @@ class VAETrainer:
 
             for batch in self.dataloader:
                 with self.accelerator.accumulate(self.vae):
-                    high_res, cached_latents, cached_mean, cached_logvar = self._prepare_batch(batch)
+                    _, high_res, cached_latents, cached_mean, cached_logvar = self._prepare_batch(batch)
                     with self.accelerator.autocast():
-                        low_res = self._downsample_for_model(high_res)
                         reconstruction, encode_out = self._forward(
-                            latents_input=low_res,
                             precomputed_latents=cached_latents,
                             cached_mean=cached_mean,
                             cached_logvar=cached_logvar,
@@ -574,19 +600,8 @@ class VAETrainer:
         self.accelerator.print("Training run complete")
 
     # ---------------------------------------------------------------- private
-    def _downsample_for_model(self, batch: torch.Tensor) -> torch.Tensor:
-        if self.cfg.dataset.high_resolution == self.cfg.dataset.model_resolution:
-            return batch
-        return F.interpolate(
-            batch,
-            size=(self.cfg.dataset.model_resolution, self.cfg.dataset.model_resolution),
-            mode="bilinear",
-            align_corners=False,
-        )
-
     def _forward(
         self,
-        latents_input: torch.Tensor,
         precomputed_latents: Optional[torch.Tensor] = None,
         cached_mean: Optional[torch.Tensor] = None,
         cached_logvar: Optional[torch.Tensor] = None,
@@ -595,27 +610,21 @@ class VAETrainer:
         is_video = self._is_video_vae(self.vae)
 
         if precomputed_latents is None:
-            encode_input = latents_input.unsqueeze(2) if is_video else latents_input
-            encode_input = encode_input.to(dtype)
-            freeze_encoder = self.cfg.model.train_decoder_only or self.latent_upscaler is not None
-            ctx = torch.no_grad() if freeze_encoder else nullcontext()
-            with ctx:
-                encoding = self.vae.encode(encode_input)
-            latents = encoding.latent_dist.mean if freeze_encoder else encoding.latent_dist.sample()
-            if freeze_encoder:
-                latents = latents.detach()
-            encoding_result: Any = encoding
-        else:
-            latents = precomputed_latents.to(self.device, dtype=dtype)
-            mean = cached_mean.to(self.device, dtype=dtype) if cached_mean is not None else None
-            logvar = cached_logvar.to(self.device, dtype=dtype) if cached_logvar is not None else None
-            if is_video:
-                latents = latents.unsqueeze(2)
-                if mean is not None:
-                    mean = mean.unsqueeze(2)
-                if logvar is not None:
-                    logvar = logvar.unsqueeze(2)
-            encoding_result = self._build_cached_encoding(latents, mean, logvar)
+            raise RuntimeError(
+                "Precomputed latents are required but missing. Generate embeddings before training and "
+                "ensure the dataloader returns cached latents."
+            )
+
+        latents = precomputed_latents.to(self.device, dtype=dtype)
+        mean = cached_mean.to(self.device, dtype=dtype) if cached_mean is not None else None
+        logvar = cached_logvar.to(self.device, dtype=dtype) if cached_logvar is not None else None
+        if is_video:
+            latents = latents.unsqueeze(2)
+            if mean is not None:
+                mean = mean.unsqueeze(2)
+            if logvar is not None:
+                logvar = logvar.unsqueeze(2)
+        encoding_result = self._build_cached_encoding(latents, mean, logvar)
 
         if self.latent_upscaler is not None:
             compiler_mod = getattr(torch, "compiler", None)
@@ -740,8 +749,9 @@ class VAETrainer:
                 if vae is None:
                     return
                 with torch.no_grad():
-                    high = self.fixed_samples
-                    low = self._downsample_for_model(high)
+                    samples = self.fixed_samples
+                    high = samples["image"]
+                    low = samples["model_input"]
                     first_param = next((p for p in vae.parameters()), None)
                     dtype = first_param.dtype if first_param is not None else torch.float32
                     low = low.to(dtype)

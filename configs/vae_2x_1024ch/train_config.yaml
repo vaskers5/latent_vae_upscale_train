@@ -13,7 +13,6 @@ dataset:
   resize_long_side: 1280
   limit: 0
   num_workers: 24
-  horizontal_flip_prob: 0.5
   persistent_workers: true
 
 embeddings:
@@ -97,9 +96,6 @@ latent_upscaler:
   rrdb_blocks: 8
   growth_channels: 32
   residual_scaling: 0.2
-
-augmentation:
-  horizontal_flip_prob: 0.5
 
 ema:
   enabled: true

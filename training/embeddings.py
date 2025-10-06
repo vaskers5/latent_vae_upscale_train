@@ -6,11 +6,11 @@ import hashlib
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
 
 from .config import DatasetConfig, EmbeddingsConfig
 
@@ -24,7 +24,7 @@ _CACHE_VERSION = 1
 
 @dataclass(frozen=True)
 class TransformParams:
-    """Deterministic description of spatial augmentations applied to an image."""
+    """Metadata describing how an image tensor was prepared for the model."""
 
     flip: bool
     crop_x: int
@@ -151,6 +151,28 @@ class EmbeddingCache:
             variant_index = variants[rng.randrange(0, len(variants))]
         return self.load_record(image_path, variant_index)
 
+    def validate_dataset(self, dataset: "ImageFolderDataset") -> None:
+        """Ensure every dataset image has the expected cached embedding variants."""
+
+        if not self.cfg.enabled:
+            return
+
+        missing: List[Tuple[Path, int]] = []
+        for path in dataset.paths:
+            for variant in range(self.cfg.variants_per_sample):
+                if not self.has_variant(path, variant):
+                    missing.append((path, variant))
+
+        if missing:
+            preview = "\n".join(
+                f"- {path} (variant {variant})" for path, variant in missing[:10]
+            )
+            suffix = "" if len(missing) <= 10 else f"\n... and {len(missing) - 10} more"
+            raise RuntimeError(
+                "Embedding cache incomplete. Missing the following entries:\n"
+                f"{preview}{suffix}"
+            )
+
     # ------------------------------------------------------------------ preparation
     def ensure_populated(
         self,
@@ -190,52 +212,66 @@ class EmbeddingCache:
         vae = vae.to(device)
         vae.eval()
 
-        from tqdm.auto import tqdm  # local import to avoid global dependency
+        dataset_loader = _EmbeddingGenerationDataset(
+            dataset=dataset,
+            pending=missing,
+            cache=self,
+            seed=seed,
+        )
+        loader = DataLoader(
+            dataset_loader,
+            batch_size=self.cfg.precompute_batch_size,
+            shuffle=False,
+            num_workers=self.cfg.num_workers,
+            pin_memory=device.type == "cuda",
+            collate_fn=_collate_embedding_batches,
+        )
 
-        iterator: Iterable[Tuple[Path, int]]
-        if accelerator is None or accelerator.is_main_process:
-            iterator = tqdm(missing, desc="Precomputing latents", unit="img")
-        else:
-            iterator = missing
+        progress = None
+        if main_process:
+            from tqdm.auto import tqdm  # local import to avoid global dependency
+
+            progress = tqdm(total=len(missing), desc="Precomputing latents", unit="img")
 
         with torch.no_grad():
-            for image_path, variant_index in iterator:
-                rng = self._build_rng(seed, image_path, variant_index)
-                sample_tensor, params = dataset.build_tensor_sample(image_path, rng=rng, params=None)
-                # sample_tensor: (C, H, W) in [-1, 1]
-                input_tensor = sample_tensor.unsqueeze(0)
-                if self.dataset_cfg.high_resolution != self.dataset_cfg.model_resolution:
-                    input_tensor = F.interpolate(
-                        input_tensor,
-                        size=(self.dataset_cfg.model_resolution, self.dataset_cfg.model_resolution),
-                        mode="bilinear",
-                        align_corners=False,
-                    )
-                encode_input = input_tensor.to(device=device, dtype=encode_dtype)
+            for batch in loader:
+                model_inputs = batch["model_input"].to(device=device, dtype=encode_dtype)
                 if self._is_video_vae(vae):
-                    encode_input = encode_input.unsqueeze(2)
-                encoding = vae.encode(encode_input)
+                    model_inputs = model_inputs.unsqueeze(2)
+                encoding = vae.encode(model_inputs)
                 latent_mean = encoding.latent_dist.mean.detach()
-                if self.cfg.store_distribution:
-                    latent_logvar = encoding.latent_dist.logvar.detach()
-                else:
-                    latent_logvar = None
+                latent_logvar = (
+                    encoding.latent_dist.logvar.detach() if self.cfg.store_distribution else None
+                )
+
                 latents = latent_mean
                 if self._is_video_vae(vae):
                     latents = latents.squeeze(2)
+                    latent_mean = latent_mean.squeeze(2)
                     if latent_logvar is not None:
                         latent_logvar = latent_logvar.squeeze(2)
-                latents = latents.squeeze(0).to(self.cfg.dtype)
-                mean_tensor = latent_mean.squeeze(0) if self.cfg.store_distribution else None
-                logvar_tensor = latent_logvar.squeeze(0) if latent_logvar is not None else None
-                self.save_record(
-                    image_path,
-                    variant_index,
-                    latents,
-                    params,
-                    mean=mean_tensor,
-                    logvar=logvar_tensor,
-                )
+
+                latents = latents.to(self.cfg.dtype)
+
+                for idx, image_path in enumerate(batch["paths"]):
+                    variant_index = batch["variants"][idx]
+                    params = batch["params"][idx]
+                    mean_tensor = latent_mean[idx] if self.cfg.store_distribution else None
+                    logvar_tensor = latent_logvar[idx] if latent_logvar is not None else None
+                    self.save_record(
+                        image_path,
+                        variant_index,
+                        latents[idx],
+                        params,
+                        mean=mean_tensor,
+                        logvar=logvar_tensor,
+                    )
+
+                if progress is not None:
+                    progress.update(len(batch["paths"]))
+
+        if progress is not None:
+            progress.close()
 
         print("[Embeddings] Cache population complete")
         vae.train(vae_prev_mode)
@@ -253,3 +289,45 @@ class EmbeddingCache:
         digest = hashlib.sha256(payload).hexdigest()[:16]
         seed_value = int(digest, 16) & 0xFFFFFFFF
         return random.Random(seed_value)
+
+
+class _EmbeddingGenerationDataset(Dataset):
+    """Dataset wrapper that yields tensors ready for VAE encoding."""
+
+    def __init__(
+        self,
+        *,
+        dataset: "ImageFolderDataset",
+        pending: Sequence[Tuple[Path, int]],
+        cache: EmbeddingCache,
+        seed: int,
+    ) -> None:
+        self.dataset = dataset
+        self.pending = list(pending)
+        self.cache = cache
+        self.seed = seed
+
+    def __len__(self) -> int:
+        return len(self.pending)
+
+    def __getitem__(self, index: int) -> Dict[str, Any]:
+        image_path, variant_index = self.pending[index]
+        rng = self.cache._build_rng(self.seed, image_path, variant_index)
+        sample_tensor, params = self.dataset.build_tensor_sample(image_path, rng=rng, params=None)
+        model_input = self.dataset.prepare_model_input(sample_tensor).contiguous()
+        return {
+            "path": image_path,
+            "variant": variant_index,
+            "model_input": model_input,
+            "params": params,
+        }
+
+
+def _collate_embedding_batches(batch: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    model_inputs = torch.stack([item["model_input"] for item in batch], dim=0)
+    return {
+        "model_input": model_inputs,
+        "params": [item["params"] for item in batch],
+        "paths": [item["path"] for item in batch],
+        "variants": [item["variant"] for item in batch],
+    }

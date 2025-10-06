@@ -122,7 +122,6 @@ class DatasetConfig:
     resize_long_side: int
     limit: int
     num_workers: int
-    horizontal_flip_prob: float
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "DatasetConfig":
@@ -133,7 +132,6 @@ class DatasetConfig:
             resize_long_side=int(section.get("resize_long_side", data.get("resize_long_side", 0))),
             limit=int(section.get("limit", data.get("limit", 0))),
             num_workers=int(section.get("num_workers", data.get("num_workers", 4))),
-            horizontal_flip_prob=float(section.get("horizontal_flip_prob", data.get("horizontal_flip_prob", 0.0))),
         )
 
 
@@ -417,7 +415,7 @@ class EmbeddingsConfig:
             if not cache_dir.is_absolute():
                 cache_dir = dataset_root / cache_dir
         else:
-            cache_dir = dataset_root / "_precomputed_latents"
+            cache_dir = dataset_root / "cache_embeddings"
         dtype = _resolve_dtype(section.get("dtype", data.get("embeddings_dtype", "float16")))
         variants_per_sample = int(section.get("variants_per_sample", data.get("embeddings_variants", 1)))
         overwrite = _resolve_bool(section.get("overwrite", data.get("embeddings_overwrite", False)))
