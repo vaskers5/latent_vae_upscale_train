@@ -290,7 +290,7 @@ class MultiPrecomputeConfig:
                 )
 
             variants = variants_override or model.variants_per_sample or self.defaults.variants_per_sample
-            batch = batch_override or model.batch_size or self.defaults.batch_size
+            base_batch = batch_override or model.batch_size or self.defaults.batch_size
             workers = workers_override or model.num_workers or self.defaults.num_workers
             resize = model.resize_long_side if model.resize_long_side is not None else self.defaults.resize_long_side
             limit = model.limit if model.limit is not None else self.defaults.limit
@@ -299,7 +299,16 @@ class MultiPrecomputeConfig:
             )
             embeddings_dtype = model.embeddings_dtype or self.defaults.embeddings_dtype
 
+            base_batch = max(1, int(base_batch))
+            last_high_resolution: Optional[int] = None
+            reductions_applied = 0
+
             for resolution in model.resolutions:
+                if last_high_resolution is not None and resolution.high_resolution > last_high_resolution:
+                    reductions_applied += 1
+
+                effective_batch = max(1, base_batch // (2**reductions_applied))
+
                 resize_long_side = (
                     resolution.resize_long_side
                     if resolution.resize_long_side is not None
@@ -319,7 +328,7 @@ class MultiPrecomputeConfig:
                         resize_long_side=int(resize_long_side),
                         limit=int(limit) if limit is not None else 0,
                         variants_per_sample=max(1, int(variants)),
-                        batch_size=max(1, int(batch)),
+                        batch_size=effective_batch,
                         num_workers=max(0, int(workers)),
                         store_distribution=bool(store_distribution),
                         embeddings_dtype=embeddings_dtype,
@@ -333,5 +342,7 @@ class MultiPrecomputeConfig:
                         display_resolution=resolution.display,
                     )
                 )
+
+                last_high_resolution = resolution.high_resolution
 
         return tasks
