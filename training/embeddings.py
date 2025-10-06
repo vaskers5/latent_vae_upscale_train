@@ -151,6 +151,28 @@ class EmbeddingCache:
             variant_index = variants[rng.randrange(0, len(variants))]
         return self.load_record(image_path, variant_index)
 
+    def validate_dataset(self, dataset: "ImageFolderDataset") -> None:
+        """Ensure every dataset image has the expected cached embedding variants."""
+
+        if not self.cfg.enabled:
+            return
+
+        missing: List[Tuple[Path, int]] = []
+        for path in dataset.paths:
+            for variant in range(self.cfg.variants_per_sample):
+                if not self.has_variant(path, variant):
+                    missing.append((path, variant))
+
+        if missing:
+            preview = "\n".join(
+                f"- {path} (variant {variant})" for path, variant in missing[:10]
+            )
+            suffix = "" if len(missing) <= 10 else f"\n... and {len(missing) - 10} more"
+            raise RuntimeError(
+                "Embedding cache incomplete. Missing the following entries:\n"
+                f"{preview}{suffix}"
+            )
+
     # ------------------------------------------------------------------ preparation
     def ensure_populated(
         self,

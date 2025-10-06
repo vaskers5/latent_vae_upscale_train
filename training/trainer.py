@@ -77,14 +77,7 @@ class VAETrainer:
         self._freeze_parameters()
 
         if self.embedding_cache is not None:
-            self.embedding_cache.ensure_populated(
-                self.dataset,
-                self.vae,
-                device=self.device,
-                encode_dtype=next(self.vae.parameters()).dtype,
-                seed=self.cfg.seed,
-                accelerator=self.accelerator,
-            )
+            self.embedding_cache.validate_dataset(self.dataset)
             self.accelerator.wait_for_everyone()
 
         self.dataloader = DataLoader(
@@ -128,6 +121,8 @@ class VAETrainer:
                 self.accelerator.print(f"[WARN] torch.compile failed for VAE: {exc}")
             if self.latent_upscaler is not None:
                 self.accelerator.print("[INFO] Skipping torch.compile for latent upscaler (eager mode forced)")
+
+        self._offload_unused_encoder()
 
         self.trainable_params = [p for p in self.vae.parameters() if p.requires_grad]
         if self.latent_upscaler is not None:
@@ -309,6 +304,26 @@ class VAETrainer:
                     param.requires_grad = True
                     names.append(f"post_quant_conv.{name}")
         self.accelerator.print(f"[INFO] Unfrozen {len(names)} parameter tensors")
+
+    def _offload_unused_encoder(self) -> None:
+        if not self.cfg.embeddings.enabled:
+            return
+
+        core = self._unwrap_model(self.vae)
+        modules = [("encoder", getattr(core, "encoder", None)), ("quant_conv", getattr(core, "quant_conv", None))]
+        freed_any = False
+        for name, module in modules:
+            if module is None:
+                continue
+            module.to("cpu")
+            module.eval()
+            for param in module.parameters():
+                param.requires_grad_(False)
+            freed_any = True
+            self.accelerator.print(f"[INFO] Offloaded VAE {name} to CPU")
+
+        if freed_any and torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def _collect_param_groups(self) -> List[Dict[str, Any]]:
         modules: List[nn.Module] = [self.vae]
