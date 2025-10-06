@@ -66,6 +66,7 @@ class VAETrainer:
             limit=self.cfg.dataset.limit,
             horizontal_flip_prob=self.cfg.dataset.horizontal_flip_prob,
             embedding_cache=self.embedding_cache,
+            model_resolution=self.cfg.dataset.model_resolution,
         )
         if len(self.dataset) < self.cfg.optimiser.batch_size:
             raise RuntimeError(
@@ -408,16 +409,22 @@ class VAETrainer:
 
     def _prepare_batch(
         self, batch: Any
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
         dtype = next(self.vae.parameters()).dtype
         if torch.is_tensor(batch):
-            return batch.to(self.device), None, None, None
+            tensor = batch.to(self.device)
+            return tensor, tensor, None, None, None
         if isinstance(batch, dict):
             image = batch["image"].to(self.device)
+            model_input = batch.get("model_input")
+            if model_input is None:
+                model_input = image
+            else:
+                model_input = model_input.to(self.device)
             latents = self._convert_optional_tensor(batch.get("latents"), dtype)
             mean = self._convert_optional_tensor(batch.get("latent_mean"), dtype)
             logvar = self._convert_optional_tensor(batch.get("latent_logvar"), dtype)
-            return image, latents, mean, logvar
+            return model_input, image, latents, mean, logvar
         raise TypeError(f"Unsupported batch type: {type(batch)!r}")
 
     def _convert_optional_tensor(self, value: Any, dtype: torch.dtype) -> Optional[torch.Tensor]:
@@ -442,17 +449,24 @@ class VAETrainer:
             base_up = self._unwrap_model(self.latent_upscaler)
             self.ema_latent_upscaler.update_parameters(base_up)
 
-    def _sample_fixed_batch(self, count: int = 4) -> torch.Tensor:
+    def _sample_fixed_batch(self, count: int = 4) -> Dict[str, torch.Tensor]:
         indices = random.sample(range(len(self.dataset)), min(count, len(self.dataset)))
-        tensors: List[torch.Tensor] = []
+        high_tensors: List[torch.Tensor] = []
+        model_inputs: List[torch.Tensor] = []
         for idx in indices:
             sample = self.dataset[idx]
             if isinstance(sample, dict):
-                tensors.append(sample["image"])
+                high_tensors.append(sample["image"])
+                model_inputs.append(sample.get("model_input", sample["image"]))
             else:
-                tensors.append(sample)
-        samples = torch.stack(tensors)
-        return samples.to(self.device)
+                high_tensors.append(sample)
+                model_inputs.append(sample)
+        high_batch = torch.stack(high_tensors)
+        model_batch = torch.stack(model_inputs)
+        return {
+            "image": high_batch.to(self.device),
+            "model_input": model_batch.to(self.device),
+        }
 
     def _wandb_payload(self) -> Dict[str, Any]:
         cfg = self.cfg
@@ -494,11 +508,9 @@ class VAETrainer:
 
             for batch in self.dataloader:
                 with self.accelerator.accumulate(self.vae):
-                    high_res, cached_latents, cached_mean, cached_logvar = self._prepare_batch(batch)
+                    _, high_res, cached_latents, cached_mean, cached_logvar = self._prepare_batch(batch)
                     with self.accelerator.autocast():
-                        low_res = self._downsample_for_model(high_res)
                         reconstruction, encode_out = self._forward(
-                            latents_input=low_res,
                             precomputed_latents=cached_latents,
                             cached_mean=cached_mean,
                             cached_logvar=cached_logvar,
@@ -589,19 +601,8 @@ class VAETrainer:
         self.accelerator.print("Training run complete")
 
     # ---------------------------------------------------------------- private
-    def _downsample_for_model(self, batch: torch.Tensor) -> torch.Tensor:
-        if self.cfg.dataset.high_resolution == self.cfg.dataset.model_resolution:
-            return batch
-        return F.interpolate(
-            batch,
-            size=(self.cfg.dataset.model_resolution, self.cfg.dataset.model_resolution),
-            mode="bilinear",
-            align_corners=False,
-        )
-
     def _forward(
         self,
-        latents_input: torch.Tensor,
         precomputed_latents: Optional[torch.Tensor] = None,
         cached_mean: Optional[torch.Tensor] = None,
         cached_logvar: Optional[torch.Tensor] = None,
@@ -749,8 +750,9 @@ class VAETrainer:
                 if vae is None:
                     return
                 with torch.no_grad():
-                    high = self.fixed_samples
-                    low = self._downsample_for_model(high)
+                    samples = self.fixed_samples
+                    high = samples["image"]
+                    low = samples["model_input"]
                     first_param = next((p for p in vae.parameters()), None)
                     dtype = first_param.dtype if first_param is not None else torch.float32
                     low = low.to(dtype)

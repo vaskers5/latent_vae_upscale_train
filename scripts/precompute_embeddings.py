@@ -182,6 +182,7 @@ def main() -> None:
         limit=config.dataset.limit,
         horizontal_flip_prob=config.dataset.horizontal_flip_prob,
         embedding_cache=None,
+        model_resolution=config.dataset.model_resolution,
     )
 
     vae = _load_vae(config)

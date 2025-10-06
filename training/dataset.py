@@ -9,6 +9,7 @@ from typing import Iterable, List, Optional, Tuple
 
 from PIL import Image, UnidentifiedImageError
 import torch
+import torch.nn.functional as F
 import torchvision.transforms.functional as TF
 from torch.utils.data import Dataset
 
@@ -28,6 +29,7 @@ class ImageFolderDataset(Dataset):
         limit: int = 0,
         horizontal_flip_prob: float = 0.0,
         embedding_cache: Optional[EmbeddingCache] = None,
+        model_resolution: int = 0,
     ) -> None:
         self.root = root
         self.high_resolution = high_resolution
@@ -35,6 +37,10 @@ class ImageFolderDataset(Dataset):
         self.horizontal_flip_prob = horizontal_flip_prob
         self.paths: List[Path] = []
         self.embedding_cache = embedding_cache
+        self.model_resolution = model_resolution
+        self._needs_model_downsample = (
+            self.model_resolution > 0 and self.model_resolution != self.high_resolution
+        )
 
         exts = {".png", ".jpg", ".jpeg", ".webp"}
         for current_root, _dirs, files in os.walk(root):
@@ -71,12 +77,16 @@ class ImageFolderDataset(Dataset):
         path = self.paths[index % len(self.paths)]
         if self.embedding_cache is None or not self.embedding_cache.cfg.enabled:
             tensor, _params = self.build_tensor_sample(path)
-            return tensor
+            return {
+                "image": tensor,
+                "model_input": self._downsample_for_model(tensor),
+            }
 
         record = self.embedding_cache.choose_record(path)
         tensor, params = self.build_tensor_sample(path, params=record.params)
         sample = {
             "image": tensor,
+            "model_input": self._downsample_for_model(tensor),
             "latents": record.latents,
             "path": str(path),
             "variant_index": record.variant_index,
@@ -99,6 +109,18 @@ class ImageFolderDataset(Dataset):
         tensor = TF.to_tensor(transformed)
         tensor = TF.normalize(tensor, mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
         return tensor, used_params
+
+    def _downsample_for_model(self, tensor: torch.Tensor) -> torch.Tensor:
+        if not self._needs_model_downsample:
+            return tensor
+        batched = tensor.unsqueeze(0)
+        resized = F.interpolate(
+            batched,
+            size=(self.model_resolution, self.model_resolution),
+            mode="bilinear",
+            align_corners=False,
+        )
+        return resized.squeeze(0)
 
     def _resize_if_needed(self, img: Image.Image) -> Image.Image:
         if self.resize_long_side <= 0:
