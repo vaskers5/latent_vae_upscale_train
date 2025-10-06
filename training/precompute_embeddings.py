@@ -1,9 +1,9 @@
-"""CLI utility to precompute VAE embeddings for a dataset."""
+"""CLI utility to precompute VAE embeddings for multiple VAE backends."""
 
 from __future__ import annotations
 
 import argparse
-import shutil
+import time
 from pathlib import Path
 from typing import Iterable, List
 
@@ -15,17 +15,18 @@ from diffusers import (
     AutoencoderKLWan,
 )
 
-from .config import TrainingConfig
+from .config import DatasetConfig, EmbeddingsConfig
 from .config_loader import load_config
 from .dataset import ImageFolderDataset
 from .embeddings import EmbeddingCache
+from .multi_precompute_config import MultiPrecomputeConfig, MultiPrecomputeTask
 
 __all__ = ["main", "parse_args"]
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Precompute latent embeddings for a dataset")
-    parser.add_argument("--config", type=Path, required=True, help="Path to the training YAML config")
+    parser = argparse.ArgumentParser(description="Precompute latent embeddings for one or more VAEs")
+    parser.add_argument("--config", type=Path, required=True, help="Path to the multi-VAE YAML config")
     parser.add_argument(
         "--dataset-root",
         type=Path,
@@ -35,8 +36,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cache-subdir",
         type=str,
-        default="cache_embeddings",
-        help="Subdirectory (relative to the dataset root) where embeddings are stored",
+        default=None,
+        help=(
+            "Subdirectory or path for cached embeddings."
+            " If relative it is resolved inside the dataset root."
+        ),
     )
     parser.add_argument(
         "--device",
@@ -47,7 +51,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--variants-per-sample",
         type=int,
-        default=1,
+        default=None,
         help="Number of cached variants to generate per image",
     )
     parser.add_argument(
@@ -67,19 +71,24 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Delete existing cached embeddings before recomputing",
     )
+    parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="Skip tasks whose caches are already complete (validated before encoding)",
+    )
+
     return parser.parse_args()
 
 
-def _load_vae(config: TrainingConfig) -> torch.nn.Module:
-    model_cfg = config.model
-    load_path = Path(model_cfg.load_from) if model_cfg.load_from else None
+def _load_vae(task: MultiPrecomputeTask) -> torch.nn.Module:
+    load_path = Path(task.load_from).expanduser() if task.load_from else None
     path_exists = load_path is not None and load_path.exists()
 
-    hf_source = model_cfg.hf_repo if model_cfg.hf_repo else None
-    if not path_exists and model_cfg.load_from and not model_cfg.hf_repo:
-        hf_source = model_cfg.load_from
+    hf_source = task.hf_repo or None
+    if not path_exists and task.load_from and not task.hf_repo:
+        hf_source = task.load_from
 
-    kind = (model_cfg.vae_kind or "").strip().lower()
+    kind = (task.vae_kind or "").strip().lower()
 
     if kind == "qwen":
         if path_exists:
@@ -88,42 +97,45 @@ def _load_vae(config: TrainingConfig) -> torch.nn.Module:
         else:
             source = hf_source or "Qwen/Qwen-Image"
             kwargs = {}
-            if model_cfg.hf_subfolder or not hf_source:
-                kwargs["subfolder"] = model_cfg.hf_subfolder or "vae"
-            if model_cfg.hf_revision:
-                kwargs["revision"] = model_cfg.hf_revision
-            if model_cfg.hf_auth_token:
-                kwargs["use_auth_token"] = model_cfg.hf_auth_token
+            if task.hf_subfolder or not hf_source:
+                kwargs["subfolder"] = task.hf_subfolder or "vae"
+            if task.hf_revision:
+                kwargs["revision"] = task.hf_revision
+            if task.hf_auth_token:
+                kwargs["use_auth_token"] = task.hf_auth_token
         vae = AutoencoderKLQwenImage.from_pretrained(source, **kwargs)
     else:
         if path_exists:
             source = str(load_path)
             kwargs = {}
         else:
-            source = hf_source or config.paths.project
+            source = hf_source
+            if not source:
+                raise RuntimeError(
+                    f"Task '{task.vae_name}' must provide either a local 'load_from' path or an 'hf_repo'."
+                )
             kwargs = {}
-            if model_cfg.hf_subfolder:
-                kwargs["subfolder"] = model_cfg.hf_subfolder
-            if model_cfg.hf_revision:
-                kwargs["revision"] = model_cfg.hf_revision
-            if model_cfg.hf_auth_token:
-                kwargs["use_auth_token"] = model_cfg.hf_auth_token
+            if task.hf_subfolder:
+                kwargs["subfolder"] = task.hf_subfolder
+            if task.hf_revision:
+                kwargs["revision"] = task.hf_revision
+            if task.hf_auth_token:
+                kwargs["use_auth_token"] = task.hf_auth_token
         if kind == "wan":
             vae = AutoencoderKLWan.from_pretrained(source, **kwargs)
+        elif kind in {"kl", "autoencoderkl", "autoencoder_kl"}:
+            vae = AutoencoderKL.from_pretrained(source, **kwargs)
+        elif kind in {"asymmetric_kl", "kl_asymmetric", "kl_asym", "asym_kl"}:
+            vae = AsymmetricAutoencoderKL.from_pretrained(source, **kwargs)
         else:
-            if kind in {"kl", "autoencoderkl", "autoencoder_kl"}:
+            if task.model_resolution == task.high_resolution:
                 vae = AutoencoderKL.from_pretrained(source, **kwargs)
-            elif kind in {"asymmetric_kl", "kl_asymmetric", "kl_asym", "asym_kl"}:
-                vae = AsymmetricAutoencoderKL.from_pretrained(source, **kwargs)
             else:
-                if config.dataset.model_resolution == config.dataset.high_resolution:
-                    vae = AutoencoderKL.from_pretrained(source, **kwargs)
-                else:
-                    vae = AsymmetricAutoencoderKL.from_pretrained(source, **kwargs)
+                vae = AsymmetricAutoencoderKL.from_pretrained(source, **kwargs)
 
-    display_source = source if not path_exists else str(load_path)
+    display_source = str(load_path) if path_exists else source
     print(f"[Embeddings] Loading VAE from: {display_source}")
-    return vae.to(model_cfg.weights_dtype)
+    return vae
 
 
 def _resolve_device(device_arg: str | None) -> torch.device:
@@ -154,78 +166,118 @@ def _ensure_expected_counts(cache: EmbeddingCache, image_paths: Iterable[Path], 
         )
 
 
-def main() -> None:
-    args = parse_args()
-
+def _run_from_config(args: argparse.Namespace) -> None:
     raw_config = load_config([args.config])
-    dataset_root = args.dataset_root or raw_config.get("ds_path")
-    if not dataset_root:
-        raise RuntimeError("Dataset root must be provided via --dataset-root or ds_path in the config")
-    dataset_root = Path(dataset_root).expanduser().resolve()
-    if not dataset_root.exists() or not dataset_root.is_dir():
-        raise FileNotFoundError(f"Dataset root {dataset_root} does not exist or is not a directory")
+    multi_cfg = MultiPrecomputeConfig.from_dict(raw_config)
 
-    cache_dir = dataset_root / args.cache_subdir
-    if args.overwrite and cache_dir.exists():
-        print(f"[Embeddings] Removing existing cache directory: {cache_dir}")
-        shutil.rmtree(cache_dir)
+    dataset_override = args.dataset_root.expanduser() if args.dataset_root else None
+    cache_override = Path(args.cache_subdir).expanduser() if args.cache_subdir else None
+    variants_override = int(args.variants_per_sample) if args.variants_per_sample is not None else None
+    batch_override = int(args.batch_size) if args.batch_size is not None else None
+    workers_override = int(args.num_workers) if args.num_workers is not None else None
 
-    raw_config["ds_path"] = str(dataset_root)
-    embeddings_section = raw_config.setdefault("embeddings", {})
-    embeddings_section["enabled"] = True
-    embeddings_section["cache_dir"] = str(cache_dir)
-    embeddings_section["variants_per_sample"] = max(1, args.variants_per_sample)
-    embeddings_section.setdefault("store_distribution", True)
-    if args.overwrite:
-        embeddings_section["overwrite"] = True
-    if args.batch_size:
-        embeddings_section["precompute_batch_size"] = int(args.batch_size)
-    if args.num_workers is not None:
-        embeddings_section["precompute_num_workers"] = int(args.num_workers)
+    tasks = multi_cfg.generate_tasks(
+        dataset_root_override=dataset_override,
+        cache_override=cache_override,
+        variants_override=variants_override,
+        batch_override=batch_override,
+        workers_override=workers_override,
+    )
 
-    config = TrainingConfig.from_dict(raw_config)
+    if not tasks:
+        raise RuntimeError("No VAE tasks were defined in the configuration file")
 
-    if config.embeddings.variants_per_sample != args.variants_per_sample:
+    device = _resolve_device(args.device or multi_cfg.defaults.device)
+    print(f"[Embeddings] Prepared {len(tasks)} task(s) for multi-VAE precomputation")
+
+    overall_start = time.perf_counter()
+    for index, task in enumerate(tasks, start=1):
         print(
-            f"[Embeddings] Adjusted variants_per_sample from {args.variants_per_sample} to "
-            f"{config.embeddings.variants_per_sample} based on configuration",
+            f"[Embeddings] Task {index}/{len(tasks)} :: {task.vae_name} at {task.display_resolution}"
         )
 
-    cache = EmbeddingCache(config.embeddings, config.dataset, config.paths.dataset_root)
+        if not task.dataset_path.exists() or not task.dataset_path.is_dir():
+            raise FileNotFoundError(
+                f"Dataset root {task.dataset_path} for task '{task.vae_name}' does not exist or is not a directory"
+            )
 
-    dataset = ImageFolderDataset(
-        root=config.paths.dataset_root,
-        high_resolution=config.dataset.high_resolution,
-        resize_long_side=config.dataset.resize_long_side,
-        limit=config.dataset.limit,
-        embedding_cache=None,
-        model_resolution=config.dataset.model_resolution,
-    )
+        dataset_cfg = DatasetConfig(
+            high_resolution=task.high_resolution,
+            model_resolution=task.model_resolution,
+            resize_long_side=task.resize_long_side,
+            limit=task.limit,
+            num_workers=task.num_workers,
+        )
 
-    vae = _load_vae(config)
-    device = _resolve_device(args.device)
-    vae = vae.to(device)
-    vae.eval()
+        embeddings_cfg = EmbeddingsConfig(
+            enabled=True,
+            cache_dir=task.cache_dir,
+            dtype=task.embeddings_dtype,
+            variants_per_sample=task.variants_per_sample,
+            overwrite=args.overwrite,
+            precompute_batch_size=task.batch_size,
+            num_workers=task.num_workers,
+            store_distribution=task.store_distribution,
+        )
 
-    cache.ensure_populated(
-        dataset,
-        vae,
-        device=device,
-        encode_dtype=next(vae.parameters()).dtype,
-        seed=config.seed,
-        accelerator=None,
-    )
+        cache = EmbeddingCache(embeddings_cfg, dataset_cfg, task.dataset_path)
 
-    _ensure_expected_counts(cache, dataset.paths, config.embeddings.variants_per_sample)
+        dataset = ImageFolderDataset(
+            root=task.dataset_path,
+            high_resolution=task.high_resolution,
+            resize_long_side=task.resize_long_side,
+            limit=task.limit,
+            embedding_cache=None,
+            model_resolution=task.model_resolution,
+        )
 
-    try:
-        cache_display = cache.cache_root.relative_to(dataset_root)
-    except ValueError:
-        cache_display = cache.cache_root
-    print(
-        f"[Embeddings] Completed precomputation for {len(dataset)} image(s) "
-        f"into {cache_display}"
-    )
+        if args.skip_existing and not args.overwrite:
+            try:
+                _ensure_expected_counts(cache, dataset.paths, embeddings_cfg.variants_per_sample)
+            except RuntimeError:
+                pass
+            else:
+                print(
+                    f"[Embeddings] Cache already complete for {task.vae_name}"
+                    f" ({task.display_resolution}); skipping."
+                )
+                continue
+
+        start = time.perf_counter()
+        vae = _load_vae(task)
+        to_kwargs = {"device": device}
+        if task.weights_dtype is not None:
+            to_kwargs["dtype"] = task.weights_dtype
+        vae = vae.to(**to_kwargs)
+        vae.eval()
+
+        cache.ensure_populated(
+            dataset,
+            vae,
+            device=device,
+            encode_dtype=next(vae.parameters()).dtype,
+            seed=0,
+            accelerator=None,
+        )
+
+        _ensure_expected_counts(cache, dataset.paths, embeddings_cfg.variants_per_sample)
+        elapsed = time.perf_counter() - start
+
+        print(
+            f"[Embeddings] Finished {task.vae_name} ({task.display_resolution}) in {elapsed:.1f}s"
+        )
+
+        del vae
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    total_elapsed = time.perf_counter() - overall_start
+    print(f"[Embeddings] Multi-VAE precomputation finished in {total_elapsed:.1f}s total")
+
+
+def main() -> None:
+    args = parse_args()
+    _run_from_config(args)
 
 
 if __name__ == "__main__":
