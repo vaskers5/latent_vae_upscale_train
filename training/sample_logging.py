@@ -534,16 +534,6 @@ class SampleLogger:
                 log_payload[f"samples/lpips_mean/{result.slug}"] = float(np.mean(result.lpips_scores))
             for index, pair_path in enumerate(result.pair_paths):
                 log_payload[f"samples/{result.slug}/pair_{index}"] = wandb.Image(str(pair_path))
-            for index, real_path in enumerate(result.real_paths):
-                log_payload[f"samples/{result.slug}/real_{index}"] = wandb.Image(str(real_path))
-            for index, decoded_path in enumerate(result.decoded_paths):
-                log_payload[f"samples/{result.slug}/decoded_{index}"] = wandb.Image(str(decoded_path))
-            if result.primary_real_paths:
-                for index, real_path in enumerate(result.primary_real_paths):
-                    log_payload[f"samples/real_{index}"] = wandb.Image(str(real_path))
-            if result.primary_decoded_paths:
-                for index, decoded_path in enumerate(result.primary_decoded_paths):
-                    log_payload[f"samples/decoded_{index}"] = wandb.Image(str(decoded_path))
             if result.primary_pair_paths:
                 for index, pair_path in enumerate(result.primary_pair_paths):
                     log_payload[f"samples/pair_{index}"] = wandb.Image(str(pair_path))

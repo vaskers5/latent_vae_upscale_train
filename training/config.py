@@ -1,12 +1,11 @@
-"""Configuration schema and helper utilities for VAE training."""
+"""Lightweight configuration objects used across the training scripts."""
 
 from __future__ import annotations
 
-import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional
 
 import torch
 
@@ -16,12 +15,11 @@ __all__ = [
     "PathsConfig",
     "DatasetConfig",
     "OptimizerConfig",
-    "EMAConfig",
     "SampleVaeConfig",
     "ModelConfig",
     "LossConfig",
     "LoggingConfig",
-    "PixNerfUpscalerConfig",
+    "LatentUpscalerConfig",
     "EmbeddingsConfig",
     "TrainingConfig",
 ]
@@ -30,11 +28,13 @@ __all__ = [
 def _slugify(text: Optional[str]) -> Optional[str]:
     if not text:
         return None
-    slug = re.sub(r"[^a-zA-Z0-9._-]+", "_", text.strip())
-    return slug or None
+    cleaned = "".join(ch if ch.isalnum() or ch in {"_", "-", "."} else "_" for ch in text.strip())
+    return cleaned or None
 
 
 def _resolve_dtype(value: Any) -> torch.dtype:
+    if isinstance(value, torch.dtype):
+        return value
     mapping = {
         "float32": torch.float32,
         "float": torch.float32,
@@ -45,12 +45,10 @@ def _resolve_dtype(value: Any) -> torch.dtype:
         "bfloat16": torch.bfloat16,
         "bf16": torch.bfloat16,
     }
-    if isinstance(value, torch.dtype):
-        return value
-    try:
-        return mapping[str(value).lower()]
-    except KeyError as exc:  # pragma: no cover - config guard
-        raise ValueError(f"Unsupported dtype value: {value!r}") from exc
+    key = str(value).lower()
+    if key not in mapping:
+        raise ValueError(f"Unsupported dtype value: {value!r}")
+    return mapping[key]
 
 
 def _resolve_bool(value: Any, default: bool = False) -> bool:
@@ -70,7 +68,6 @@ class PathsConfig:
     dataset_root: Path
     project: str
     save_root: Path
-    samples_name: str
     exp_name: Optional[str]
     timestamp: str
     run_dir: Path
@@ -84,21 +81,19 @@ class PathsConfig:
         dataset_root = Path(data.get("ds_path", "./data"))
         project = str(data.get("project", "vae_project"))
         save_root = Path(data.get("save_root_dir", project))
-        samples_name = str(data.get("generated_folder_name", "samples"))
         exp_name = data.get("exp_name")
         timestamp = datetime.now().strftime("%Y_%m_%d_%H")
         slug = _slugify(exp_name)
-        run_folder = f"{timestamp}_{slug}".strip("_") if slug else timestamp
-        run_dir = save_root / run_folder
+        folder = f"{timestamp}_{slug}".strip("_") if slug else timestamp
+        run_dir = save_root / folder
         return cls(
             dataset_root=dataset_root,
             project=project,
             save_root=save_root,
-            samples_name=samples_name,
             exp_name=exp_name,
             timestamp=timestamp,
             run_dir=run_dir,
-            samples_dir=run_dir / samples_name,
+            samples_dir=run_dir / str(data.get("generated_folder_name", "samples")),
             checkpoints_dir=run_dir / "checkpoints",
             best_dir=run_dir / "best",
             final_dir=run_dir / "final",
@@ -148,10 +143,8 @@ class OptimizerConfig:
     clip_grad_norm: float
     use_decay: bool
     weight_decay: float
-    warmup_percent: float
     gradient_accumulation_steps: int
     scheduler: str
-    cosine_min_ratio: float
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "OptimizerConfig":
@@ -165,44 +158,24 @@ class OptimizerConfig:
             beta2=float(section.get("beta2", data.get("beta2", 0.99))),
             eps=float(section.get("eps", data.get("eps", 1e-6))),
             clip_grad_norm=float(section.get("clip_grad_norm", data.get("clip_grad_norm", 1.0))),
-            use_decay=bool(section.get("use_decay", data.get("use_decay", True))),
+            use_decay=_resolve_bool(section.get("use_decay", data.get("use_decay", True)), default=True),
             weight_decay=float(section.get("weight_decay", data.get("weight_decay", 0.01))),
-            warmup_percent=float(section.get("warmup_percent", data.get("warmup_percent", 0.01))),
-            gradient_accumulation_steps=int(section.get("gradient_accumulation_steps", data.get("gradient_accumulation_steps", 1))),
+            gradient_accumulation_steps=int(
+                section.get("gradient_accumulation_steps", data.get("gradient_accumulation_steps", 1))
+            ),
             scheduler=str(section.get("scheduler", data.get("scheduler", "cosine"))).lower(),
-            cosine_min_ratio=float(section.get("cosine_min_ratio", data.get("cosine_min_ratio", 0.1))),
-        )
-
-
-@dataclass
-class EMAConfig:
-    enabled: bool
-    decay: float
-    update_after_step: int
-    update_interval: int
-    device: Optional[str]
-
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "EMAConfig":
-        section = data.get("ema", {})
-        return cls(
-            enabled=_resolve_bool(section.get("enabled", data.get("ema_enabled", False))),
-            decay=float(section.get("decay", data.get("ema_decay", 0.999))),
-            update_after_step=int(section.get("update_after_step", data.get("ema_update_after_step", 0))),
-            update_interval=max(1, int(section.get("update_interval", data.get("ema_update_interval", 1)))),
-            device=section.get("device") or data.get("ema_device"),
         )
 
 
 @dataclass
 class SampleVaeConfig:
-    load_from: Optional[str]
-    hf_repo: Optional[str]
-    hf_subfolder: Optional[str]
-    hf_revision: Optional[str]
-    hf_auth_token: Optional[str]
-    vae_kind: Optional[str]
-    weights_dtype: Optional[torch.dtype]
+    load_from: Optional[str] = None
+    hf_repo: Optional[str] = None
+    hf_subfolder: Optional[str] = None
+    hf_revision: Optional[str] = None
+    hf_auth_token: Optional[str] = None
+    vae_kind: Optional[str] = None
+    weights_dtype: Optional[torch.dtype] = None
 
     @staticmethod
     def _clean_string(value: Any) -> Optional[str]:
@@ -213,26 +186,19 @@ class SampleVaeConfig:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any], defaults: Dict[str, Any]) -> "SampleVaeConfig":
-        load_from_raw = data.get("load_from")
-        load_from = cls._clean_string(load_from_raw) or cls._clean_string(defaults.get("load_from"))
-
+        load_from = cls._clean_string(data.get("load_from")) or cls._clean_string(defaults.get("load_from"))
         hf_repo = cls._clean_string(data.get("hf_repo")) or cls._clean_string(defaults.get("hf_repo"))
         hf_subfolder = cls._clean_string(data.get("hf_subfolder")) or cls._clean_string(defaults.get("hf_subfolder"))
         hf_revision = cls._clean_string(data.get("hf_revision")) or cls._clean_string(defaults.get("hf_revision"))
         hf_auth_token = cls._clean_string(data.get("hf_auth_token")) or cls._clean_string(defaults.get("hf_auth_token"))
 
-        vae_kind_raw = cls._clean_string(data.get("vae_kind"))
-        if vae_kind_raw is None:
-            vae_kind_raw = cls._clean_string(defaults.get("vae_kind"))
-        vae_kind = vae_kind_raw.lower() if vae_kind_raw else None
+        raw_kind = cls._clean_string(data.get("vae_kind")) or cls._clean_string(defaults.get("vae_kind"))
+        vae_kind = raw_kind.lower() if raw_kind else None
 
-        weights_dtype_raw = data.get("weights_dtype")
-        if weights_dtype_raw is not None:
-            weights_dtype = _resolve_dtype(weights_dtype_raw)
-        else:
-            weights_dtype = defaults.get("weights_dtype")
-            if weights_dtype is not None and not isinstance(weights_dtype, torch.dtype):
-                weights_dtype = _resolve_dtype(weights_dtype)
+        raw_dtype = data.get("weights_dtype")
+        if raw_dtype is None:
+            raw_dtype = defaults.get("weights_dtype")
+        weights_dtype = _resolve_dtype(raw_dtype) if raw_dtype is not None else None
 
         return cls(
             load_from=load_from,
@@ -246,13 +212,8 @@ class SampleVaeConfig:
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "SampleVaeConfig":
-        def _maybe_dtype(value: Any) -> Optional[torch.dtype]:
-            if value is None:
-                return None
-            if isinstance(value, torch.dtype):
-                return value
-            return _resolve_dtype(value)
-
+        weights = data.get("weights_dtype")
+        dtype = _resolve_dtype(weights) if weights is not None else None
         return cls(
             load_from=cls._clean_string(data.get("load_from")),
             hf_repo=cls._clean_string(data.get("hf_repo")),
@@ -260,7 +221,7 @@ class SampleVaeConfig:
             hf_revision=cls._clean_string(data.get("hf_revision")),
             hf_auth_token=cls._clean_string(data.get("hf_auth_token")),
             vae_kind=cls._clean_string(data.get("vae_kind")),
-            weights_dtype=_maybe_dtype(data.get("weights_dtype")),
+            weights_dtype=dtype,
         )
 
 
@@ -272,225 +233,127 @@ class ModelConfig:
     hf_revision: Optional[str]
     hf_auth_token: Optional[str]
     weights_dtype: torch.dtype
-    mixed_precision: str
-    train_decoder_only: bool
-    full_training: bool
     vae_kind: str
-    kl_ratio: float
-    use_torch_compile: bool
-    torch_compile_backend: Optional[str]
-    torch_compile_mode: Optional[str]
-    torch_compile_fullgraph: Optional[bool]
-    sample_vaes: Dict[str, SampleVaeConfig]
+    sample_vaes: Dict[str, SampleVaeConfig] = field(default_factory=dict)
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any], project: str) -> "ModelConfig":
+    def from_dict(cls, data: Dict[str, Any]) -> "ModelConfig":
         section = data.get("model", {})
-        load_from = (
-            section.get("LOAD_FROM")
-            or section.get("load_from")
-            or data.get("LOAD_FROM")
-            or data.get("load_from")
-        )
-        load_from = str(load_from) if load_from else None
-        compile_fullgraph = section.get("torch_compile_fullgraph")
-        if compile_fullgraph is None:
-            compile_fullgraph = data.get("torch_compile_fullgraph")
-        if isinstance(compile_fullgraph, str):
-            compile_fullgraph = _resolve_bool(compile_fullgraph, default=False)
-        elif compile_fullgraph is not None:
-            compile_fullgraph = bool(compile_fullgraph)
 
-        base_weights_dtype = _resolve_dtype(section.get("weights_dtype", data.get("weights_dtype", "float32")))
-        base_vae_kind = str(section.get("vae_kind", data.get("vae_kind", "kl"))).strip().lower()
+        def _from_section(key: str) -> Optional[str]:
+            value = section.get(key)
+            if value is None:
+                value = data.get(key)
+            return str(value) if value else None
 
-        sample_vaes_raw = section.get("sample_vaes") or data.get("sample_vaes")
+        load_from = _from_section("load_from")
+        base_dtype = _resolve_dtype(section.get("weights_dtype", data.get("weights_dtype", "float32")))
+        base_kind = str(section.get("vae_kind", data.get("vae_kind", "kl"))).strip().lower()
+
+        sample_vaes_raw = section.get("sample_vaes") or data.get("sample_vaes") or {}
         sample_vaes: Dict[str, SampleVaeConfig] = {}
-        if isinstance(sample_vaes_raw, dict):
-            defaults_map = {
+        if isinstance(sample_vaes_raw, Mapping):
+            defaults = {
                 "load_from": load_from,
                 "hf_repo": section.get("hf_repo") or data.get("hf_repo"),
                 "hf_subfolder": section.get("hf_subfolder") or data.get("hf_subfolder"),
                 "hf_revision": section.get("hf_revision") or data.get("hf_revision"),
                 "hf_auth_token": section.get("hf_auth_token") or data.get("hf_auth_token"),
-                "vae_kind": base_vae_kind,
-                "weights_dtype": base_weights_dtype,
+                "vae_kind": base_kind,
+                "weights_dtype": base_dtype,
             }
             for key, value in sample_vaes_raw.items():
-                if isinstance(value, dict):
-                    sample_vaes[key] = SampleVaeConfig.from_dict(value, defaults=defaults_map)
+                if isinstance(value, Mapping):
+                    sample_vaes[str(key)] = SampleVaeConfig.from_dict(dict(value), defaults)
 
         return cls(
             load_from=load_from,
-            hf_repo=section.get("hf_repo") or data.get("hf_repo"),
-            hf_subfolder=section.get("hf_subfolder") or data.get("hf_subfolder"),
-            hf_revision=section.get("hf_revision") or data.get("hf_revision"),
-            hf_auth_token=section.get("hf_auth_token") or data.get("hf_auth_token"),
-            weights_dtype=base_weights_dtype,
-            mixed_precision=str(section.get("mixed_precision", data.get("mixed_precision", "no"))).strip().lower(),
-            train_decoder_only=_resolve_bool(section.get("train_decoder_only", data.get("train_decoder_only", True))),
-            full_training=_resolve_bool(section.get("full_training", data.get("full_training", False))),
-            vae_kind=base_vae_kind,
-            kl_ratio=float(section.get("kl_ratio", data.get("kl_ratio", 0.0))),
-            use_torch_compile=_resolve_bool(section.get("use_torch_compile", data.get("use_torch_compile", True))),
-            torch_compile_backend=section.get("torch_compile_backend") or data.get("torch_compile_backend"),
-            torch_compile_mode=section.get("torch_compile_mode") or data.get("torch_compile_mode"),
-            torch_compile_fullgraph=compile_fullgraph,
+            hf_repo=_from_section("hf_repo"),
+            hf_subfolder=_from_section("hf_subfolder"),
+            hf_revision=_from_section("hf_revision"),
+            hf_auth_token=_from_section("hf_auth_token"),
+            weights_dtype=base_dtype,
+            vae_kind=base_kind,
             sample_vaes=sample_vaes,
         )
 
 
 @dataclass
 class LossConfig:
-    ratios: Dict[str, float]
-    enabled: Dict[str, bool]
-    active_losses: Tuple[str, ...]
-    median_coeff_steps: int
     lpips_backbone: str
-    lpips_eval_resolution: int
-    focal_frequency_alpha: float
-    focal_frequency_patch_factor: int
-    focal_frequency_log_weight: bool
-    focal_frequency_ave_spectrum: bool
-    focal_frequency_normalize: bool
-    focal_frequency_eps: float
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any], default_resolution: int, default_kl: float) -> "LossConfig":
+    def from_dict(cls, data: Dict[str, Any]) -> "LossConfig":
         section = data.get("loss", {})
-
-        ratio_section_raw = section.get("ratios") if isinstance(section.get("ratios"), dict) else {}
-        fallback_ratio_raw = data.get("loss_ratios") if isinstance(data.get("loss_ratios"), dict) else {}
-
-        ratio_section = {str(key).lower(): value for key, value in ratio_section_raw.items()}
-        fallback_ratio_section = {str(key).lower(): value for key, value in fallback_ratio_raw.items()}
-
-        defaults = {
-            "mae": 1.0,
-            "mse": 1.0,
-            "edge": 0.1,
-            "lpips": 0.0,
-            "kl": default_kl,
-            "ffl": 0.0,
-        }
-
-        def resolve_ratio(name: str, default: float) -> float:
-            raw = ratio_section.get(name, fallback_ratio_section.get(name, default))
-            try:
-                return float(raw)
-            except (TypeError, ValueError):  # pragma: no cover - config guard
-                return default
-
-        ratios_full: Dict[str, float] = {}
-        for key, default in defaults.items():
-            ratios_full[key] = resolve_ratio(key, default)
-
-        global_enabled = True
-        toggles: Dict[str, bool] = {}
-
-        raw_enabled = section.get("enabled")
-        if isinstance(raw_enabled, dict):
-            for key, value in raw_enabled.items():
-                toggles[str(key).lower()] = _resolve_bool(value, default=True)
-        elif raw_enabled is not None:
-            global_enabled = _resolve_bool(raw_enabled, default=True)
-
-        raw_enable = section.get("enable")
-        if isinstance(raw_enable, dict):
-            for key, value in raw_enable.items():
-                toggles[str(key).lower()] = _resolve_bool(value, default=True)
-        elif raw_enable is not None and not isinstance(raw_enable, dict):
-            global_enabled = _resolve_bool(raw_enable, default=global_enabled)
-
-        disabled_raw = section.get("disabled")
-        if disabled_raw is None:
-            disabled_raw = section.get("disable")
-        if isinstance(disabled_raw, str):
-            disabled = {disabled_raw.lower()}
-        elif isinstance(disabled_raw, (list, tuple, set)):
-            disabled = {str(item).lower() for item in disabled_raw}
-        elif disabled_raw is None:
-            disabled = set()
-        else:  # pragma: no cover - config guard
-            disabled = {str(disabled_raw).lower()}
-
-        enabled_map: Dict[str, bool] = {}
-        filtered_ratios: Dict[str, float] = {}
-        active_losses: List[str] = []
-
-        for key, value in ratios_full.items():
-            enabled = global_enabled and key not in disabled
-            if key in toggles:
-                enabled = toggles[key]
-            enabled_map[key] = bool(enabled)
-            if enabled and value != 0.0:
-                filtered_ratios[key] = value
-                active_losses.append(key)
-
-        return cls(
-            ratios=filtered_ratios,
-            enabled=enabled_map,
-            active_losses=tuple(active_losses),
-            median_coeff_steps=int(section.get("median_coeff_steps", data.get("median_coeff_steps", 256))),
-            lpips_backbone=str(section.get("lpips_backbone", data.get("lpips_backbone", "vgg"))),
-            lpips_eval_resolution=int(section.get("lpips_eval_resolution", data.get("lpips_eval_resolution", default_resolution))),
-            focal_frequency_alpha=float(section.get("focal_frequency", {}).get("alpha", data.get("focal_frequency_alpha", 1.0))),
-            focal_frequency_patch_factor=int(section.get("focal_frequency", {}).get("patch_factor", data.get("focal_frequency_patch_factor", 1))),
-            focal_frequency_log_weight=_resolve_bool(section.get("focal_frequency", {}).get("log_weight", data.get("focal_frequency_log_weight", True))),
-            focal_frequency_ave_spectrum=_resolve_bool(section.get("focal_frequency", {}).get("ave_spectrum", data.get("focal_frequency_ave_spectrum", False))),
-            focal_frequency_normalize=_resolve_bool(section.get("focal_frequency", {}).get("normalize", data.get("focal_frequency_normalize", True))),
-            focal_frequency_eps=float(section.get("focal_frequency", {}).get("eps", data.get("focal_frequency_eps", 1e-8))),
-        )
+        backbone = section.get("lpips_backbone", data.get("lpips_backbone", "vgg"))
+        return cls(lpips_backbone=str(backbone))
 
 
 @dataclass
 class LoggingConfig:
     use_wandb: bool
     wandb_run_name: Optional[str]
-    sample_interval_share: int
     global_sample_interval: int
-    global_save_interval: Optional[int]
-    save_model: bool
-    save_barrier: float
-    log_grad_norm: bool
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any], timestamp: str) -> "LoggingConfig":
         section = data.get("logging", {})
-        save_interval = int(section.get("global_save_interval", data.get("GLOBAL_SAVE_INTERVAL", 1000)))
-        return cls(
-            use_wandb=bool(section.get("use_wandb", data.get("use_wandb", False))),
-            wandb_run_name=section.get("wandb_run_name") or data.get("wandb_run_name") or timestamp,
-            sample_interval_share=int(section.get("sample_interval_share", data.get("sample_interval_share", 1000))),
-            global_sample_interval=int(section.get("global_sample_interval", data.get("GLOBAL_SAMPLE_INTERVAL", 500))),
-            global_save_interval=save_interval if save_interval > 0 else None,
-            save_model=bool(section.get("save_model", data.get("save_model", True))),
-            save_barrier=float(section.get("save_barrier", data.get("save_barrier", 1.003))),
-            log_grad_norm=bool(section.get("log_grad_norm", data.get("log_grad_norm", True))),
-        )
+        use_wandb = _resolve_bool(section.get("use_wandb", data.get("use_wandb", False)))
+        run_name = section.get("wandb_run_name") or data.get("wandb_run_name") or timestamp
+        sample_interval = int(section.get("global_sample_interval", data.get("GLOBAL_SAMPLE_INTERVAL", 500)))
+        return cls(use_wandb=use_wandb, wandb_run_name=run_name, global_sample_interval=max(1, sample_interval))
 
 
 @dataclass
-class PixNerfUpscalerConfig:
-    enabled: bool
-    patch_size: int
-    hidden_dim_multiplier: int
-    nerf_blocks: int
+class LatentUpscalerConfig:
+    model_name: str
+    model: Optional[str]
+    window: Optional[int]
+    depth: Optional[int]
+    heads: Optional[int]
+    mlp_ratio: Optional[float]
+    liif_hidden: Optional[int]
+    patch_size: Optional[int]
+    blocks: Optional[int]
+    nerf_blocks: Optional[int]
+    groups: Optional[int]
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "PixNerfUpscalerConfig":
+    def from_dict(cls, data: Dict[str, Any]) -> "LatentUpscalerConfig":
         section = data.get("latent_upscaler", {})
+        name = section.get("model_name") or section.get("model") or data.get("latent_upscaler", "swin")
+        patch_size = section.get("patch_size")
         return cls(
-            enabled=_resolve_bool(section.get("enabled", data.get("train_latent_upscaler", True)), default=True),
-            patch_size=int(section.get("patch_size", data.get("latent_upscaler_patch_size", 4))),
-            hidden_dim_multiplier=int(
-                section.get(
-                    "hidden_dim_multiplier",
-                    section.get("width_multiplier", data.get("latent_upscaler_width", 4)),
-                )
-            ),
-            nerf_blocks=int(section.get("nerf_blocks", data.get("latent_upscaler_nerf_blocks", 2))),
+            model_name=str(name or "swin"),
+            model=str(name or "swin"),
+            window=_maybe_int(section.get("window") or patch_size),
+            depth=_maybe_int(section.get("depth")),
+            heads=_maybe_int(section.get("heads")),
+            mlp_ratio=_maybe_float(section.get("mlp_ratio")),
+            liif_hidden=_maybe_int(section.get("liif_hidden")),
+            patch_size=_maybe_int(patch_size),
+            blocks=_maybe_int(section.get("blocks") or section.get("nerf_blocks")),
+            nerf_blocks=_maybe_int(section.get("nerf_blocks")),
+            groups=_maybe_int(section.get("groups")),
         )
+
+
+def _maybe_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _maybe_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 @dataclass
@@ -503,71 +366,41 @@ class EmbeddingsConfig:
     precompute_batch_size: int
     num_workers: int
     store_distribution: bool
-    vae_names: Tuple[str, ...]
-    vae_cache_dirs: Tuple[Path, ...]
+    vae_names: tuple[str, ...]
+    vae_cache_dirs: tuple[Path, ...]
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any], dataset_root: Path) -> "EmbeddingsConfig":
         section = data.get("embeddings", {})
         enabled = _resolve_bool(section.get("enabled", data.get("embeddings_enabled", False)))
         cache_dir_raw = section.get("cache_dir") or data.get("embeddings_cache_dir")
-        if cache_dir_raw:
-            cache_dir = Path(cache_dir_raw)
-            if not cache_dir.is_absolute():
-                cache_dir = dataset_root / cache_dir
-        else:
-            cache_dir = dataset_root / "cache_embeddings"
+        cache_dir = Path(cache_dir_raw) if cache_dir_raw else dataset_root / "cache_embeddings"
+        if not cache_dir.is_absolute():
+            cache_dir = (dataset_root / cache_dir).resolve()
         dtype = _resolve_dtype(section.get("dtype", data.get("embeddings_dtype", "float16")))
-        variants_per_sample = int(section.get("variants_per_sample", data.get("embeddings_variants", 1)))
+        variants = int(section.get("variants_per_sample", data.get("embeddings_variants", 1)))
         overwrite = _resolve_bool(section.get("overwrite", data.get("embeddings_overwrite", False)))
-        precompute_batch_size = int(section.get("precompute_batch_size", data.get("embeddings_precompute_batch_size", 16)))
+        precompute_batch_size = int(
+            section.get("precompute_batch_size", data.get("embeddings_precompute_batch_size", 16))
+        )
         num_workers = int(section.get("precompute_num_workers", data.get("embeddings_precompute_num_workers", 4)))
-        store_distribution = _resolve_bool(section.get("store_distribution", data.get("embeddings_store_distribution", True)), default=True)
-        raw_names = section.get("vae_names")
-        if raw_names is None:
-            raw_names = data.get("vae_names") or data.get("embeddings_vae_names")
+        store_distribution = _resolve_bool(
+            section.get("store_distribution", data.get("embeddings_store_distribution", True)),
+            default=True,
+        )
 
-        vae_names: List[str] = []
-        if isinstance(raw_names, str):
-            candidate = raw_names.strip()
-            if candidate:
-                vae_names.append(candidate)
-        elif isinstance(raw_names, (list, tuple, set)):
-            for item in raw_names:
-                if item is None:
-                    continue
-                candidate = str(item).strip()
-                if candidate:
-                    vae_names.append(candidate)
-
-        if vae_names:
-            cache_dirs: List[Path] = []
-            base_dir = cache_dir
-            for index, name in enumerate(vae_names):
-                name_path = Path(name)
-                if name_path.is_absolute():
-                    cache_dirs.append(name_path)
-                    continue
-                if index == 0 and name_path.parent == Path(".") and cache_dir.name == name_path.name:
-                    cache_dirs.append(cache_dir)
-                    base_dir = cache_dir.parent if cache_dir.parent != cache_dir else cache_dir.parent
-                    continue
-                if index == 0:
-                    candidate = cache_dir / name_path
-                    cache_dirs.append(candidate)
-                    base_dir = cache_dir
-                else:
-                    cache_dirs.append((base_dir or cache_dir) / name_path)
-        else:
-            fallback_name = cache_dir.name or "default"
-            vae_names = [fallback_name]
-            cache_dirs = [cache_dir]
+        raw_names = section.get("vae_names") or data.get("vae_names") or data.get("embeddings_vae_names")
+        vae_names = _coerce_names(raw_names)
+        if not vae_names:
+            fallback = cache_dir.name or "default"
+            vae_names = [fallback]
+        cache_dirs = [_resolve_cache_dir(cache_dir, name) for name in vae_names]
 
         return cls(
             enabled=enabled,
-            cache_dir=cache_dirs[0],
+            cache_dir=cache_dir,
             dtype=dtype,
-            variants_per_sample=max(1, variants_per_sample),
+            variants_per_sample=max(1, variants),
             overwrite=overwrite,
             precompute_batch_size=max(1, precompute_batch_size),
             num_workers=max(0, num_workers),
@@ -575,6 +408,30 @@ class EmbeddingsConfig:
             vae_names=tuple(vae_names),
             vae_cache_dirs=tuple(cache_dirs),
         )
+
+
+def _coerce_names(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        candidate = value.strip()
+        return [candidate] if candidate else []
+    names: list[str] = []
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            if item is None:
+                continue
+            candidate = str(item).strip()
+            if candidate:
+                names.append(candidate)
+    return names
+
+
+def _resolve_cache_dir(base: Path, name: str) -> Path:
+    path = Path(name)
+    if path.is_absolute():
+        return path
+    return (base / path).resolve()
 
 
 @dataclass
@@ -585,9 +442,8 @@ class TrainingConfig:
     model: ModelConfig
     losses: LossConfig
     logging: LoggingConfig
-    latent_upscaler: PixNerfUpscalerConfig
+    latent_upscaler: LatentUpscalerConfig
     embeddings: EmbeddingsConfig
-    ema: EMAConfig
     seed: int
 
     @classmethod
@@ -595,12 +451,11 @@ class TrainingConfig:
         paths = PathsConfig.from_dict(data)
         dataset = DatasetConfig.from_dict(data)
         optimiser = OptimizerConfig.from_dict(data)
-        model = ModelConfig.from_dict(data, project=paths.project)
-        losses = LossConfig.from_dict(data, dataset.model_resolution, model.kl_ratio)
+        model = ModelConfig.from_dict(data)
+        losses = LossConfig.from_dict(data)
         logging = LoggingConfig.from_dict(data, timestamp=paths.timestamp)
-        latent_upscaler = PixNerfUpscalerConfig.from_dict(data)
+        latent_upscaler = LatentUpscalerConfig.from_dict(data)
         embeddings = EmbeddingsConfig.from_dict(data, dataset_root=paths.dataset_root)
-        ema = EMAConfig.from_dict(data)
         seed = int(data.get("seed", int(datetime.now().strftime("%Y%m%d"))))
         return cls(
             paths=paths,
@@ -611,6 +466,6 @@ class TrainingConfig:
             logging=logging,
             latent_upscaler=latent_upscaler,
             embeddings=embeddings,
-            ema=ema,
             seed=seed,
         )
+
