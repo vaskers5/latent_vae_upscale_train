@@ -4,14 +4,14 @@ save_root_dir: ./runs
 ds_path: ./datasets/test_dataset
 
 dataset:
-  high_resolution: 1024
-  model_resolution: 512
+  high_resolution: 256
+  model_resolution: 128
   num_workers: 24
 
 optimizer:
-  batch_size: 16
-  base_learning_rate: 0.0001
-  min_learning_rate: 0.00001
+  batch_size: 256
+  base_learning_rate: 0.005
+  min_learning_rate: 0.0001
   num_epochs: 250
   optimizer_type: adamw
   beta2: 0.99
@@ -42,7 +42,7 @@ logging:
   use_wandb: true
   wandb_run_name: pixnerf-upscale
   sample_interval_share: 1000
-  global_sample_interval: 100
+  global_sample_interval: 250
   global_save_interval: 500
   save_model: true
   save_barrier: 1.003
@@ -52,12 +52,15 @@ latent_upscaler:
   enabled: true
   # num_attention_heads: 4
   patch_size: 4
-  hidden_dim_multiplier: 448
-  nerf_blocks: 224
+  hidden_dim_multiplier: 24
+  nerf_blocks: 256
 
 embeddings:
   enabled: true
-  cache_dir: ./cache_vae_embeddings/sd_vae
+  cache_dir: ./cache_vae_embeddings
+  vae_names:
+    - sd_vae
+    - sd_vae_midjourneyv6
   dtype: float16
   variants_per_sample: 1
   overwrite: false

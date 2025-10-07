@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import logging
+import math
 import random
 from dataclasses import asdict, is_dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -15,7 +16,7 @@ from tqdm import tqdm
 
 from .config import TrainingConfig
 from .dataset import UpscaleDataset
-from .helpers import PixNerfUpscaler
+from .helpers import get_latent_upscaler
 from .sample_logging import SampleLogger
 from .wandb_logger import WandbLogger
 
@@ -61,34 +62,64 @@ class VAETrainer:
     def __init__(self, config: TrainingConfig) -> None:
         self.cfg = config
         self.cfg.paths.ensure_directories()
-        # _seed_everything(self.cfg.seed)
+        _seed_everything(self.cfg.seed)
 
         if not self.cfg.embeddings.enabled:
             raise ValueError("Latent training requires precomputed embeddings to be enabled in the config.")
 
         self.logger = _create_logger(self.__class__.__name__)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.dataset = UpscaleDataset(
-            cache_dir=str(self.cfg.embeddings.cache_dir),
-            low_res=self.cfg.dataset.model_resolution or self.cfg.dataset.high_resolution,
-            high_res=self.cfg.dataset.high_resolution,
-        )
-        if len(self.dataset) == 0:
-            raise RuntimeError("No latent pairs were found in the cache directory for the given resolutions.")
-        if len(self.dataset) < self.cfg.optimiser.batch_size:
+
+        vae_names = list(self.cfg.embeddings.vae_names)
+        cache_dirs = list(self.cfg.embeddings.vae_cache_dirs)
+        if not cache_dirs:
+            raise RuntimeError("No embedding caches configured for training.")
+        if len(cache_dirs) != len(vae_names):
             raise RuntimeError(
-                f"Found only {len(self.dataset)} latent pairs but batch_size is {self.cfg.optimiser.batch_size}."
+                f"Mismatch between configured VAE names ({len(vae_names)}) and cache directories ({len(cache_dirs)})."
             )
 
-        self.dataloader = DataLoader(
-            self.dataset,
-            batch_size=self.cfg.optimiser.batch_size,
-            shuffle=True,
-            num_workers=self.cfg.dataset.num_workers,
-            drop_last=True,
-        )
+        self.vae_names = vae_names
+        self.vae_metric_names = [name.replace(" ", "_").replace("/", "_").replace("\\", "_") for name in self.vae_names]
+        self.datasets: List[UpscaleDataset] = []
+        self.dataloaders: List[DataLoader] = []
+        dataset_sizes: List[int] = []
 
-        example = self.dataset[0]
+        low_res = self.cfg.dataset.model_resolution or self.cfg.dataset.high_resolution
+        high_res = self.cfg.dataset.high_resolution
+
+        for name, cache_dir in zip(self.vae_names, cache_dirs):
+            dataset = UpscaleDataset(
+                cache_dir=str(cache_dir),
+                low_res=low_res,
+                high_res=high_res,
+            )
+            if len(dataset) == 0:
+                raise RuntimeError(f"No latent pairs were found in cache '{cache_dir}' for VAE '{name}'.")
+            if len(dataset) < self.cfg.optimiser.batch_size:
+                raise RuntimeError(
+                    f"VAE '{name}' provides only {len(dataset)} latent pairs but batch_size is {self.cfg.optimiser.batch_size}."
+                )
+
+            dataloader = DataLoader(
+                dataset,
+                batch_size=self.cfg.optimiser.batch_size,
+                shuffle=True,
+                num_workers=self.cfg.dataset.num_workers,
+                drop_last=True,
+            )
+
+            self.datasets.append(dataset)
+            self.dataloaders.append(dataloader)
+            dataset_sizes.append(len(dataset))
+
+        self.steps_per_epoch = min(len(loader) for loader in self.dataloaders)
+        if self.steps_per_epoch <= 0:
+            raise RuntimeError("No training batches available – check the embedding caches and batch size.")
+        self.total_batches_per_epoch = self.steps_per_epoch * len(self.dataloaders)
+        total_dataset_size = sum(dataset_sizes)
+
+        example = self.datasets[0][0]
         low_latents = example["low"].unsqueeze(0) if example["low"].dim() == 3 else example["low"]
         high_latents = example["high"].unsqueeze(0) if example["high"].dim() == 3 else example["high"]
         if low_latents.dim() != 4 or high_latents.dim() != 4:
@@ -97,38 +128,86 @@ class VAETrainer:
         channels = low_latents.shape[1]
         if high_latents.shape[-1] % low_latents.shape[-1] != 0:
             raise ValueError("High-resolution latents must be an integer multiple of the low-resolution size.")
-        inferred_scale = high_latents.shape[-1] // low_latents.shape[-1]
+        if high_latents.shape[-2] % low_latents.shape[-2] != 0:
+            raise ValueError("High-resolution latents must be an integer multiple of the low-resolution height.")
+        scale_w = high_latents.shape[-1] // low_latents.shape[-1]
+        scale_h = high_latents.shape[-2] // low_latents.shape[-2]
+        if scale_w != scale_h:
+            raise ValueError("High-resolution latents must use the same integer scale factor for height and width.")
+        inferred_scale = scale_h
         if inferred_scale != 2:
-            raise ValueError(f"PixNerfUpscaler supports 2x upscaling, but dataset scale factor is {inferred_scale}.")
+            raise ValueError(f"Latent upscalers in helpers.py currently support only 2x upscaling (found {inferred_scale}×).")
 
-        self.model = PixNerfUpscaler(
+        for idx, dataset in enumerate(self.datasets[1:], start=1):
+            other = dataset[0]
+            other_low = other["low"].unsqueeze(0) if other["low"].dim() == 3 else other["low"]
+            other_high = other["high"].unsqueeze(0) if other["high"].dim() == 3 else other["high"]
+            if other_low.shape[1:] != low_latents.shape[1:] or other_high.shape[1:] != high_latents.shape[1:]:
+                raise ValueError(
+                    f"Dataset for VAE '{self.vae_names[idx]}' has latent shape mismatch compared to the first dataset."
+                )
+
+        upscaler_cfg = self.cfg.latent_upscaler
+        upscaler_name = getattr(upscaler_cfg, "model_name", getattr(upscaler_cfg, "model", None)) or "swin"
+        upscaler_kwargs: Dict[str, Any] = {}
+        if upscaler_name.startswith("swin"):
+            window = getattr(upscaler_cfg, "window", None)
+            if window is None:
+                window = getattr(upscaler_cfg, "patch_size", None)
+            if window:
+                upscaler_kwargs["window"] = int(window)
+            depth = getattr(upscaler_cfg, "depth", None)
+            if depth:
+                upscaler_kwargs["depth"] = int(depth)
+            heads = getattr(upscaler_cfg, "heads", None)
+            if heads:
+                upscaler_kwargs["heads"] = int(heads)
+            mlp_ratio = getattr(upscaler_cfg, "mlp_ratio", None)
+            if mlp_ratio:
+                upscaler_kwargs["mlp_ratio"] = float(mlp_ratio)
+            if upscaler_name == "swin_liif":
+                liif_hidden = getattr(upscaler_cfg, "liif_hidden", None)
+                if liif_hidden:
+                    upscaler_kwargs["liif_hidden"] = int(liif_hidden)
+        elif upscaler_name.startswith("naf"):
+            blocks = getattr(upscaler_cfg, "blocks", None) or getattr(upscaler_cfg, "nerf_blocks", None)
+            if blocks:
+                upscaler_kwargs["blocks"] = int(blocks)
+            groups = getattr(upscaler_cfg, "groups", None)
+            if groups:
+                upscaler_kwargs["groups"] = int(groups)
+
+        self.model = get_latent_upscaler(
+            model_name=upscaler_name,
             channels=channels,
-            patch_size=self.cfg.latent_upscaler.patch_size,
-            hidden_dim_multiplier=self.cfg.latent_upscaler.hidden_dim_multiplier,
-            nerf_blocks=self.cfg.latent_upscaler.nerf_blocks,
+            **upscaler_kwargs,
         ).to(self.device)
+        self.upscaler_name = upscaler_name
         self.param_dtype = next(self.model.parameters()).dtype
 
         self.criterion = nn.MSELoss()
+        self.grad_accum_steps = max(1, self.cfg.optimiser.gradient_accumulation_steps)
         self.optimizer = self._build_optimizer()
-        self.scheduler = self._build_scheduler()
+        self.scheduler = self._build_scheduler(self.grad_accum_steps)
 
-        self.global_step = 0
+        self.global_step = 0  # counts optimiser steps
         total_params = sum(param.numel() for param in self.model.parameters())
         trainable_params = sum(param.numel() for param in self.model.parameters() if param.requires_grad)
+
         self.logger.info(
-            "Initialised trainer | device=%s | dataset_size=%d | batch_size=%d | epochs=%d",
+            "Initialised trainer | device=%s | datasets=%d | total_pairs=%d | batch_size=%d | epochs=%d",
             self.device,
-            len(self.dataset),
+            len(self.datasets),
+            total_dataset_size,
             self.cfg.optimiser.batch_size,
             self.cfg.optimiser.num_epochs,
         )
         self.logger.info(
-            "Model parameters | total=%d | trainable=%d | dtype=%s | patch_size=%d",
+            "Model parameters | total=%d | trainable=%d | dtype=%s | upscaler=%s",
             total_params,
             trainable_params,
             self.param_dtype,
-            self.cfg.latent_upscaler.patch_size,
+            self.upscaler_name,
         )
         self.logger.info(
             "Latent shapes | channels=%d | low_resolution=%d | high_resolution=%d | scale=%d",
@@ -137,6 +216,14 @@ class VAETrainer:
             high_latents.shape[-1],
             inferred_scale,
         )
+        for name, cache_dir, size, loader in zip(self.vae_names, cache_dirs, dataset_sizes, self.dataloaders):
+            self.logger.info(
+                "Dataset[%s] | cache=%s | pairs=%d | batches_per_epoch=%d",
+                name,
+                cache_dir,
+                size,
+                len(loader),
+            )
 
         self.wandb_logger = WandbLogger(
             project=self.cfg.paths.project,
@@ -148,7 +235,8 @@ class VAETrainer:
             "metadata/total_parameters": total_params,
             "metadata/trainable_parameters": trainable_params,
             "metadata/device": str(self.device),
-            "metadata/dataset_size": len(self.dataset),
+            "metadata/datasets": len(self.datasets),
+            "metadata/dataset_size_total": total_dataset_size,
             "metadata/batch_size": self.cfg.optimiser.batch_size,
             "metadata/num_epochs": self.cfg.optimiser.num_epochs,
             "metadata/optimizer": self.cfg.optimiser.optimizer_type,
@@ -156,11 +244,16 @@ class VAETrainer:
             "metadata/clip_grad_norm": self.cfg.optimiser.clip_grad_norm,
             "metadata/latent_channels": channels,
             "metadata/latent_scale": inferred_scale,
+            "metadata/vae_names": ", ".join(self.vae_names),
         }
+        for name, size, loader in zip(self.vae_names, dataset_sizes, self.dataloaders):
+            metadata[f"metadata/dataset_size/{name}"] = size
+            metadata[f"metadata/batches_per_epoch/{name}"] = len(loader)
+
         self.sample_logger: Optional[SampleLogger] = None
         if self.wandb_logger.start(config=_flatten_config(self.cfg), model=self.model, metadata=metadata):
             try:
-                self.sample_logger = SampleLogger(self.cfg, dataset=self.dataset, wandb_logger=self.wandb_logger)
+                self.sample_logger = SampleLogger(self.cfg, dataset=self.datasets[0], wandb_logger=self.wandb_logger)
                 self.sample_logger.maybe_log_samples(model=self.model, step=0, device=self.device)
                 self.logger.info(
                     "Sample logger initialised | interval=%d | samples=%d",
@@ -186,10 +279,14 @@ class VAETrainer:
             return torch.optim.AdamW(self.model.parameters(), lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
         return torch.optim.Adam(self.model.parameters(), lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
 
-    def _build_scheduler(self) -> Optional[torch.optim.lr_scheduler._LRScheduler]:
+    def _build_scheduler(self, accum_steps: int) -> Optional[torch.optim.lr_scheduler._LRScheduler]:
         scheduler_type = (self.cfg.optimiser.scheduler or "").lower()
         if scheduler_type == "cosine":
-            total_steps = self.cfg.optimiser.num_epochs * len(self.dataloader)
+            batches_per_epoch = getattr(self, "total_batches_per_epoch", 0)
+            if batches_per_epoch <= 0:
+                return None
+            effective_batches = math.ceil(batches_per_epoch / max(1, accum_steps))
+            total_steps = self.cfg.optimiser.num_epochs * effective_batches
             if total_steps <= 0:
                 return None
             return torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -199,57 +296,123 @@ class VAETrainer:
             )
         return None
 
+    def step(
+        self,
+        batch: Dict[str, torch.Tensor],
+        *,
+        vae_index: int,
+        accum_steps: int,
+        zero_grad: bool,
+    ) -> float:
+        if zero_grad:
+            self.optimizer.zero_grad(set_to_none=True)
+
+        low = batch["low"].to(self.device, dtype=self.param_dtype)
+        high = batch["high"].to(self.device, dtype=self.param_dtype)
+
+        upscaled = self.model(low)
+        loss = self.criterion(upscaled, high)
+        loss_value = float(loss.detach().item())
+        (loss / accum_steps).backward()
+        return loss_value
+
+    def _optimizer_step(self, clip_norm: float) -> None:
+        if clip_norm > 0:
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), clip_norm)
+        self.optimizer.step()
+        if self.scheduler is not None:
+            self.scheduler.step()
+        self.optimizer.zero_grad(set_to_none=True)
+        self.global_step += 1
+
+    def _log_step_metrics(self, metrics: Dict[str, float]) -> None:
+        if not self.wandb_logger.is_active:
+            return
+        self.wandb_logger.log(metrics, step=self.global_step)
+        if self.sample_logger is not None:
+            try:
+                self.sample_logger.maybe_log_samples(model=self.model, step=self.global_step, device=self.device)
+            except Exception as sample_exc:
+                self.logger.warning("Sample logging failed at step %d: %s", self.global_step, sample_exc)
+                self.sample_logger = None
+
     def train(self) -> None:
         num_epochs = self.cfg.optimiser.num_epochs
         clip_norm = self.cfg.optimiser.clip_grad_norm
 
-        num_batches = len(self.dataloader)
         final_epoch_loss: Optional[float] = None
         best_epoch_loss: float = float("inf")
+        accum_total_loss = 0.0
+        accum_loss_by_vae = [0.0 for _ in self.dataloaders]
+        accum_counts_by_vae = [0 for _ in self.dataloaders]
+        accum_counter = 0
+        num_vaes = len(self.dataloaders)
+
+        def flush_accumulated() -> None:
+            nonlocal accum_total_loss, accum_loss_by_vae, accum_counts_by_vae, accum_counter
+            if accum_counter == 0:
+                return
+
+            effective_counter = accum_counter
+            metrics: Dict[str, float] = {
+                "train/mse_loss": accum_total_loss / max(1, effective_counter),
+            }
+            for idx, count in enumerate(accum_counts_by_vae):
+                if count > 0:
+                    metrics[f"train/mse_loss/{self.vae_metric_names[idx]}"] = accum_loss_by_vae[idx] / count
+
+            if effective_counter != self.grad_accum_steps:
+                scale = self.grad_accum_steps / effective_counter
+                for param in self.model.parameters():
+                    if param.grad is not None:
+                        param.grad.mul_(scale)
+
+            self._optimizer_step(clip_norm)
+            self._log_step_metrics(metrics)
+
+            accum_total_loss = 0.0
+            accum_loss_by_vae = [0.0 for _ in range(num_vaes)]
+            accum_counts_by_vae = [0 for _ in range(num_vaes)]
+            accum_counter = 0
+
         for epoch in tqdm(range(1, num_epochs + 1), desc="Training epochs", unit="epoch"):
-            epoch_loss = 0.0
+            epoch_loss_totals = [0.0 for _ in self.dataloaders]
+            loader_iters = [iter(loader) for loader in self.dataloaders]
 
-            for batch in tqdm(self.dataloader, desc=f"Epoch {epoch} batches", unit="batch"):
-                low = batch["low"].to(self.device, dtype=self.param_dtype)
-                high = batch["high"].to(self.device, dtype=self.param_dtype)
+            for _ in tqdm(range(self.steps_per_epoch), desc=f"Epoch {epoch} steps", unit="step"):
+                for vae_index, loader_iter in enumerate(loader_iters):
+                    batch = next(loader_iter)
+                    loss_value = self.step(
+                        batch,
+                        vae_index=vae_index,
+                        accum_steps=self.grad_accum_steps,
+                        zero_grad=(accum_counter == 0),
+                    )
+                    epoch_loss_totals[vae_index] += loss_value
+                    accum_total_loss += loss_value
+                    accum_loss_by_vae[vae_index] += loss_value
+                    accum_counts_by_vae[vae_index] += 1
+                    accum_counter += 1
 
-                self.optimizer.zero_grad(set_to_none=True)
-                upscaled = self.model(low)
-                loss = self.criterion(upscaled, high)
-                loss.backward()
+                    if accum_counter == self.grad_accum_steps:
+                        flush_accumulated()
 
-                if clip_norm > 0:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), clip_norm)
+            avg_losses = [total / max(1, self.steps_per_epoch) for total in epoch_loss_totals]
+            combined_avg = sum(avg_losses) / len(avg_losses)
+            final_epoch_loss = combined_avg
+            if combined_avg < best_epoch_loss:
+                best_epoch_loss = combined_avg
 
-                self.optimizer.step()
-
-                if self.scheduler is not None:
-                    self.scheduler.step()
-
-                loss_value = loss.detach().item()
-                epoch_loss += loss_value
-
-                self.global_step += 1
-
-                if self.wandb_logger.is_active:
-                    self.wandb_logger.log({"train/mse_loss": loss_value}, step=self.global_step)
-                    if self.sample_logger is not None:
-                        try:
-                            self.sample_logger.maybe_log_samples(
-                                model=self.model, step=self.global_step, device=self.device
-                            )
-                        except Exception as sample_exc:
-                            self.logger.warning("Sample logging failed at step %d: %s", self.global_step, sample_exc)
-                            self.sample_logger = None
-
-            avg_loss = epoch_loss / max(1, num_batches)
-            final_epoch_loss = avg_loss
-            if avg_loss < best_epoch_loss:
-                best_epoch_loss = avg_loss
-            self.logger.info("Epoch %d/%d | loss=%.6f", epoch, num_epochs, avg_loss)
+            per_vae_summary = " | ".join(f"{name}=%.6f" % avg for name, avg in zip(self.vae_names, avg_losses))
+            self.logger.info("Epoch %d/%d | loss=%.6f | %s", epoch, num_epochs, combined_avg, per_vae_summary)
 
             if self.wandb_logger.is_active:
-                self.wandb_logger.log({"train/epoch_loss": avg_loss}, step=self.global_step)
+                metrics = {"train/epoch_loss": combined_avg}
+                for suffix, avg in zip(self.vae_metric_names, avg_losses):
+                    metrics[f"train/epoch_loss/{suffix}"] = avg
+                self.wandb_logger.log(metrics, step=self.global_step)
+
+        flush_accumulated()
 
         if self.wandb_logger.is_active:
             summary: Dict[str, Any] = {"best_epoch_loss": best_epoch_loss}

@@ -1,5 +1,5 @@
 # Basic configuration for precomputing latent embeddings compatible with the test dataset.
-dataset_root: ./datasets/full_dataset
+dataset_root: ./datasets/test_dataset
 cache_root: cache_vae_embeddings
 
 defaults:
@@ -14,6 +14,15 @@ models:
     vae_kind: kl
     weights_dtype: float32
     cache_subdir: sd_vae
+    resolutions_with_batchsize:
+      - [128, 512]
+      - [256, 224]
+      - [512, 100]
+  sd_vae_midjourneyv6:
+    hf_repo: lavinal712/sd-vae-ft-mse-midjourneyv6
+    vae_kind: kl
+    weights_dtype: float32
+    cache_subdir: sd_vae_midjourneyv6
     resolutions_with_batchsize:
       - [128, 512]
       - [256, 224]

@@ -410,6 +410,8 @@ class EmbeddingsConfig:
     precompute_batch_size: int
     num_workers: int
     store_distribution: bool
+    vae_names: Tuple[str, ...]
+    vae_cache_dirs: Tuple[Path, ...]
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any], dataset_root: Path) -> "EmbeddingsConfig":
@@ -428,15 +430,57 @@ class EmbeddingsConfig:
         precompute_batch_size = int(section.get("precompute_batch_size", data.get("embeddings_precompute_batch_size", 16)))
         num_workers = int(section.get("precompute_num_workers", data.get("embeddings_precompute_num_workers", 4)))
         store_distribution = _resolve_bool(section.get("store_distribution", data.get("embeddings_store_distribution", True)), default=True)
+        raw_names = section.get("vae_names")
+        if raw_names is None:
+            raw_names = data.get("vae_names") or data.get("embeddings_vae_names")
+
+        vae_names: List[str] = []
+        if isinstance(raw_names, str):
+            candidate = raw_names.strip()
+            if candidate:
+                vae_names.append(candidate)
+        elif isinstance(raw_names, (list, tuple, set)):
+            for item in raw_names:
+                if item is None:
+                    continue
+                candidate = str(item).strip()
+                if candidate:
+                    vae_names.append(candidate)
+
+        if vae_names:
+            cache_dirs: List[Path] = []
+            base_dir = cache_dir
+            for index, name in enumerate(vae_names):
+                name_path = Path(name)
+                if name_path.is_absolute():
+                    cache_dirs.append(name_path)
+                    continue
+                if index == 0 and name_path.parent == Path(".") and cache_dir.name == name_path.name:
+                    cache_dirs.append(cache_dir)
+                    base_dir = cache_dir.parent if cache_dir.parent != cache_dir else cache_dir.parent
+                    continue
+                if index == 0:
+                    candidate = cache_dir / name_path
+                    cache_dirs.append(candidate)
+                    base_dir = cache_dir
+                else:
+                    cache_dirs.append((base_dir or cache_dir) / name_path)
+        else:
+            fallback_name = cache_dir.name or "default"
+            vae_names = [fallback_name]
+            cache_dirs = [cache_dir]
+
         return cls(
             enabled=enabled,
-            cache_dir=cache_dir,
+            cache_dir=cache_dirs[0],
             dtype=dtype,
             variants_per_sample=max(1, variants_per_sample),
             overwrite=overwrite,
             precompute_batch_size=max(1, precompute_batch_size),
             num_workers=max(0, num_workers),
             store_distribution=store_distribution,
+            vae_names=tuple(vae_names),
+            vae_cache_dirs=tuple(cache_dirs),
         )
 
 

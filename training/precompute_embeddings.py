@@ -218,6 +218,8 @@ def _run_from_config(args: argparse.Namespace) -> None:
             precompute_batch_size=task.batch_size,
             num_workers=task.num_workers,
             store_distribution=task.store_distribution,
+            vae_names=(task.vae_name,),
+            vae_cache_dirs=(task.cache_dir,),
         )
 
         cache = EmbeddingCache(embeddings_cfg, dataset_cfg, task.dataset_path)
@@ -282,4 +284,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
