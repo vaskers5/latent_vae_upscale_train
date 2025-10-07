@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
+from accelerate import Accelerator
 from torch import nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -67,8 +68,13 @@ class VAETrainer:
         if not self.cfg.embeddings.enabled:
             raise ValueError("Latent training requires precomputed embeddings to be enabled in the config.")
 
+        self.accelerator = Accelerator(
+            gradient_accumulation_steps=self.cfg.optimiser.gradient_accumulation_steps
+        )
+        self.accelerator.seed_everything(self.cfg.seed)
         self.logger = _create_logger(self.__class__.__name__)
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.logger.disabled = not self.accelerator.is_local_main_process
+        self.device = self.accelerator.device
 
         vae_names = list(self.cfg.embeddings.vae_names)
         cache_dirs = list(self.cfg.embeddings.vae_cache_dirs)
@@ -113,9 +119,20 @@ class VAETrainer:
             self.dataloaders.append(dataloader)
             dataset_sizes.append(len(dataset))
 
-        self.steps_per_epoch = min(len(loader) for loader in self.dataloaders)
+        world_size = max(1, self.accelerator.num_processes)
+        per_dataset_steps: List[int] = []
+        for name, loader in zip(self.vae_names, self.dataloaders):
+            total_batches = len(loader)
+            per_process_batches = total_batches // world_size
+            if per_process_batches <= 0:
+                raise RuntimeError(
+                    f"Dataset for VAE '{name}' does not provide enough batches ({total_batches}) for {world_size} processes."
+                )
+            per_dataset_steps.append(per_process_batches)
+
+        self.steps_per_epoch = min(per_dataset_steps)
         if self.steps_per_epoch <= 0:
-            raise RuntimeError("No training batches available – check the embedding caches and batch size.")
+            raise RuntimeError("No training batches available – check the embedding caches, batch size, and world size.")
         self.total_batches_per_epoch = self.steps_per_epoch * len(self.dataloaders)
         total_dataset_size = sum(dataset_sizes)
 
@@ -190,9 +207,26 @@ class VAETrainer:
         self.optimizer = self._build_optimizer()
         self.scheduler = self._build_scheduler(self.grad_accum_steps)
 
+        prepare_targets: List[Any] = [self.model, self.optimizer, *self.dataloaders]
+        scheduler_present = self.scheduler is not None
+        if scheduler_present:
+            prepare_targets.append(self.scheduler)
+
+        prepared = self.accelerator.prepare(*prepare_targets)
+        self.model = prepared[0]
+        self.optimizer = prepared[1]
+        loaders_start = 2
+        loaders_end = loaders_start + len(self.dataloaders)
+        self.dataloaders = list(prepared[loaders_start:loaders_end])
+        if scheduler_present:
+            self.scheduler = prepared[-1]
+
+        self.optimizer.zero_grad(set_to_none=True)
+
         self.global_step = 0  # counts optimiser steps
-        total_params = sum(param.numel() for param in self.model.parameters())
-        trainable_params = sum(param.numel() for param in self.model.parameters() if param.requires_grad)
+        parameter_source = self.accelerator.unwrap_model(self.model)
+        total_params = sum(param.numel() for param in parameter_source.parameters())
+        trainable_params = sum(param.numel() for param in parameter_source.parameters() if param.requires_grad)
 
         self.logger.info(
             "Initialised trainer | device=%s | datasets=%d | total_pairs=%d | batch_size=%d | epochs=%d",
@@ -228,7 +262,7 @@ class VAETrainer:
         self.wandb_logger = WandbLogger(
             project=self.cfg.paths.project,
             run_name=self.cfg.logging.wandb_run_name,
-            enabled=self.cfg.logging.use_wandb,
+            enabled=self.cfg.logging.use_wandb and self.accelerator.is_main_process,
             logger=self.logger,
         )
         metadata = {
@@ -251,7 +285,8 @@ class VAETrainer:
             metadata[f"metadata/batches_per_epoch/{name}"] = len(loader)
 
         self.sample_logger: Optional[SampleLogger] = None
-        if self.wandb_logger.start(config=_flatten_config(self.cfg), model=self.model, metadata=metadata):
+        unwrapped_model = self.accelerator.unwrap_model(self.model)
+        if self.wandb_logger.start(config=_flatten_config(self.cfg), model=unwrapped_model, metadata=metadata):
             try:
                 dataset_map = {name: dataset for name, dataset in zip(self.vae_names, self.datasets)}
                 primary_dataset = self.datasets[0] if self.datasets else None
@@ -261,7 +296,7 @@ class VAETrainer:
                     datasets=dataset_map,
                     wandb_logger=self.wandb_logger,
                 )
-                self.sample_logger.maybe_log_samples(model=self.model, step=0, device=self.device)
+                self.sample_logger.maybe_log_samples(model=unwrapped_model, step=0, device=self.device)
                 self.logger.info(
                     "Sample logger initialised | interval=%d | samples=%d",
                     self.sample_logger.sample_interval,
@@ -303,42 +338,35 @@ class VAETrainer:
             )
         return None
 
-    def step(
-        self,
-        batch: Dict[str, torch.Tensor],
-        *,
-        vae_index: int,
-        accum_steps: int,
-        zero_grad: bool,
-    ) -> float:
-        if zero_grad:
-            self.optimizer.zero_grad(set_to_none=True)
-
+    def step(self, batch: Dict[str, torch.Tensor]) -> float:
         low = batch["low"].to(self.device, dtype=self.param_dtype)
         high = batch["high"].to(self.device, dtype=self.param_dtype)
 
         upscaled = self.model(low)
         loss = self.criterion(upscaled, high)
-        loss_value = float(loss.detach().item())
-        (loss / accum_steps).backward()
+        self.accelerator.backward(loss)
+
+        gathered = self.accelerator.gather(loss.detach())
+        loss_value = float(gathered.mean().item())
         return loss_value
 
     def _optimizer_step(self, clip_norm: float) -> None:
         if clip_norm > 0:
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), clip_norm)
-        self.optimizer.step()
+            self.accelerator.clip_grad_norm_(self.model.parameters(), clip_norm)
+        self.accelerator.step(self.optimizer)
         if self.scheduler is not None:
             self.scheduler.step()
         self.optimizer.zero_grad(set_to_none=True)
         self.global_step += 1
 
     def _log_step_metrics(self, metrics: Dict[str, float]) -> None:
-        if not self.wandb_logger.is_active:
+        if not self.wandb_logger.is_active or not self.accelerator.is_main_process:
             return
         self.wandb_logger.log(metrics, step=self.global_step)
         if self.sample_logger is not None:
             try:
-                self.sample_logger.maybe_log_samples(model=self.model, step=self.global_step, device=self.device)
+                model = self.accelerator.unwrap_model(self.model)
+                self.sample_logger.maybe_log_samples(model=model, step=self.global_step, device=self.device)
             except Exception as sample_exc:
                 self.logger.warning("Sample logging failed at step %d: %s", self.global_step, sample_exc)
                 self.sample_logger = None
@@ -357,7 +385,11 @@ class VAETrainer:
 
         def flush_accumulated() -> None:
             nonlocal accum_total_loss, accum_loss_by_vae, accum_counts_by_vae, accum_counter
-            if accum_counter == 0:
+            if accum_counter == 0 or not self.accelerator.is_main_process:
+                accum_total_loss = 0.0
+                accum_loss_by_vae = [0.0 for _ in range(num_vaes)]
+                accum_counts_by_vae = [0 for _ in range(num_vaes)]
+                accum_counter = 0
                 return
 
             effective_counter = accum_counter
@@ -368,13 +400,6 @@ class VAETrainer:
                 if count > 0:
                     metrics[f"train/mse_loss/{self.vae_metric_names[idx]}"] = accum_loss_by_vae[idx] / count
 
-            if effective_counter != self.grad_accum_steps:
-                scale = self.grad_accum_steps / effective_counter
-                for param in self.model.parameters():
-                    if param.grad is not None:
-                        param.grad.mul_(scale)
-
-            self._optimizer_step(clip_norm)
             self._log_step_metrics(metrics)
 
             accum_total_loss = 0.0
@@ -382,27 +407,40 @@ class VAETrainer:
             accum_counts_by_vae = [0 for _ in range(num_vaes)]
             accum_counter = 0
 
-        for epoch in tqdm(range(1, num_epochs + 1), desc="Training epochs", unit="epoch"):
+        for epoch in tqdm(
+            range(1, num_epochs + 1),
+            desc="Training epochs",
+            unit="epoch",
+            disable=not self.accelerator.is_local_main_process,
+        ):
             epoch_loss_totals = [0.0 for _ in self.dataloaders]
+
+            for loader in self.dataloaders:
+                sampler = getattr(loader, "sampler", None)
+                if sampler is not None and hasattr(sampler, "set_epoch"):
+                    sampler.set_epoch(epoch)
+
             loader_iters = [iter(loader) for loader in self.dataloaders]
 
-            for _ in tqdm(range(self.steps_per_epoch), desc=f"Epoch {epoch} steps", unit="step"):
+            for _ in tqdm(
+                range(self.steps_per_epoch),
+                desc=f"Epoch {epoch} steps",
+                unit="step",
+                disable=not self.accelerator.is_local_main_process,
+            ):
                 for vae_index, loader_iter in enumerate(loader_iters):
                     batch = next(loader_iter)
-                    loss_value = self.step(
-                        batch,
-                        vae_index=vae_index,
-                        accum_steps=self.grad_accum_steps,
-                        zero_grad=(accum_counter == 0),
-                    )
-                    epoch_loss_totals[vae_index] += loss_value
-                    accum_total_loss += loss_value
-                    accum_loss_by_vae[vae_index] += loss_value
-                    accum_counts_by_vae[vae_index] += 1
-                    accum_counter += 1
+                    with self.accelerator.accumulate(self.model):
+                        loss_value = self.step(batch)
+                        epoch_loss_totals[vae_index] += loss_value
+                        accum_total_loss += loss_value
+                        accum_loss_by_vae[vae_index] += loss_value
+                        accum_counts_by_vae[vae_index] += 1
+                        accum_counter += 1
 
-                    if accum_counter == self.grad_accum_steps:
-                        flush_accumulated()
+                        if self.accelerator.sync_gradients:
+                            self._optimizer_step(clip_norm)
+                            flush_accumulated()
 
             avg_losses = [total / max(1, self.steps_per_epoch) for total in epoch_loss_totals]
             combined_avg = sum(avg_losses) / len(avg_losses)
@@ -419,14 +457,13 @@ class VAETrainer:
                     metrics[f"train/epoch_loss/{suffix}"] = avg
                 self.wandb_logger.log(metrics, step=self.global_step)
 
-        flush_accumulated()
-
         if self.wandb_logger.is_active:
             summary: Dict[str, Any] = {"best_epoch_loss": best_epoch_loss}
             if final_epoch_loss is not None:
                 summary["final_loss"] = final_epoch_loss
             self.wandb_logger.log_summary(summary)
             self.wandb_logger.finish()
+        self.accelerator.wait_for_everyone()
 
 
 def run(config: TrainingConfig | Dict[str, Any]) -> None:
