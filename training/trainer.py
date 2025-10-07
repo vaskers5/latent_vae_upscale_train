@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import logging
-import math
 import random
-import time
 from dataclasses import asdict, is_dataclass
 from typing import Any, Dict, Optional
 
@@ -201,104 +199,40 @@ class VAETrainer:
             )
         return None
 
-    def _current_lr(self) -> float:
-        if not self.optimizer.param_groups:
-            return 0.0
-        return float(self.optimizer.param_groups[0].get("lr", 0.0))
-
-    def _compute_grad_norm(self) -> float:
-        total = 0.0
-        for param in self.model.parameters():
-            if param.grad is None:
-                continue
-            norm = param.grad.detach().data.norm(2)
-            if torch.isnan(norm):
-                return float("nan")
-            total += float(norm.item()) ** 2
-        return float(total**0.5)
-
     def train(self) -> None:
         num_epochs = self.cfg.optimiser.num_epochs
         clip_norm = self.cfg.optimiser.clip_grad_norm
-        if self.device.type == "cuda":
-            torch.cuda.reset_peak_memory_stats(self.device)
 
         num_batches = len(self.dataloader)
         final_epoch_loss: Optional[float] = None
-        final_epoch_mae: Optional[float] = None
         best_epoch_loss: float = float("inf")
-        best_epoch_index: Optional[int] = None
         for epoch in tqdm(range(1, num_epochs + 1), desc="Training epochs", unit="epoch"):
-            epoch_start = time.perf_counter()
             epoch_loss = 0.0
-            epoch_mae = 0.0
-            grad_norm_accumulator = 0.0
-            grad_norm_max = 0.0
-            batch_time_accumulator = 0.0
-            data_time_accumulator = 0.0
-            max_loss = 0.0
-            samples_seen = 0
-            data_timer = time.perf_counter()
 
-            for batch_idx, batch in enumerate(
-                tqdm(self.dataloader, desc=f"Epoch {epoch} batches", unit="batch"),
-                start=1,
-            ):
-                data_time = time.perf_counter() - data_timer
+            for batch in tqdm(self.dataloader, desc=f"Epoch {epoch} batches", unit="batch"):
                 low = batch["low"].to(self.device, dtype=self.param_dtype)
                 high = batch["high"].to(self.device, dtype=self.param_dtype)
-                samples_seen += int(low.shape[0])
 
-                step_timer = time.perf_counter()
                 self.optimizer.zero_grad(set_to_none=True)
                 upscaled = self.model(low)
                 loss = self.criterion(upscaled, high)
                 loss.backward()
 
-                grad_norm: Optional[float] = None
                 if clip_norm > 0:
-                    grad_norm_tensor = torch.nn.utils.clip_grad_norm_(self.model.parameters(), clip_norm)
-                    if self.cfg.logging.log_grad_norm:
-                        grad_norm = float(grad_norm_tensor.detach().item())
-                elif self.cfg.logging.log_grad_norm:
-                    grad_norm = self._compute_grad_norm()
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), clip_norm)
 
                 self.optimizer.step()
 
                 if self.scheduler is not None:
                     self.scheduler.step()
 
-                step_time = time.perf_counter() - step_timer
-                batch_time_accumulator += step_time
-                data_time_accumulator += data_time
                 loss_value = loss.detach().item()
                 epoch_loss += loss_value
-                max_loss = max(max_loss, loss_value)
-                with torch.no_grad():
-                    diff = upscaled - high
-                    mae_value = diff.abs().mean().item()
-                    epoch_mae += mae_value
-
-                if grad_norm is not None and not math.isnan(grad_norm):
-                    grad_norm_accumulator += grad_norm
-                    grad_norm_max = max(grad_norm_max, grad_norm)
 
                 self.global_step += 1
-                current_lr = self._current_lr()
-                data_timer = time.perf_counter()
 
                 if self.wandb_logger.is_active:
-                    metrics: Dict[str, Any] = {
-                        "train/mse_loss": loss_value,
-                        "train/lr": current_lr,
-                        "train/epoch": epoch,
-                        "train/batch_index": batch_idx,
-                    }
-                    if step_time > 0:
-                        metrics["train/samples_per_sec_batch"] = low.shape[0] / step_time
-                    if grad_norm is not None:
-                        metrics["train/grad_norm"] = grad_norm
-                    self.wandb_logger.log(metrics, step=self.global_step)
+                    self.wandb_logger.log({"train/mse_loss": loss_value}, step=self.global_step)
                     if self.sample_logger is not None:
                         try:
                             self.sample_logger.maybe_log_samples(
@@ -308,77 +242,19 @@ class VAETrainer:
                             self.logger.warning("Sample logging failed at step %d: %s", self.global_step, sample_exc)
                             self.sample_logger = None
 
-            epoch_time = time.perf_counter() - epoch_start
             avg_loss = epoch_loss / max(1, num_batches)
             final_epoch_loss = avg_loss
-            avg_mae = epoch_mae / max(1, num_batches)
-            final_epoch_mae = avg_mae
-            avg_batch_time = batch_time_accumulator / max(1, num_batches)
-            avg_data_time = data_time_accumulator / max(1, num_batches)
-            throughput = samples_seen / epoch_time if epoch_time > 0 else 0.0
-            avg_grad_norm = None
-            if self.cfg.logging.log_grad_norm and num_batches > 0:
-                avg_grad_norm = grad_norm_accumulator / max(1, num_batches)
             if avg_loss < best_epoch_loss:
                 best_epoch_loss = avg_loss
-                best_epoch_index = epoch
-
-            peak_memory_mb: Optional[float] = None
-            if self.device.type == "cuda":
-                peak_memory = torch.cuda.max_memory_allocated(self.device)
-                peak_memory_mb = peak_memory / (1024**2)
-                torch.cuda.reset_peak_memory_stats(self.device)
-
-            summary_parts = [
-                f"Epoch {epoch}/{num_epochs}",
-                f"loss={avg_loss:.6f}",
-                f"max_loss={max_loss:.6f}",
-                f"lr={self._current_lr():.6e}",
-                f"epoch_time={epoch_time:.2f}s",
-                f"batch_time={avg_batch_time:.3f}s",
-                f"data_time={avg_data_time:.3f}s",
-                f"samples_per_sec={throughput:.1f}",
-            ]
-            if final_epoch_mae is not None:
-                summary_parts.append(f"latent_mae={avg_mae:.6f}")
-            if avg_grad_norm is not None:
-                summary_parts.append(f"avg_grad={avg_grad_norm:.4f}")
-                summary_parts.append(f"max_grad={grad_norm_max:.4f}")
-            if peak_memory_mb is not None:
-                summary_parts.append(f"gpu_mem={peak_memory_mb:.1f}MB")
-            self.logger.info(" | ".join(summary_parts))
+            self.logger.info("Epoch %d/%d | loss=%.6f", epoch, num_epochs, avg_loss)
 
             if self.wandb_logger.is_active:
-                epoch_metrics: Dict[str, Any] = {
-                    "train/epoch_loss": avg_loss,
-                    "train/epoch_mae_latent": avg_mae,
-                    "train/epoch_max_loss": max_loss,
-                    "train/epoch_time": epoch_time,
-                    "train/avg_batch_time": avg_batch_time,
-                    "train/avg_data_time": avg_data_time,
-                    "train/samples_per_sec": throughput,
-                    "train/epoch_index": epoch,
-                    "train/samples_seen_epoch": samples_seen,
-                    "train/learning_rate_epoch_end": current_lr,
-                }
-                if avg_grad_norm is not None:
-                    epoch_metrics["train/avg_grad_norm"] = avg_grad_norm
-                    epoch_metrics["train/max_grad_norm"] = grad_norm_max
-                if peak_memory_mb is not None:
-                    epoch_metrics["train/peak_gpu_memory_mb"] = peak_memory_mb
-                self.wandb_logger.log(epoch_metrics, step=self.global_step)
+                self.wandb_logger.log({"train/epoch_loss": avg_loss}, step=self.global_step)
 
         if self.wandb_logger.is_active:
-            summary: Dict[str, Any] = {
-                "total_steps": self.global_step,
-                "best_epoch_loss": best_epoch_loss,
-            }
+            summary: Dict[str, Any] = {"best_epoch_loss": best_epoch_loss}
             if final_epoch_loss is not None:
                 summary["final_loss"] = final_epoch_loss
-            if final_epoch_mae is not None:
-                summary["final_latent_mae"] = final_epoch_mae
-            if best_epoch_index is not None:
-                summary["best_epoch_index"] = best_epoch_index
             self.wandb_logger.log_summary(summary)
             self.wandb_logger.finish()
 
