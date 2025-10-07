@@ -11,6 +11,8 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TYPE_CH
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
+from tqdm.auto import tqdm
+
 
 from .config import DatasetConfig, EmbeddingsConfig
 
@@ -62,12 +64,15 @@ class EmbeddingCache:
         embeddings_config: EmbeddingsConfig,
         dataset_config: DatasetConfig,
         dataset_root: Path,
+        log: Optional[Callable[[str], None]] = None,
     ) -> None:
         self.cfg = embeddings_config
         self.dataset_cfg = dataset_config
         self.dataset_root = dataset_root.resolve()
         self.cache_root = self.cfg.cache_dir.resolve()
         self.cache_root.mkdir(parents=True, exist_ok=True)
+        self.log = log or print
+        self.log(f"Initialized EmbeddingCache with cache_root: {self.cache_root}")
 
     # ------------------------------------------------------------------ storage helpers
     def _relative_path(self, image_path: Path) -> Path:
@@ -104,6 +109,7 @@ class EmbeddingCache:
         mean: Optional[torch.Tensor] = None,
         logvar: Optional[torch.Tensor] = None,
     ) -> None:
+        self.log(f"Saving embedding for {image_path} variant {variant_index}")
         record_path = self._record_path(image_path, variant_index)
         record_path.parent.mkdir(parents=True, exist_ok=True)
         payload: Dict[str, Any] = {
@@ -125,6 +131,7 @@ class EmbeddingCache:
         torch.save(payload, record_path)
 
     def load_record(self, image_path: Path, variant_index: int) -> EmbeddingRecord:
+        self.log(f"Loading embedding for {image_path} variant {variant_index}")
         record_path = self._record_path(image_path, variant_index)
         if not record_path.exists():
             raise FileNotFoundError(f"Missing embedding cache for '{image_path}' variant {variant_index}")
@@ -149,6 +156,7 @@ class EmbeddingCache:
             variant_index = random.choice(variants)
         else:
             variant_index = variants[rng.randrange(0, len(variants))]
+        self.log(f"Chose variant {variant_index} for {image_path}")
         return self.load_record(image_path, variant_index)
 
     def validate_dataset(self, dataset: "ImageFolderDataset") -> None:
@@ -164,6 +172,7 @@ class EmbeddingCache:
                     missing.append((path, variant))
 
         if missing:
+            self.log(f"Validation failed: {len(missing)} missing embedding variants")
             preview = "\n".join(
                 f"- {path} (variant {variant})" for path, variant in missing[:10]
             )
@@ -172,6 +181,8 @@ class EmbeddingCache:
                 "Embedding cache incomplete. Missing the following entries:\n"
                 f"{preview}{suffix}"
             )
+        else:
+            self.log("Dataset validation passed: all embeddings available")
 
     # ------------------------------------------------------------------ preparation
     def ensure_populated(
@@ -190,12 +201,28 @@ class EmbeddingCache:
         if not self.cfg.enabled:
             return
 
+        total_checks = len(dataset.paths) * self.cfg.variants_per_sample
         missing: List[Tuple[Path, int]] = []
+        progress = tqdm(total=total_checks, desc="Check cache", dynamic_ncols=True)
         for path in dataset.paths:
+            relative = self._relative_path(path)
+            cache_subdir = self.cache_root / relative.parent
+            existing_variants = set()
+            if cache_subdir.exists():
+                for file in cache_subdir.iterdir():
+                    if file.is_file() and file.name.startswith(f"{relative.stem}_v") and file.name.endswith('.pt'):
+                        try:
+                            variant_str = file.name[len(f"{relative.stem}_v"):-3]
+                            variant = int(variant_str)
+                            existing_variants.add(variant)
+                        except ValueError:
+                            pass
             for variant in range(self.cfg.variants_per_sample):
-                present = self.has_variant(path, variant)
+                present = variant in existing_variants
                 if present and not self.cfg.overwrite:
+                    progress.update(1)
                     continue
+                progress.update(1)
                 missing.append((path, variant))
 
         main_process = accelerator is None or accelerator.is_main_process
@@ -234,7 +261,6 @@ class EmbeddingCache:
 
         progress = None
         if main_process:
-            from tqdm.auto import tqdm  # local import to avoid global dependency
 
             progress = tqdm(
                 total=len(missing),
@@ -325,6 +351,7 @@ class _EmbeddingGenerationDataset(Dataset):
     def __getitem__(self, index: int) -> Dict[str, Any]:
         image_path, variant_index = self.pending[index]
         rng = self.cache._build_rng(self.seed, image_path, variant_index)
+        self.cache.log(f"Building tensor sample for {image_path} variant {variant_index}")
         sample_tensor, params = self.dataset.build_tensor_sample(image_path, rng=rng, params=None)
         model_input = self.dataset.prepare_model_input(sample_tensor).contiguous()
         return {
