@@ -6,7 +6,7 @@ import glob
 import os
 import random
 from pathlib import Path
-from typing import Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from PIL import Image, ImageOps, UnidentifiedImageError
 import torch
@@ -164,7 +164,7 @@ class UpscaleDataset(Dataset):
     def __init__(self, cache_dir: str, low_res: int, high_res: int) -> None:
         self.pairs = []
         low_res_files = glob.glob(
-            f"{cache_dir}/**/{low_res}px/*.pt", recursive=True
+            f"{cache_dir}/{low_res}px/**/*.pt", recursive=True
         )
 
         for low_path in low_res_files:
@@ -177,8 +177,50 @@ class UpscaleDataset(Dataset):
     def __len__(self) -> int:
         return len(self.pairs)
 
+    @staticmethod
+    def _extract_latent(record: Any) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        """
+        Normalize stored latent payloads into tensors, preserving auxiliary metadata.
+
+        Newer caches store dictionaries with a `latents` tensor along with mean/logvar,
+        while older caches may persist the tensor directly. We gracefully handle both.
+        """
+
+        if isinstance(record, torch.Tensor):
+            return record, {}
+
+        if isinstance(record, dict):
+            for key in ("latents", "tensor", "latent"):
+                value = record.get(key)
+                if isinstance(value, torch.Tensor):
+                    meta = {k: v for k, v in record.items() if k != key}
+                    return value, meta
+            raise TypeError("Latent record dict does not contain a tensor payload.")
+
+        if isinstance(record, (list, tuple)) and record:
+            tensor_candidate = None
+            meta: Dict[str, Any] = {}
+            for item in record:
+                if isinstance(item, torch.Tensor) and tensor_candidate is None:
+                    tensor_candidate = item
+                elif isinstance(item, dict):
+                    meta.update(item)
+            if tensor_candidate is not None:
+                return tensor_candidate, meta
+
+        raise TypeError(f"Unsupported latent record type: {type(record)}")
+
     def __getitem__(self, idx: int):
         low_path, high_path = self.pairs[idx]
-        low_tensor = torch.load(low_path)
-        high_tensor = torch.load(high_path)
-        return {"low": low_tensor, "high": high_tensor}
+        low_record = torch.load(low_path, map_location="cpu")
+        high_record = torch.load(high_path, map_location="cpu")
+
+        low_tensor, low_meta = self._extract_latent(low_record)
+        high_tensor, high_meta = self._extract_latent(high_record)
+
+        sample: Dict[str, Any] = {"low": low_tensor, "high": high_tensor}
+        if low_meta:
+            sample["low_meta"] = low_meta
+        if high_meta:
+            sample["high_meta"] = high_meta
+        return sample

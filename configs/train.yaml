@@ -1,0 +1,71 @@
+# Minimal training configuration for the PixNerf upscaler.
+project: pixnerf-upscale
+save_root_dir: ./runs
+ds_path: ./datasets/test_dataset
+
+dataset:
+  high_resolution: 1024
+  model_resolution: 512
+  num_workers: 24
+
+optimizer:
+  batch_size: 16
+  base_learning_rate: 0.0001
+  min_learning_rate: 0.00001
+  num_epochs: 250
+  optimizer_type: adamw
+  beta2: 0.99
+  eps: 1.0e-08
+  clip_grad_norm: 1.0
+  use_decay: false
+  weight_decay: 0.0
+  warmup_percent: 0.01
+  gradient_accumulation_steps: 1
+  scheduler: cosine
+  cosine_min_ratio: 0.1
+
+model:
+  hf_repo: stabilityai/sd-vae-ft-ema
+  mixed_precision: bf16
+  vae_kind: kl
+  kl_ratio: 0.0
+  use_torch_compile: false
+
+loss:
+  enabled:
+    mse: true
+  ratios:
+    mse: 1.0
+  median_coeff_steps: 128
+
+logging:
+  use_wandb: true
+  wandb_run_name: pixnerf-upscale
+  sample_interval_share: 1000
+  global_sample_interval: 100
+  global_save_interval: 500
+  save_model: true
+  save_barrier: 1.003
+  log_grad_norm: true
+
+latent_upscaler:
+  enabled: true
+  # num_attention_heads: 4
+  patch_size: 4
+  hidden_dim_multiplier: 448
+  nerf_blocks: 224
+
+embeddings:
+  enabled: true
+  cache_dir: ./cache_vae_embeddings/sd_vae
+  dtype: float16
+  variants_per_sample: 1
+  overwrite: false
+  num_workers: 4
+  store_distribution: true
+
+ema:
+  enabled: false
+  decay: 0.999
+  update_after_step: 100
+  update_interval: 1

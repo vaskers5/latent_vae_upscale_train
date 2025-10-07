@@ -9,7 +9,7 @@ from training.config_loader import load_config
 from training.trainer import run as run_training
 
 BASE_DIR = Path(__file__).resolve().parent
-DEFAULT_CONFIG = BASE_DIR / "configs" / "vae_2x_1024ch" / "train_config.yaml"
+DEFAULT_CONFIG = BASE_DIR / "configs" / "train.yaml"
 
 
 def _parse_value(raw: str) -> Any:

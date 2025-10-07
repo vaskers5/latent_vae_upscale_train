@@ -7,45 +7,118 @@ from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch import nn
 
-__all__ = ["LatentUpscaler", "MedianLossNormalizer", "FocalFrequencyLoss"]
+__all__ = ["PixNerfUpscaler", "MedianLossNormalizer", "FocalFrequencyLoss"]
 
 
-class LatentUpscaler(nn.Module):
-    def __init__(self, channels: int, scale_factor: int, hidden_multiplier: int) -> None:
+class NerfHead(nn.Module):
+    def __init__(self, channels: int, hidden_dim: int) -> None:
         super().__init__()
-        if scale_factor < 2:
-            raise ValueError("Latent upscaler requires scale_factor >= 2")
-        hidden_channels = max(channels * hidden_multiplier, channels)
-        self.scale_factor = scale_factor
-        self.net = nn.Sequential(
-            nn.Conv2d(channels, hidden_channels, kernel_size=3, padding=1),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(hidden_channels, channels * (scale_factor**2), kernel_size=3, padding=1),
-            nn.SiLU(inplace=True),
-            nn.PixelShuffle(scale_factor),
-            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+        self.channels = channels
+        self.norm = nn.LayerNorm(channels)
+        self.weight_net = nn.Sequential(
+            nn.Linear(channels, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, channels * channels),
         )
-        self.act = nn.SiLU(inplace=True)
+        self.bias_net = nn.Sequential(
+            nn.Linear(channels, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, channels),
+        )
 
-    def forward(self, latents: torch.Tensor) -> torch.Tensor:
-        if latents.dim() == 5:  # video VAE (B, C, T, H, W)
-            b, c, t, h, w = latents.shape
-            latents_2d = latents.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
-            upsampled = self._forward_2d(latents_2d)
-            _, c2, h2, w2 = upsampled.shape
-            upsampled = upsampled.reshape(b, t, c2, h2, w2).permute(0, 2, 1, 3, 4)
-            return upsampled
-        if latents.dim() != 4:
-            raise ValueError(f"Expected 4D or 5D latents, got shape {latents.shape}")
-        return self._forward_2d(latents)
+    def forward(self, positions: torch.Tensor, patches: torch.Tensor) -> torch.Tensor:
+        if positions.shape != patches.shape:
+            raise ValueError(f"positions shape {positions.shape} must match patches shape {patches.shape}.")
+        residual = patches
+        normed = self.norm(patches)
+        normed = normed.transpose(1, 2)
+        summary = positions.mean(dim=1)
+        weights = self.weight_net(summary).view(-1, self.channels, self.channels)
+        bias = self.bias_net(summary).unsqueeze(-1)
+        transformed = torch.bmm(weights, normed) + bias
+        transformed = transformed.transpose(1, 2)
+        return transformed + residual
 
-    def _forward_2d(self, latents: torch.Tensor) -> torch.Tensor:
-        residual = F.interpolate(latents, scale_factor=self.scale_factor, mode="nearest")
-        out = self.net(latents)
-        return self.act(out + residual.to(out.dtype))
+
+class PixNerfUpscaler(nn.Module):
+    def __init__(
+        self,
+        channels: int,
+        patch_size: int = 4,
+        hidden_dim_multiplier: int = 4,
+        nerf_blocks: int = 2,
+    ) -> None:
+        super().__init__()
+        if patch_size <= 0:
+            raise ValueError("patch_size must be positive.")
+        self.channels = channels
+        self.patch_size = patch_size
+        hidden_dim = max(channels * hidden_dim_multiplier, channels)
+        self.pixel_positions = nn.Parameter(torch.randn(1, patch_size * patch_size, channels))
+        self.patch_position_encoder = nn.Sequential(
+            nn.Linear(2, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, channels),
+        )
+        self.nerf = nn.ModuleList(
+            [NerfHead(channels=channels, hidden_dim=hidden_dim) for _ in range(max(1, nerf_blocks))]
+        )
+        self.out_conv = nn.Conv2d(channels, channels * 4, kernel_size=1)
+        self.pixel_shuffle = nn.PixelShuffle(2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() != 4:
+            raise ValueError(f"PixNerfUpscaler expects 4D latents, got shape {x.shape}.")
+        b, c, h, w = x.shape
+        if c != self.channels:
+            raise ValueError(f"Expected {self.channels} channels, received {c}.")
+        ps = self.patch_size
+        if h % ps != 0 or w % ps != 0:
+            raise ValueError(f"Image dimensions ({h}, {w}) must be divisible by patch size {ps}.")
+
+        patch_h = h // ps
+        patch_w = w // ps
+
+        patches = x.unfold(2, ps, ps).unfold(3, ps, ps)
+        patches = patches.permute(0, 2, 3, 4, 5, 1).contiguous()
+        patches = patches.view(b, patch_h * patch_w, ps * ps, c)
+        patches = patches.view(b * patch_h * patch_w, ps * ps, c)
+
+        device = x.device
+        dtype = x.dtype
+        coords_y = torch.arange(patch_h, device=device, dtype=dtype)
+        coords_x = torch.arange(patch_w, device=device, dtype=dtype)
+        grid_y, grid_x = torch.meshgrid(coords_y, coords_x, indexing="ij")
+        coords = torch.stack([grid_y, grid_x], dim=-1).view(-1, 2)
+        if patch_h > 1:
+            coords[:, 0] /= patch_h - 1
+        else:
+            coords[:, 0] = 0
+        if patch_w > 1:
+            coords[:, 1] /= patch_w - 1
+        else:
+            coords[:, 1] = 0
+        coords = coords.unsqueeze(0).repeat(b, 1, 1).view(-1, 2)
+        patch_pos = self.patch_position_encoder(coords)
+
+        pixel_pos = self.pixel_positions.expand(patches.size(0), -1, -1).to(dtype=dtype, device=device)
+        positions = pixel_pos + patch_pos.unsqueeze(1)
+        patches = patches.to(dtype)
+
+        processed = patches
+        for block in self.nerf:
+            processed = block(positions, processed)
+
+        processed = processed.view(b, patch_h, patch_w, ps * ps, c)
+        processed = processed.view(b, patch_h, patch_w, ps, ps, c)
+        processed = processed.permute(0, 5, 1, 3, 2, 4).contiguous()
+        merged = processed.view(b, c, h, w)
+
+        out = self.out_conv(merged)
+        out = self.pixel_shuffle(out)
+        return out
 
 
 class MedianLossNormalizer:

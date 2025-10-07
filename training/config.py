@@ -20,7 +20,7 @@ __all__ = [
     "ModelConfig",
     "LossConfig",
     "LoggingConfig",
-    "LatentUpscalerConfig",
+    "PixNerfUpscalerConfig",
     "EmbeddingsConfig",
     "TrainingConfig",
 ]
@@ -378,19 +378,25 @@ class LoggingConfig:
 
 
 @dataclass
-class LatentUpscalerConfig:
+class PixNerfUpscalerConfig:
     enabled: bool
-    width_multiplier: int
-    scale_factor: Optional[int]
+    patch_size: int
+    hidden_dim_multiplier: int
+    nerf_blocks: int
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "LatentUpscalerConfig":
+    def from_dict(cls, data: Dict[str, Any]) -> "PixNerfUpscalerConfig":
         section = data.get("latent_upscaler", {})
-        scale = section.get("scale_factor")
         return cls(
-            enabled=bool(section.get("enabled", data.get("train_latent_upscaler", False))),
-            width_multiplier=int(section.get("width_multiplier", data.get("latent_upscaler_width", 2))),
-            scale_factor=int(scale) if scale is not None else None,
+            enabled=_resolve_bool(section.get("enabled", data.get("train_latent_upscaler", True)), default=True),
+            patch_size=int(section.get("patch_size", data.get("latent_upscaler_patch_size", 4))),
+            hidden_dim_multiplier=int(
+                section.get(
+                    "hidden_dim_multiplier",
+                    section.get("width_multiplier", data.get("latent_upscaler_width", 4)),
+                )
+            ),
+            nerf_blocks=int(section.get("nerf_blocks", data.get("latent_upscaler_nerf_blocks", 2))),
         )
 
 
@@ -442,7 +448,7 @@ class TrainingConfig:
     model: ModelConfig
     losses: LossConfig
     logging: LoggingConfig
-    latent_upscaler: LatentUpscalerConfig
+    latent_upscaler: PixNerfUpscalerConfig
     embeddings: EmbeddingsConfig
     ema: EMAConfig
     seed: int
@@ -455,7 +461,7 @@ class TrainingConfig:
         model = ModelConfig.from_dict(data, project=paths.project)
         losses = LossConfig.from_dict(data, dataset.model_resolution, model.kl_ratio)
         logging = LoggingConfig.from_dict(data, timestamp=paths.timestamp)
-        latent_upscaler = LatentUpscalerConfig.from_dict(data)
+        latent_upscaler = PixNerfUpscalerConfig.from_dict(data)
         embeddings = EmbeddingsConfig.from_dict(data, dataset_root=paths.dataset_root)
         ema = EMAConfig.from_dict(data)
         seed = int(data.get("seed", int(datetime.now().strftime("%Y%m%d"))))
