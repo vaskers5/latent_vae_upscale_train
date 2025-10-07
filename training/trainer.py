@@ -253,7 +253,14 @@ class VAETrainer:
         self.sample_logger: Optional[SampleLogger] = None
         if self.wandb_logger.start(config=_flatten_config(self.cfg), model=self.model, metadata=metadata):
             try:
-                self.sample_logger = SampleLogger(self.cfg, dataset=self.datasets[0], wandb_logger=self.wandb_logger)
+                dataset_map = {name: dataset for name, dataset in zip(self.vae_names, self.datasets)}
+                primary_dataset = self.datasets[0] if self.datasets else None
+                self.sample_logger = SampleLogger(
+                    self.cfg,
+                    dataset=primary_dataset,
+                    datasets=dataset_map,
+                    wandb_logger=self.wandb_logger,
+                )
                 self.sample_logger.maybe_log_samples(model=self.model, step=0, device=self.device)
                 self.logger.info(
                     "Sample logger initialised | interval=%d | samples=%d",

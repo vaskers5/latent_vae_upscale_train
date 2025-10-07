@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import torch
 
@@ -17,6 +17,7 @@ __all__ = [
     "DatasetConfig",
     "OptimizerConfig",
     "EMAConfig",
+    "SampleVaeConfig",
     "ModelConfig",
     "LossConfig",
     "LoggingConfig",
@@ -194,6 +195,76 @@ class EMAConfig:
 
 
 @dataclass
+class SampleVaeConfig:
+    load_from: Optional[str]
+    hf_repo: Optional[str]
+    hf_subfolder: Optional[str]
+    hf_revision: Optional[str]
+    hf_auth_token: Optional[str]
+    vae_kind: Optional[str]
+    weights_dtype: Optional[torch.dtype]
+
+    @staticmethod
+    def _clean_string(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any], defaults: Dict[str, Any]) -> "SampleVaeConfig":
+        load_from_raw = data.get("load_from")
+        load_from = cls._clean_string(load_from_raw) or cls._clean_string(defaults.get("load_from"))
+
+        hf_repo = cls._clean_string(data.get("hf_repo")) or cls._clean_string(defaults.get("hf_repo"))
+        hf_subfolder = cls._clean_string(data.get("hf_subfolder")) or cls._clean_string(defaults.get("hf_subfolder"))
+        hf_revision = cls._clean_string(data.get("hf_revision")) or cls._clean_string(defaults.get("hf_revision"))
+        hf_auth_token = cls._clean_string(data.get("hf_auth_token")) or cls._clean_string(defaults.get("hf_auth_token"))
+
+        vae_kind_raw = cls._clean_string(data.get("vae_kind"))
+        if vae_kind_raw is None:
+            vae_kind_raw = cls._clean_string(defaults.get("vae_kind"))
+        vae_kind = vae_kind_raw.lower() if vae_kind_raw else None
+
+        weights_dtype_raw = data.get("weights_dtype")
+        if weights_dtype_raw is not None:
+            weights_dtype = _resolve_dtype(weights_dtype_raw)
+        else:
+            weights_dtype = defaults.get("weights_dtype")
+            if weights_dtype is not None and not isinstance(weights_dtype, torch.dtype):
+                weights_dtype = _resolve_dtype(weights_dtype)
+
+        return cls(
+            load_from=load_from,
+            hf_repo=hf_repo,
+            hf_subfolder=hf_subfolder,
+            hf_revision=hf_revision,
+            hf_auth_token=hf_auth_token,
+            vae_kind=vae_kind,
+            weights_dtype=weights_dtype,
+        )
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any]) -> "SampleVaeConfig":
+        def _maybe_dtype(value: Any) -> Optional[torch.dtype]:
+            if value is None:
+                return None
+            if isinstance(value, torch.dtype):
+                return value
+            return _resolve_dtype(value)
+
+        return cls(
+            load_from=cls._clean_string(data.get("load_from")),
+            hf_repo=cls._clean_string(data.get("hf_repo")),
+            hf_subfolder=cls._clean_string(data.get("hf_subfolder")),
+            hf_revision=cls._clean_string(data.get("hf_revision")),
+            hf_auth_token=cls._clean_string(data.get("hf_auth_token")),
+            vae_kind=cls._clean_string(data.get("vae_kind")),
+            weights_dtype=_maybe_dtype(data.get("weights_dtype")),
+        )
+
+
+@dataclass
 class ModelConfig:
     load_from: Optional[str]
     hf_repo: Optional[str]
@@ -210,6 +281,7 @@ class ModelConfig:
     torch_compile_backend: Optional[str]
     torch_compile_mode: Optional[str]
     torch_compile_fullgraph: Optional[bool]
+    sample_vaes: Dict[str, SampleVaeConfig]
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any], project: str) -> "ModelConfig":
@@ -228,22 +300,43 @@ class ModelConfig:
             compile_fullgraph = _resolve_bool(compile_fullgraph, default=False)
         elif compile_fullgraph is not None:
             compile_fullgraph = bool(compile_fullgraph)
+
+        base_weights_dtype = _resolve_dtype(section.get("weights_dtype", data.get("weights_dtype", "float32")))
+        base_vae_kind = str(section.get("vae_kind", data.get("vae_kind", "kl"))).strip().lower()
+
+        sample_vaes_raw = section.get("sample_vaes") or data.get("sample_vaes")
+        sample_vaes: Dict[str, SampleVaeConfig] = {}
+        if isinstance(sample_vaes_raw, dict):
+            defaults_map = {
+                "load_from": load_from,
+                "hf_repo": section.get("hf_repo") or data.get("hf_repo"),
+                "hf_subfolder": section.get("hf_subfolder") or data.get("hf_subfolder"),
+                "hf_revision": section.get("hf_revision") or data.get("hf_revision"),
+                "hf_auth_token": section.get("hf_auth_token") or data.get("hf_auth_token"),
+                "vae_kind": base_vae_kind,
+                "weights_dtype": base_weights_dtype,
+            }
+            for key, value in sample_vaes_raw.items():
+                if isinstance(value, dict):
+                    sample_vaes[key] = SampleVaeConfig.from_dict(value, defaults=defaults_map)
+
         return cls(
             load_from=load_from,
             hf_repo=section.get("hf_repo") or data.get("hf_repo"),
             hf_subfolder=section.get("hf_subfolder") or data.get("hf_subfolder"),
             hf_revision=section.get("hf_revision") or data.get("hf_revision"),
             hf_auth_token=section.get("hf_auth_token") or data.get("hf_auth_token"),
-            weights_dtype=_resolve_dtype(section.get("weights_dtype", data.get("weights_dtype", "float32"))),
+            weights_dtype=base_weights_dtype,
             mixed_precision=str(section.get("mixed_precision", data.get("mixed_precision", "no"))).strip().lower(),
             train_decoder_only=_resolve_bool(section.get("train_decoder_only", data.get("train_decoder_only", True))),
             full_training=_resolve_bool(section.get("full_training", data.get("full_training", False))),
-            vae_kind=str(section.get("vae_kind", data.get("vae_kind", "kl"))),
+            vae_kind=base_vae_kind,
             kl_ratio=float(section.get("kl_ratio", data.get("kl_ratio", 0.0))),
             use_torch_compile=_resolve_bool(section.get("use_torch_compile", data.get("use_torch_compile", True))),
             torch_compile_backend=section.get("torch_compile_backend") or data.get("torch_compile_backend"),
             torch_compile_mode=section.get("torch_compile_mode") or data.get("torch_compile_mode"),
             torch_compile_fullgraph=compile_fullgraph,
+            sample_vaes=sample_vaes,
         )
 
 
