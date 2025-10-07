@@ -97,6 +97,7 @@ class MultiPrecomputeDefaults:
     store_distribution: bool = True
     embeddings_dtype: torch.dtype = torch.float16
     device: Optional[str] = None
+    devices: Optional[List[str]] = None
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "MultiPrecomputeDefaults":
@@ -109,6 +110,23 @@ class MultiPrecomputeDefaults:
         store_distribution = data.get("store_distribution")
         dtype_value = data.get("embeddings_dtype")
         device = data.get("device")
+        devices_raw = data.get("devices")
+
+        devices: Optional[List[str]]
+        if devices_raw is None:
+            devices = None
+        elif isinstance(devices_raw, str):
+            items = [part.strip() for part in devices_raw.split(",")]
+            devices = [item for item in items if item]
+        elif isinstance(devices_raw, (list, tuple, set)):
+            cleaned: List[str] = []
+            for entry in devices_raw:
+                text = str(entry).strip()
+                if text:
+                    cleaned.append(text)
+            devices = cleaned or None
+        else:
+            raise TypeError("defaults.devices must be a string, list, or tuple of device names")
 
         return cls(
             cache_subdir=cache_subdir,
@@ -120,6 +138,7 @@ class MultiPrecomputeDefaults:
             store_distribution=_resolve_bool(store_distribution, default=True),
             embeddings_dtype=_resolve_dtype(dtype_value or "float16"),
             device=str(device) if device else None,
+            devices=devices,
         )
 
 

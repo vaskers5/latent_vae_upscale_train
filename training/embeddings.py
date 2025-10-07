@@ -6,7 +6,7 @@ import hashlib
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
 
 import torch
 import torch.nn as nn
@@ -75,7 +75,7 @@ class EmbeddingCache:
             return image_path.resolve().relative_to(self.dataset_root)
         except ValueError:
             # Fallback for datasets outside the configured root – hash the absolute path.
-            digest = hashlib.sha256(str(image_path.resolve()).encode("utf-8")).hexdigest()[:16]
+            digest = hashlib.sha256(str(image_path).encode("utf-8")).hexdigest()[:16]
             safe_name = image_path.stem + f"_{digest}"
             return Path("__external__") / safe_name
 
@@ -183,6 +183,9 @@ class EmbeddingCache:
         encode_dtype: torch.dtype,
         seed: int,
         accelerator: Optional["Accelerator"] = None,
+        progress_position: Optional[int] = None,
+        progress_desc: Optional[str] = None,
+        log: Optional[Callable[[str], None]] = None,
     ) -> None:
         if not self.cfg.enabled:
             return
@@ -199,14 +202,16 @@ class EmbeddingCache:
 
         if not missing:
             if main_process:
-                print("[Embeddings] Cache already populated")
+                (log or print)("[Embeddings] Cache already populated")
             return
 
         if not main_process:
             # A different process is responsible for generating the cache – return and wait for sync.
             return
 
-        print(f"[Embeddings] Populating cache for {len(missing)} variants ...")
+        display_desc = progress_desc or "Precomputing latents"
+        logger = log or print
+        logger(f"[Embeddings] Populating cache for {len(missing)} variants ...")
 
         vae_prev_mode = vae.training
         vae = vae.to(device)
@@ -231,7 +236,14 @@ class EmbeddingCache:
         if main_process:
             from tqdm.auto import tqdm  # local import to avoid global dependency
 
-            progress = tqdm(total=len(missing), desc="Precomputing latents", unit="img")
+            progress = tqdm(
+                total=len(missing),
+                desc=display_desc,
+                unit="img",
+                position=progress_position,
+                leave=progress_position is None,
+                dynamic_ncols=True,
+            )
 
         with torch.no_grad():
             for batch in loader:
