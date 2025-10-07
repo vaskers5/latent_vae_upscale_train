@@ -59,8 +59,8 @@ embeddings:
   enabled: true
   cache_dir: ./cache_vae_embeddings
   vae_names:
-    - sd_vae
-    - sd_vae_midjourneyv6
+    - flux_vae
+    - sd3_vae_anime_ft
   dtype: float16
   variants_per_sample: 1
   overwrite: false
