@@ -19,7 +19,7 @@ defaults:
   resize_long_side: 0
   limit: 0
   store_distribution: true
-  device: cuda
+  device: cuda:0
 
 # Define the list (or mapping) of VAE backends to precompute.
 models:
@@ -40,8 +40,8 @@ models:
     resolutions_with_batchsize:
       - [128, 512]
       - [256, 224]
-      - [512, 100]
-      - [1024, 32]
+      - [512, 32]
+      - [1024, 8]
 
   TAESDXL:
     hf_repo: madebyollin/TAESDXL
@@ -52,5 +52,5 @@ models:
     resolutions_with_batchsize:
       - [128, 512]
       - [256, 224]
-      - [512, 100]
-      - [1024, 32]
+      - [512, 64]
+      - [1024, 12]

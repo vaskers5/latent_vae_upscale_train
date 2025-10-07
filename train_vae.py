@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 from training.config_loader import load_config
-from training.train_core import run as run_training
+from training.trainer import run as run_training
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG = BASE_DIR / "configs" / "vae_2x_1024ch" / "train_config.yaml"
