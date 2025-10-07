@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import glob
 import os
 import random
 from pathlib import Path
@@ -15,7 +16,7 @@ from torch.utils.data import Dataset
 
 from .embeddings import EmbeddingCache, TransformParams
 
-__all__ = ["ImageFolderDataset"]
+__all__ = ["ImageFolderDataset", "UpscaleDataset"]
 
 
 class ImageFolderDataset(Dataset):
@@ -155,3 +156,29 @@ class ImageFolderDataset(Dataset):
             centering=(0.5, 0.5),
         )
         return img, TransformParams(flip=False, crop_x=0, crop_y=0)
+
+
+class UpscaleDataset(Dataset):
+    """Dataset that loads precomputed low/high resolution tensor pairs."""
+
+    def __init__(self, cache_dir: str, low_res: int, high_res: int) -> None:
+        self.pairs = []
+        low_res_files = glob.glob(
+            f"{cache_dir}/**/{low_res}px/*.pt", recursive=True
+        )
+
+        for low_path in low_res_files:
+            high_path = low_path.replace(
+                f"{os.sep}{low_res}px{os.sep}", f"{os.sep}{high_res}px{os.sep}"
+            )
+            if os.path.exists(high_path):
+                self.pairs.append((low_path, high_path))
+
+    def __len__(self) -> int:
+        return len(self.pairs)
+
+    def __getitem__(self, idx: int):
+        low_path, high_path = self.pairs[idx]
+        low_tensor = torch.load(low_path)
+        high_tensor = torch.load(high_path)
+        return {"low": low_tensor, "high": high_tensor}
