@@ -9,7 +9,7 @@ dataset:
   num_workers: 24
 
 optimizer:
-  batch_size: 256
+  batch_size: 512
   base_learning_rate: 0.005
   min_learning_rate: 0.0001
   num_epochs: 250
@@ -42,7 +42,7 @@ logging:
   use_wandb: true
   wandb_run_name: pixnerf-upscale
   sample_interval_share: 1000
-  global_sample_interval: 250
+  global_sample_interval: 1000
   global_save_interval: 500
   save_model: true
   save_barrier: 1.003

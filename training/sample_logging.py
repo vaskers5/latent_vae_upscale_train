@@ -55,6 +55,19 @@ def _to_pil_uint8(tensor: torch.Tensor) -> Image.Image:
     return Image.fromarray(image.permute(1, 2, 0).numpy())
 
 
+def _concat_side_by_side(left: Image.Image, right: Image.Image) -> Image.Image:
+    """Concatenate two images with matching heights horizontally."""
+
+    if left.mode != right.mode:
+        right = right.convert(left.mode)
+    if left.height != right.height:
+        raise ValueError("Images must share the same height to concatenate.")
+    combined = Image.new(left.mode, (left.width + right.width, left.height))
+    combined.paste(left, (0, 0))
+    combined.paste(right, (left.width, 0))
+    return combined
+
+
 def _is_video_vae(module: torch.nn.Module) -> bool:
     encoder = getattr(module, "encoder", None)
     conv_in = getattr(encoder, "conv_in", None) if encoder is not None else None
@@ -76,11 +89,9 @@ class GroupLogResult:
     slug: str
     real_cpu: torch.Tensor
     decoded_cpu: torch.Tensor
-    real_paths: List[Path]
-    decoded_paths: List[Path]
+    pair_paths: List[Path]
     lpips_scores: List[float]
-    primary_decoded_paths: Optional[List[Path]] = None
-    primary_real_paths: Optional[List[Path]] = None
+    primary_pair_paths: Optional[List[Path]] = None
 
 
 class SampleLogger:
@@ -403,36 +414,31 @@ class SampleLogger:
                     group_dir = self.generated_folder / group.slug
                     group_dir.mkdir(parents=True, exist_ok=True)
 
-                    real_paths: List[Path] = []
-                    decoded_paths: List[Path] = []
-                    primary_real_paths: List[Path] = []
-                    primary_decoded_paths: List[Path] = []
+                    pair_paths: List[Path] = []
+                    primary_pair_paths: List[Path] = []
 
                     for sample_idx in range(decoded_cpu.shape[0]):
                         real_image = _to_pil_uint8(real_cpu[sample_idx])
                         decoded_image = _to_pil_uint8(decoded_cpu[sample_idx])
+                        pair_image = _concat_side_by_side(real_image, decoded_image)
 
-                        real_path = group_dir / f"real_{sample_idx}.jpg"
-                        decoded_path = group_dir / f"decoded_{sample_idx}.jpg"
-                        real_image.save(real_path, quality=95)
-                        decoded_image.save(decoded_path, quality=95)
+                        pair_path = group_dir / f"pair_{sample_idx}.jpg"
+                        pair_image.save(pair_path, quality=95)
 
-                        real_paths.append(real_path)
-                        decoded_paths.append(decoded_path)
+                        pair_paths.append(pair_path)
 
                         if idx == 0:
-                            base_real = self.generated_folder / f"real_{sample_idx}.jpg"
-                            base_decoded = self.generated_folder / f"decoded_{sample_idx}.jpg"
-                            real_image.save(base_real, quality=95)
-                            decoded_image.save(base_decoded, quality=95)
-                            primary_real_paths.append(base_real)
-                            primary_decoded_paths.append(base_decoded)
+                            base_pair = self.generated_folder / f"pair_{sample_idx}.jpg"
+                            pair_image.save(base_pair, quality=95)
+                            primary_pair_paths.append(base_pair)
 
                     if idx == 0:
                         first_real = _to_pil_uint8(real_cpu[0])
                         first_decoded = _to_pil_uint8(decoded_cpu[0])
-                        first_real.save(self.generated_folder / "sample_real.jpg", quality=95)
-                        first_decoded.save(self.generated_folder / "sample_decoded.jpg", quality=95)
+                        _concat_side_by_side(first_real, first_decoded).save(
+                            self.generated_folder / "sample_pair.jpg",
+                            quality=95,
+                        )
 
                     results.append(
                         GroupLogResult(
@@ -440,11 +446,9 @@ class SampleLogger:
                             slug=group.slug,
                             real_cpu=real_cpu,
                             decoded_cpu=decoded_cpu,
-                            real_paths=real_paths,
-                            decoded_paths=decoded_paths,
+                            pair_paths=pair_paths,
                             lpips_scores=lpips_scores,
-                            primary_decoded_paths=primary_decoded_paths if idx == 0 else None,
-                            primary_real_paths=primary_real_paths if idx == 0 else None,
+                            primary_pair_paths=primary_pair_paths if idx == 0 else None,
                         )
                     )
         finally:
@@ -455,8 +459,8 @@ class SampleLogger:
             return
 
         rows = len(results)
-        cols = self.sample_count * 2
-        fig, axes = plt.subplots(rows, cols, figsize=(cols * 1.8, rows * 2.5))
+        cols = self.sample_count
+        fig, axes = plt.subplots(rows, cols, figsize=(cols * 3.6, rows * 2.5))
 
         def _ensure_axes_array(ax):
             if rows == 1 and cols == 1:
@@ -471,18 +475,17 @@ class SampleLogger:
 
         for row_idx, result in enumerate(results):
             for sample_idx in range(self.sample_count):
-                real_axis = axes[row_idx, sample_idx * 2]
-                decoded_axis = axes[row_idx, sample_idx * 2 + 1]
+                pair_axis = axes[row_idx, sample_idx]
+                pair_image = _concat_side_by_side(
+                    _to_pil_uint8(result.real_cpu[sample_idx]),
+                    _to_pil_uint8(result.decoded_cpu[sample_idx]),
+                )
 
-                real_axis.imshow(_to_pil_uint8(result.real_cpu[sample_idx]))
-                decoded_axis.imshow(_to_pil_uint8(result.decoded_cpu[sample_idx]))
-
-                real_axis.axis("off")
-                decoded_axis.axis("off")
+                pair_axis.imshow(pair_image)
+                pair_axis.axis("off")
 
                 if row_idx == 0:
-                    real_axis.set_title(f"Real {sample_idx}")
-                    decoded_axis.set_title(f"Decoded {sample_idx}")
+                    pair_axis.set_title(f"Real vs Decoded {sample_idx}")
 
             axes[row_idx, 0].set_ylabel(result.name, rotation=90, fontsize=10, labelpad=8)
 
@@ -505,6 +508,32 @@ class SampleLogger:
         for result in results:
             if result.lpips_scores:
                 log_payload[f"samples/lpips_mean/{result.slug}"] = float(np.mean(result.lpips_scores))
+            for index, pair_path in enumerate(result.pair_paths):
+                log_payload[f"samples/{result.slug}/pair_{index}"] = wandb.Image(str(pair_path))
+            if result.primary_pair_paths:
+                for index, pair_path in enumerate(result.primary_pair_paths):
+                    log_payload[f"samples/pair_{index}"] = wandb.Image(str(pair_path))
+
+        if self._wandb is not None and self._wandb.is_active:
+            self._wandb.log(log_payload, step=step)
+        plt.close(fig)
+
+        overall_scores = [score for result in results for score in result.lpips_scores]
+        overall_avg = float(np.mean(overall_scores)) if overall_scores else 0.0
+
+        log_payload: Dict[str, Any] = {
+            "samples/lpips_mean": overall_avg,
+            "samples/pairs": wandb.Image(
+                str(pairs_path),
+                caption=f"{rows} VAEs × {self.sample_count} samples (real + decoded)",
+            ),
+        }
+
+        for result in results:
+            if result.lpips_scores:
+                log_payload[f"samples/lpips_mean/{result.slug}"] = float(np.mean(result.lpips_scores))
+            for index, pair_path in enumerate(result.pair_paths):
+                log_payload[f"samples/{result.slug}/pair_{index}"] = wandb.Image(str(pair_path))
             for index, real_path in enumerate(result.real_paths):
                 log_payload[f"samples/{result.slug}/real_{index}"] = wandb.Image(str(real_path))
             for index, decoded_path in enumerate(result.decoded_paths):
@@ -515,6 +544,9 @@ class SampleLogger:
             if result.primary_decoded_paths:
                 for index, decoded_path in enumerate(result.primary_decoded_paths):
                     log_payload[f"samples/decoded_{index}"] = wandb.Image(str(decoded_path))
+            if result.primary_pair_paths:
+                for index, pair_path in enumerate(result.primary_pair_paths):
+                    log_payload[f"samples/pair_{index}"] = wandb.Image(str(pair_path))
 
         if self._wandb is not None and self._wandb.is_active:
             self._wandb.log(log_payload, step=step)
