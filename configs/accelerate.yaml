@@ -1,0 +1,12 @@
+# Minimal Accelerate launcher configuration.
+compute_environment: LOCAL_MACHINE
+distributed_type: NO
+num_machines: 1
+num_processes: 1
+machine_rank: 0
+mixed_precision: bf16
+downcast_bf16: 'no'
+same_network: true
+main_training_function: main
+use_cpu: false
+gpu_ids: "0"
