@@ -89,7 +89,6 @@ class ResolutionSpec:
 @dataclass
 class MultiPrecomputeDefaults:
     cache_subdir: str = "cache_embeddings"
-    variants_per_sample: int = 1
     batch_size: int = 16
     num_workers: int = 4
     resize_long_side: Optional[int] = None
@@ -103,7 +102,6 @@ class MultiPrecomputeDefaults:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "MultiPrecomputeDefaults":
         cache_subdir = str(data.get("cache_subdir", "cache_embeddings"))
-        variants = int(data.get("variants_per_sample", 1))
         batch = int(data.get("batch_size", 16))
         workers = int(data.get("num_workers", 4))
         resize = data.get("resize_long_side")
@@ -139,7 +137,6 @@ class MultiPrecomputeDefaults:
 
         return cls(
             cache_subdir=cache_subdir,
-            variants_per_sample=max(1, variants),
             batch_size=max(1, batch),
             num_workers=max(0, workers),
             resize_long_side=int(resize) if resize is not None else None,
@@ -167,7 +164,6 @@ class MultiVaeConfig:
     dataset_root: Optional[Path]
     dataset_subdir: Optional[Path]
     cache_subdir: Optional[Path]
-    variants_per_sample: Optional[int]
     batch_size: Optional[int]
     num_workers: Optional[int]
     resize_long_side: Optional[int]
@@ -198,7 +194,6 @@ class MultiVaeConfig:
         cache_subdir = data.get("cache_subdir")
         weights_dtype = data.get("weights_dtype")
         embeddings_dtype = data.get("embeddings_dtype")
-        variants = data.get("variants_per_sample")
         batch = data.get("batch_size")
         workers = data.get("num_workers")
         resize = data.get("resize_long_side")
@@ -227,7 +222,6 @@ class MultiVaeConfig:
             dataset_root=Path(dataset_root).expanduser() if dataset_root else None,
             dataset_subdir=Path(dataset_subdir).expanduser() if dataset_subdir else None,
             cache_subdir=Path(cache_subdir).expanduser() if cache_subdir else None,
-            variants_per_sample=int(variants) if variants is not None else None,
             batch_size=int(batch) if batch is not None else None,
             num_workers=int(workers) if workers is not None else None,
             resize_long_side=int(resize) if resize is not None else None,
@@ -250,7 +244,6 @@ class MultiPrecomputeTask:
     model_resolution: int
     resize_long_side: int
     limit: int
-    variants_per_sample: int
     batch_size: int
     num_workers: int
     store_distribution: bool
@@ -306,7 +299,6 @@ class MultiPrecomputeConfig:
         *,
         dataset_root_override: Optional[Path] = None,
         cache_override: Optional[Path] = None,
-        variants_override: Optional[int] = None,
         batch_override: Optional[int] = None,
         workers_override: Optional[int] = None,
         image_csv_override: Optional[Path] = None,
@@ -354,7 +346,6 @@ class MultiPrecomputeConfig:
                     else (cache_root / model.cache_subdir).resolve()
                 )
 
-            variants = variants_override or model.variants_per_sample or self.defaults.variants_per_sample
             base_batch = batch_override or model.batch_size or self.defaults.batch_size
             workers = workers_override or model.num_workers or self.defaults.num_workers
             resize = model.resize_long_side if model.resize_long_side is not None else self.defaults.resize_long_side
@@ -412,7 +403,6 @@ class MultiPrecomputeConfig:
                         model_resolution=resolution.model_resolution,
                         resize_long_side=int(resize_long_side),
                         limit=int(limit) if limit is not None else 0,
-                        variants_per_sample=max(1, int(variants)),
                         batch_size=effective_batch,
                         num_workers=max(0, int(workers)),
                         store_distribution=bool(store_distribution),

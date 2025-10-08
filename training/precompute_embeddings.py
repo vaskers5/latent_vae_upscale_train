@@ -59,12 +59,6 @@ def parse_args() -> argparse.Namespace:
         help="Optional list of torch devices used to run tasks in parallel (e.g. cuda:0 cuda:1)",
     )
     parser.add_argument(
-        "--variants-per-sample",
-        type=int,
-        default=None,
-        help="Number of cached variants to generate per image",
-    )
-    parser.add_argument(
         "--batch-size",
         type=int,
         default=None,
@@ -216,25 +210,20 @@ def _ensure_cuda_context(device: torch.device) -> None:
         torch.cuda.set_device(device)
 
 
-def _ensure_expected_counts(cache: EmbeddingCache, image_paths: Iterable[Path], expected_variants: int) -> None:
+def _ensure_expected_counts(cache: EmbeddingCache, image_paths: Iterable[Path]) -> None:
     paths = list(image_paths)
-    missing: List[Path] = []
-    for path in paths:
-        variants = cache.available_variants(path)
-        if len(variants) != expected_variants:
-            missing.append(path)
+    missing = [path for path in paths if not cache.has_variant(path, 0)]
 
     if missing:
         raise RuntimeError(
-            f"Embedding cache is incomplete. Expected {expected_variants} variant(s) per image but "
+            f"Embedding cache is incomplete. Expected one embedding per image but "
             f"{len(missing)} file(s) are missing."
         )
 
-    expected_total = len(paths) * expected_variants
-    produced = sum(len(cache.available_variants(path)) for path in paths)
-    if produced != expected_total:
+    produced = sum(1 for path in paths if cache.has_variant(path, 0))
+    if produced != len(paths):
         raise RuntimeError(
-            f"Embedding count mismatch: expected {expected_total} cache files, found {produced}."
+            f"Embedding count mismatch: expected {len(paths)} cache files, found {produced}."
         )
 
 
@@ -274,7 +263,6 @@ def _execute_task(
         enabled=True,
         cache_dir=task.cache_dir,
         dtype=task.embeddings_dtype,
-        variants_per_sample=task.variants_per_sample,
         overwrite=overwrite,
         precompute_batch_size=task.batch_size,
         num_workers=task.num_workers,
@@ -299,7 +287,7 @@ def _execute_task(
 
     if skip_existing and not overwrite:
         try:
-            _ensure_expected_counts(cache, dataset.paths, embeddings_cfg.variants_per_sample)
+            _ensure_expected_counts(cache, dataset.paths)
         except RuntimeError:
             pass
         else:
@@ -335,7 +323,7 @@ def _execute_task(
         log=logger,
     )
 
-    _ensure_expected_counts(cache, dataset.paths, embeddings_cfg.variants_per_sample)
+    _ensure_expected_counts(cache, dataset.paths)
     elapsed = time.perf_counter() - start
 
     logger(
@@ -419,7 +407,6 @@ def _run_from_config(args: argparse.Namespace) -> None:
 
     dataset_override = args.dataset_root.expanduser() if args.dataset_root else None
     cache_override = Path(args.cache_subdir).expanduser() if args.cache_subdir else None
-    variants_override = int(args.variants_per_sample) if args.variants_per_sample is not None else None
     batch_override = int(args.batch_size) if args.batch_size is not None else None
     workers_override = int(args.num_workers) if args.num_workers is not None else None
     image_csv_override = args.image_csv.expanduser() if args.image_csv else None
@@ -428,7 +415,6 @@ def _run_from_config(args: argparse.Namespace) -> None:
     tasks = multi_cfg.generate_tasks(
         dataset_root_override=dataset_override,
         cache_override=cache_override,
-        variants_override=variants_override,
         batch_override=batch_override,
         workers_override=workers_override,
         image_csv_override=image_csv_override,

@@ -251,7 +251,6 @@ class UpscaleDataset(Dataset):
 
     def __getitem__(self, idx: int):
         low_path, high_path = self.pairs[idx]
-        print(f"[Dataset] Loading pair {idx}: low={low_path}, high={high_path}")
         low_record = torch.load(low_path, map_location="cpu")
         high_record = torch.load(high_path, map_location="cpu")
 

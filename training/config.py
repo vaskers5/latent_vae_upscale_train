@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 import torch
 
@@ -136,7 +136,7 @@ class OptimizerConfig:
     batch_size: int
     base_learning_rate: float
     min_learning_rate: float
-    num_epochs: int
+    max_train_steps: int
     optimizer_type: str
     beta2: float
     eps: float
@@ -145,15 +145,25 @@ class OptimizerConfig:
     weight_decay: float
     gradient_accumulation_steps: int
     scheduler: str
+    legacy_num_epochs: Optional[int] = None
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "OptimizerConfig":
         section = data.get("optimizer", {})
+        raw_max_steps = section.get("max_train_steps", data.get("max_train_steps"))
+        max_train_steps = int(raw_max_steps) if raw_max_steps is not None else 0
+        raw_legacy_epochs = section.get("num_epochs", data.get("num_epochs"))
+        legacy_num_epochs = int(raw_legacy_epochs) if raw_legacy_epochs is not None else None
+        if max_train_steps <= 0:
+            if legacy_num_epochs is not None and legacy_num_epochs > 0:
+                max_train_steps = legacy_num_epochs
+            else:
+                raise ValueError("optimizer.max_train_steps must be a positive integer.")
         return cls(
             batch_size=int(section.get("batch_size", data.get("batch_size", 8))),
             base_learning_rate=float(section.get("base_learning_rate", data.get("base_learning_rate", 1e-4))),
             min_learning_rate=float(section.get("min_learning_rate", data.get("min_learning_rate", 1e-5))),
-            num_epochs=int(section.get("num_epochs", data.get("num_epochs", 10))),
+            max_train_steps=max_train_steps,
             optimizer_type=str(section.get("optimizer_type", data.get("optimizer_type", "adam8bit"))),
             beta2=float(section.get("beta2", data.get("beta2", 0.99))),
             eps=float(section.get("eps", data.get("eps", 1e-6))),
@@ -164,6 +174,7 @@ class OptimizerConfig:
                 section.get("gradient_accumulation_steps", data.get("gradient_accumulation_steps", 1))
             ),
             scheduler=str(section.get("scheduler", data.get("scheduler", "cosine"))).lower(),
+            legacy_num_epochs=legacy_num_epochs,
         )
 
 
@@ -281,12 +292,19 @@ class ModelConfig:
 @dataclass
 class LossConfig:
     lpips_backbone: str
+    components: List[Dict[str, Any]]
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "LossConfig":
         section = data.get("loss", {})
         backbone = section.get("lpips_backbone", data.get("lpips_backbone", "vgg"))
-        return cls(lpips_backbone=str(backbone))
+        raw_components = section.get("components") or data.get("loss_components") or []
+        components: List[Dict[str, Any]] = []
+        if isinstance(raw_components, list):
+            for item in raw_components:
+                if isinstance(item, Mapping):
+                    components.append(dict(item))
+        return cls(lpips_backbone=str(backbone), components=components)
 
 
 @dataclass
@@ -294,6 +312,7 @@ class LoggingConfig:
     use_wandb: bool
     wandb_run_name: Optional[str]
     global_sample_interval: int
+    save_each_n_steps: int
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any], timestamp: str) -> "LoggingConfig":
@@ -301,7 +320,17 @@ class LoggingConfig:
         use_wandb = _resolve_bool(section.get("use_wandb", data.get("use_wandb", False)))
         run_name = section.get("wandb_run_name") or data.get("wandb_run_name") or timestamp
         sample_interval = int(section.get("global_sample_interval", data.get("GLOBAL_SAMPLE_INTERVAL", 500)))
-        return cls(use_wandb=use_wandb, wandb_run_name=run_name, global_sample_interval=max(1, sample_interval))
+        raw_save_steps = section.get("save_each_n_steps", data.get("save_each_n_steps", 0))
+        try:
+            save_steps = int(raw_save_steps)
+        except (TypeError, ValueError):
+            save_steps = 0
+        return cls(
+            use_wandb=use_wandb,
+            wandb_run_name=run_name,
+            global_sample_interval=max(1, sample_interval),
+            save_each_n_steps=max(0, save_steps),
+        )
 
 
 @dataclass
@@ -317,6 +346,8 @@ class LatentUpscalerConfig:
     blocks: Optional[int]
     nerf_blocks: Optional[int]
     groups: Optional[int]
+    load_from: Optional[str]
+    extra: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "LatentUpscalerConfig":
@@ -335,6 +366,8 @@ class LatentUpscalerConfig:
             blocks=_maybe_int(section.get("blocks") or section.get("nerf_blocks")),
             nerf_blocks=_maybe_int(section.get("nerf_blocks")),
             groups=_maybe_int(section.get("groups")),
+            load_from=str(section.get("load_from") or data.get("latent_upscaler_load_from") or "").strip() or None,
+            extra=dict(section),
         )
 
 
@@ -361,7 +394,6 @@ class EmbeddingsConfig:
     enabled: bool
     cache_dir: Path
     dtype: torch.dtype
-    variants_per_sample: int
     overwrite: bool
     precompute_batch_size: int
     num_workers: int
@@ -378,7 +410,6 @@ class EmbeddingsConfig:
         if not cache_dir.is_absolute():
             cache_dir = (dataset_root / cache_dir).resolve()
         dtype = _resolve_dtype(section.get("dtype", data.get("embeddings_dtype", "float16")))
-        variants = int(section.get("variants_per_sample", data.get("embeddings_variants", 1)))
         overwrite = _resolve_bool(section.get("overwrite", data.get("embeddings_overwrite", False)))
         precompute_batch_size = int(
             section.get("precompute_batch_size", data.get("embeddings_precompute_batch_size", 16))
@@ -400,7 +431,6 @@ class EmbeddingsConfig:
             enabled=enabled,
             cache_dir=cache_dir,
             dtype=dtype,
-            variants_per_sample=max(1, variants),
             overwrite=overwrite,
             precompute_batch_size=max(1, precompute_batch_size),
             num_workers=max(0, num_workers),
@@ -468,4 +498,3 @@ class TrainingConfig:
             embeddings=embeddings,
             seed=seed,
         )
-

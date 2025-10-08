@@ -3,7 +3,6 @@ dataset_root: ./unpacked_original_ds/full_dataset
 cache_root: cache_vae_embeddings
 
 defaults:
-  variants_per_sample: 1
   num_workers: 6
   embeddings_dtype: float32
   store_distribution: true
@@ -13,10 +12,10 @@ defaults:
     - cuda:1
     - cuda:2
     - cuda:3
-    - cuda:4
-    - cuda:5
-    - cuda:6
-    - cuda:7
+    # - cuda:4
+    # - cuda:5
+    # - cuda:6
+    # - cuda:7
 
 models:
   flux_vae:
