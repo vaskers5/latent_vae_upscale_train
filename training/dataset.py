@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from PIL import Image, ImageOps
+import pandas as pd
 import torch
 import torch.nn.functional as F
 import torchvision.transforms.functional as TF
@@ -30,14 +31,19 @@ class ImageFolderDataset(Dataset):
         limit: int = 0,
         embedding_cache: Optional[EmbeddingCache] = None,
         model_resolution: int = 0,
+        paths_csv: Optional[Path] = None,
     ) -> None:
-        print(f"[Dataset] Initializing ImageFolderDataset with root={root}, high_resolution={high_resolution}, resize_long_side={resize_long_side}, limit={limit}")
-        self.root = Path(root)
+        print(
+            f"[Dataset] Initializing ImageFolderDataset with root={root}, high_resolution={high_resolution}, "
+            f"resize_long_side={resize_long_side}, limit={limit}, paths_csv={paths_csv}"
+        )
+        self.root = Path(root).expanduser().resolve()
         self.high_resolution = high_resolution
         self.resize_long_side = resize_long_side
         self.paths: List[Path] = []
         self.embedding_cache = embedding_cache
         self.model_resolution = model_resolution
+        self.paths_csv = Path(paths_csv).expanduser() if paths_csv else None
         self._needs_model_downsample = (
             self.model_resolution > 0 and self.model_resolution != self.high_resolution
         )
@@ -50,15 +56,50 @@ class ImageFolderDataset(Dataset):
         print(f"[Dataset] Paths shuffled; total dataset length: {len(self.paths)}")
 
     def _collect_valid_paths(self, limit: int = 0) -> List[Path]:
+        if self.paths_csv:
+            print(f"[Dataset] Loading image list from CSV manifest: {self.paths_csv}")
+            return self._collect_from_csv(limit=limit)
+
         print(f"[Dataset] Collecting valid image paths from {self.root}...")
-        all_images = []
+        return self._collect_from_disk(limit=limit)
+
+    def _collect_from_disk(self, limit: int = 0) -> List[Path]:
+        all_images: List[Path] = []
         exts = {".png", ".jpg", ".jpeg", ".webp"}
-        for root, dirs, files in os.walk(self.root):
+        for root, _dirs, files in os.walk(self.root):
             for file in files:
                 if os.path.splitext(file)[1].lower() in exts:
                     full_path = Path(os.path.abspath(os.path.join(root, file)))
                     all_images.append(full_path)
-        return all_images
+                    if limit > 0 and len(all_images) >= limit:
+                        return all_images
+        return all_images[:limit] if limit > 0 else all_images
+
+    def _collect_from_csv(self, limit: int = 0) -> List[Path]:
+        if not self.paths_csv:
+            return []
+        manifest_path = self.paths_csv
+        if not manifest_path.exists():
+            raise FileNotFoundError(f"CSV manifest not found: {manifest_path}")
+
+        images: List[Path] = []
+        df = pd.read_csv(manifest_path)
+        if df.empty:
+            raise RuntimeError(f"No valid image records found in CSV manifest '{manifest_path}'.")
+
+        lowered = {col.lower(): col for col in df.columns}
+        path_key = next((lowered[key] for key in ("path", "filepath", "image_path") if key in lowered), None)
+        if path_key is None:
+            raise KeyError(
+                f"CSV manifest '{manifest_path}' must include a 'path' column (accepted aliases: filepath, image_path)."
+            )
+
+        path_series = df[path_key].dropna().astype(str).str.strip()
+        if limit > 0:
+            path_series = path_series.iloc[:limit]
+        images = path_series.apply(Path).tolist()
+
+        return images
 
     def set_embedding_cache(self, cache: Optional[EmbeddingCache]) -> None:
         self.embedding_cache = cache

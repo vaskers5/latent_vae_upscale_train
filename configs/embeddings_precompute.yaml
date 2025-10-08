@@ -7,6 +7,7 @@ defaults:
   num_workers: 6
   embeddings_dtype: float32
   store_distribution: true
+  image_csv: ./clear_images.csv
   devices:
     - cuda:0
     - cuda:1

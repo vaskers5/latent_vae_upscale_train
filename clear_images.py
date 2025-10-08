@@ -2,7 +2,7 @@ import os
 import pandas as pd
 
 # Create the clear_df_normal_images DataFrame
-df = pd.read_csv('data_df.csv')
+df = pd.read_csv('result_cleared_df.csv')
 validate_df = df[df['stage'] == 'validate']
 clear_df = validate_df.dropna(subset=['width', 'size_bytes', 'height'])
 clear_df_normal_images = clear_df[clear_df['size_bytes'] < 10 * 1024 * 1024]

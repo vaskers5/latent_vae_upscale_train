@@ -6,7 +6,7 @@ import hashlib
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, TYPE_CHECKING
 
 import torch
 import torch.nn as nn
@@ -22,6 +22,8 @@ if TYPE_CHECKING:  # pragma: no cover - type checking only
 
 
 _CACHE_VERSION = 1
+_LOG_BATCH_FLUSH_INTERVAL = 100
+_LOG_BUFFER_MAX_ENTRIES = 10_000
 
 
 @dataclass(frozen=True)
@@ -72,7 +74,14 @@ class EmbeddingCache:
         self.cache_root = self.cfg.cache_dir.resolve()
         self.cache_root.mkdir(parents=True, exist_ok=True)
         self.log = log or print
-        self.log(f"Initialized EmbeddingCache with cache_root: {self.cache_root}")
+        self._log_path = self._resolve_log_path()
+        self._cache_index = self._load_cache_log()
+        self._pending_log_entries = []
+        self._log_cleared_for_overwrite = False
+        self.log(
+            f"Initialized EmbeddingCache with cache_root: {self.cache_root} "
+            f"(log: {self._log_path})"
+        )
 
     # ------------------------------------------------------------------ storage helpers
     def _relative_path(self, image_path: Path) -> Path:
@@ -89,15 +98,82 @@ class EmbeddingCache:
         filename = f"{relative.stem}_v{variant_index:02d}.pt"
         return self.cache_root / relative.parent / filename
 
+    @staticmethod
+    def _sanitize_fragment(text: str) -> str:
+        cleaned = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in text.strip())
+        return cleaned or "cache"
+
+    def _resolve_log_path(self) -> Path:
+        parent = self.cache_root.parent if self.cache_root.parent != self.cache_root else self.cache_root
+        slug_candidate = next(iter(self.cfg.vae_names), parent.name or self.cache_root.name)
+        resolution = self.cache_root.name or "latents"
+        filename = f"{self._sanitize_fragment(slug_candidate)}_{self._sanitize_fragment(resolution)}_embed_cache_log"
+        return parent / filename
+
+    def _load_cache_log(self) -> Dict[Path, Set[int]]:
+        index: Dict[Path, Set[int]] = {}
+        if not hasattr(self, "_log_path") or not self._log_path.exists():
+            return index
+        try:
+            with self._log_path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    try:
+                        rel_str, variant_str = line.split("\t", 1)
+                        variant = int(variant_str)
+                    except ValueError:
+                        continue
+                    relative = Path(rel_str)
+                    index.setdefault(relative, set()).add(variant)
+        except OSError as exc:
+            self.log(f"[Embeddings] Warning: failed to read cache log '{self._log_path}': {exc}")
+        return index
+
+    def _register_cached_variant(self, image_path: Path, variant_index: int) -> None:
+        relative = self._relative_path(image_path)
+        variants = self._cache_index.setdefault(relative, set())
+        if variant_index in variants:
+            return
+        variants.add(variant_index)
+        self._pending_log_entries.append((relative, variant_index))
+        if len(self._pending_log_entries) >= _LOG_BUFFER_MAX_ENTRIES:
+            self._flush_log_buffer()
+
+    def _flush_log_buffer(self) -> None:
+        if not self._pending_log_entries:
+            return
+        self._log_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with self._log_path.open("a", encoding="utf-8") as handle:
+                for relative, variant in self._pending_log_entries:
+                    handle.write(f"{relative.as_posix()}\t{variant}\n")
+        except OSError as exc:
+            self.log(f"[Embeddings] Warning: failed to write cache log '{self._log_path}': {exc}")
+        finally:
+            self._pending_log_entries.clear()
+
+    def _prepare_for_overwrite(self) -> None:
+        if not self.cfg.overwrite or self._log_cleared_for_overwrite:
+            return
+        if self._log_path.exists():
+            try:
+                self._log_path.unlink()
+            except OSError as exc:
+                self.log(f"[Embeddings] Warning: unable to remove cache log '{self._log_path}': {exc}")
+        self._cache_index = {}
+        self._pending_log_entries = []
+        self._log_cleared_for_overwrite = True
+
     def available_variants(self, image_path: Path) -> List[int]:
-        variants: List[int] = []
-        for idx in range(self.cfg.variants_per_sample):
-            if self._record_path(image_path, idx).exists():
-                variants.append(idx)
-        return variants
+        relative = self._relative_path(image_path)
+        variants = self._cache_index.get(relative, set())
+        return sorted(variants)
 
     def has_variant(self, image_path: Path, variant_index: int) -> bool:
-        return self._record_path(image_path, variant_index).exists()
+        relative = self._relative_path(image_path)
+        return variant_index in self._cache_index.get(relative, set())
 
     def save_record(
         self,
@@ -109,7 +185,7 @@ class EmbeddingCache:
         mean: Optional[torch.Tensor] = None,
         logvar: Optional[torch.Tensor] = None,
     ) -> None:
-        self.log(f"Saving embedding for {image_path} variant {variant_index}")
+        # self.log(f"Saving embedding for {image_path} variant {variant_index}")
         record_path = self._record_path(image_path, variant_index)
         record_path.parent.mkdir(parents=True, exist_ok=True)
         payload: Dict[str, Any] = {
@@ -124,6 +200,7 @@ class EmbeddingCache:
             },
             "storage_dtype": str(latents.dtype).replace("torch.", ""),
         }
+        
         if mean is not None:
             payload["mean"] = mean.cpu()
         if logvar is not None:
@@ -201,29 +278,45 @@ class EmbeddingCache:
         if not self.cfg.enabled:
             return
 
-        total_checks = len(dataset.paths) * self.cfg.variants_per_sample
+        self._prepare_for_overwrite()
+        variants_per_sample = self.cfg.variants_per_sample
+        total_checks = len(dataset.paths) * variants_per_sample
+        expected_variants = tuple(range(variants_per_sample))
+        expected_variants_set = set(expected_variants)
+
+        if self.cfg.overwrite:
+            cached_keys: Set[Tuple[Path, int]] = set()
+        else:
+            cached_keys = {
+                (relative, variant)
+                for relative, variants in self._cache_index.items()
+                for variant in variants
+                if variant in expected_variants_set
+            }
+
+        missing_keys: Set[Tuple[Path, int]] = set()
+        path_lookup: Dict[Path, Path] = {}
+        for path in dataset.paths:
+            relative = self._relative_path(path)
+            path_lookup.setdefault(relative, path)
+            for variant in expected_variants:
+                key = (relative, variant)
+                if self.cfg.overwrite or key not in cached_keys:
+                    missing_keys.add(key)
+
         missing: List[Tuple[Path, int]] = []
+        processed_relatives: Set[Path] = set()
         progress = tqdm(total=total_checks, desc="Check cache", dynamic_ncols=True)
         for path in dataset.paths:
             relative = self._relative_path(path)
-            cache_subdir = self.cache_root / relative.parent
-            existing_variants = set()
-            if cache_subdir.exists():
-                for file in cache_subdir.iterdir():
-                    if file.is_file() and file.name.startswith(f"{relative.stem}_v") and file.name.endswith('.pt'):
-                        try:
-                            variant_str = file.name[len(f"{relative.stem}_v"):-3]
-                            variant = int(variant_str)
-                            existing_variants.add(variant)
-                        except ValueError:
-                            pass
-            for variant in range(self.cfg.variants_per_sample):
-                present = variant in existing_variants
-                if present and not self.cfg.overwrite:
-                    progress.update(1)
-                    continue
-                progress.update(1)
-                missing.append((path, variant))
+            if relative not in processed_relatives:
+                processed_relatives.add(relative)
+                for variant in expected_variants:
+                    key = (relative, variant)
+                    if key in missing_keys:
+                        missing.append((path_lookup[relative], variant))
+            progress.update(variants_per_sample)
+        progress.close()
 
         main_process = accelerator is None or accelerator.is_main_process
 
@@ -271,42 +364,50 @@ class EmbeddingCache:
                 dynamic_ncols=True,
             )
 
-        with torch.no_grad():
-            for batch in loader:
-                model_inputs = batch["model_input"].to(device=device, dtype=encode_dtype)
-                if self._is_video_vae(vae):
-                    model_inputs = model_inputs.unsqueeze(2)
-                encoding = vae.encode(model_inputs)
-                latent_mean = encoding.latent_dist.mean.detach()
-                latent_logvar = (
-                    encoding.latent_dist.logvar.detach() if self.cfg.store_distribution else None
-                )
-
-                latents = latent_mean
-                if self._is_video_vae(vae):
-                    latents = latents.squeeze(2)
-                    latent_mean = latent_mean.squeeze(2)
-                    if latent_logvar is not None:
-                        latent_logvar = latent_logvar.squeeze(2)
-
-                latents = latents.to(self.cfg.dtype)
-
-                for idx, image_path in enumerate(batch["paths"]):
-                    variant_index = batch["variants"][idx]
-                    params = batch["params"][idx]
-                    mean_tensor = latent_mean[idx] if self.cfg.store_distribution else None
-                    logvar_tensor = latent_logvar[idx] if latent_logvar is not None else None
-                    self.save_record(
-                        image_path,
-                        variant_index,
-                        latents[idx],
-                        params,
-                        mean=mean_tensor,
-                        logvar=logvar_tensor,
+        batch_counter = 0
+        try:
+            with torch.no_grad():
+                for batch in loader:
+                    batch_counter += 1
+                    model_inputs = batch["model_input"].to(device=device, dtype=encode_dtype)
+                    if self._is_video_vae(vae):
+                        model_inputs = model_inputs.unsqueeze(2)
+                    encoding = vae.encode(model_inputs)
+                    latent_mean = encoding.latent_dist.mean.detach()
+                    latent_logvar = (
+                        encoding.latent_dist.logvar.detach() if self.cfg.store_distribution else None
                     )
 
-                if progress is not None:
-                    progress.update(len(batch["paths"]))
+                    latents = latent_mean
+                    if self._is_video_vae(vae):
+                        latents = latents.squeeze(2)
+                        latent_mean = latent_mean.squeeze(2)
+                        if latent_logvar is not None:
+                            latent_logvar = latent_logvar.squeeze(2)
+
+                    latents = latents.to(self.cfg.dtype)
+
+                    for idx, image_path in enumerate(batch["paths"]):
+                        variant_index = batch["variants"][idx]
+                        params = batch["params"][idx]
+                        mean_tensor = latent_mean[idx] if self.cfg.store_distribution else None
+                        logvar_tensor = latent_logvar[idx] if latent_logvar is not None else None
+                        self.save_record(
+                            image_path,
+                            variant_index,
+                            latents[idx],
+                            params,
+                            mean=mean_tensor,
+                            logvar=logvar_tensor,
+                        )
+                        self._register_cached_variant(image_path, variant_index)
+
+                    if progress is not None:
+                        progress.update(len(batch["paths"]))
+                    if batch_counter % _LOG_BATCH_FLUSH_INTERVAL == 0:
+                        self._flush_log_buffer()
+        finally:
+            self._flush_log_buffer()
 
         if progress is not None:
             progress.close()
@@ -351,7 +452,7 @@ class _EmbeddingGenerationDataset(Dataset):
     def __getitem__(self, index: int) -> Dict[str, Any]:
         image_path, variant_index = self.pending[index]
         rng = self.cache._build_rng(self.seed, image_path, variant_index)
-        self.cache.log(f"Building tensor sample for {image_path} variant {variant_index}")
+        # self.cache.log(f"Building tensor sample for {image_path} variant {variant_index}")
         sample_tensor, params = self.dataset.build_tensor_sample(image_path, rng=rng, params=None)
         model_input = self.dataset.prepare_model_input(sample_tensor).contiguous()
         return {

@@ -86,6 +86,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip tasks whose caches are already complete (validated before encoding)",
     )
+    parser.add_argument(
+        "--image-csv",
+        type=Path,
+        default=None,
+        help="Override the CSV manifest listing images to encode",
+    )
 
     args = parser.parse_args()
     print(f"[Embeddings] Arguments parsed: config={args.config}, dataset_root={args.dataset_root}, device={args.device}, etc.")
@@ -225,7 +231,7 @@ def _ensure_expected_counts(cache: EmbeddingCache, image_paths: Iterable[Path], 
         )
 
     expected_total = len(paths) * expected_variants
-    produced = len([p for p in cache.cache_root.rglob("*.pt") if p.is_file()])
+    produced = sum(len(cache.available_variants(path)) for path in paths)
     if produced != expected_total:
         raise RuntimeError(
             f"Embedding count mismatch: expected {expected_total} cache files, found {produced}."
@@ -287,6 +293,7 @@ def _execute_task(
         limit=task.limit,
         embedding_cache=None,
         model_resolution=task.model_resolution,
+        paths_csv=task.image_csv,
     )
     logger(f"[Embeddings] Dataset created: Collected {len(dataset.paths)} paths")
 
@@ -415,6 +422,7 @@ def _run_from_config(args: argparse.Namespace) -> None:
     variants_override = int(args.variants_per_sample) if args.variants_per_sample is not None else None
     batch_override = int(args.batch_size) if args.batch_size is not None else None
     workers_override = int(args.num_workers) if args.num_workers is not None else None
+    image_csv_override = args.image_csv.expanduser() if args.image_csv else None
 
     print("[Embeddings] Generating tasks from configuration...")
     tasks = multi_cfg.generate_tasks(
@@ -423,6 +431,7 @@ def _run_from_config(args: argparse.Namespace) -> None:
         variants_override=variants_override,
         batch_override=batch_override,
         workers_override=workers_override,
+        image_csv_override=image_csv_override,
     )
     print(f"[Embeddings] Generated {len(tasks)} task(s)")
 

@@ -98,6 +98,7 @@ class MultiPrecomputeDefaults:
     embeddings_dtype: torch.dtype = torch.float16
     device: Optional[str] = None
     devices: Optional[List[str]] = None
+    image_csv: Optional[Path] = None
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "MultiPrecomputeDefaults":
@@ -111,6 +112,12 @@ class MultiPrecomputeDefaults:
         dtype_value = data.get("embeddings_dtype")
         device = data.get("device")
         devices_raw = data.get("devices")
+        image_csv_raw = (
+            data.get("image_csv")
+            or data.get("paths_csv")
+            or data.get("image_manifest")
+            or data.get("dataset_csv")
+        )
 
         devices: Optional[List[str]]
         if devices_raw is None:
@@ -128,6 +135,8 @@ class MultiPrecomputeDefaults:
         else:
             raise TypeError("defaults.devices must be a string, list, or tuple of device names")
 
+        image_csv = Path(image_csv_raw).expanduser() if image_csv_raw else None
+
         return cls(
             cache_subdir=cache_subdir,
             variants_per_sample=max(1, variants),
@@ -139,6 +148,7 @@ class MultiPrecomputeDefaults:
             embeddings_dtype=_resolve_dtype(dtype_value or "float16"),
             device=str(device) if device else None,
             devices=devices,
+            image_csv=image_csv,
         )
 
 
@@ -163,6 +173,7 @@ class MultiVaeConfig:
     resize_long_side: Optional[int]
     limit: Optional[int]
     store_distribution: Optional[bool]
+    image_csv: Optional[Path]
     resolutions: List[ResolutionSpec] = field(default_factory=list)
 
     @classmethod
@@ -193,6 +204,12 @@ class MultiVaeConfig:
         resize = data.get("resize_long_side")
         limit = data.get("limit")
         store_distribution = data.get("store_distribution")
+        image_csv_raw = (
+            data.get("image_csv")
+            or data.get("paths_csv")
+            or data.get("image_manifest")
+            or data.get("dataset_csv")
+        )
 
         slug = _slugify(name) or name.replace("/", "_")
 
@@ -218,6 +235,7 @@ class MultiVaeConfig:
             store_distribution=(
                 _resolve_bool(store_distribution) if store_distribution is not None else None
             ),
+            image_csv=Path(image_csv_raw).expanduser() if image_csv_raw else None,
             resolutions=resolutions,
         )
 
@@ -245,6 +263,7 @@ class MultiPrecomputeTask:
     hf_auth_token: Optional[str]
     vae_kind: Optional[str]
     display_resolution: str
+    image_csv: Optional[Path]
 
 
 @dataclass
@@ -290,6 +309,7 @@ class MultiPrecomputeConfig:
         variants_override: Optional[int] = None,
         batch_override: Optional[int] = None,
         workers_override: Optional[int] = None,
+        image_csv_override: Optional[Path] = None,
     ) -> List[MultiPrecomputeTask]:
         base_dataset_root = dataset_root_override or self.dataset_root
         if base_dataset_root is None:
@@ -343,6 +363,23 @@ class MultiPrecomputeConfig:
                 model.store_distribution if model.store_distribution is not None else self.defaults.store_distribution
             )
             embeddings_dtype = model.embeddings_dtype or self.defaults.embeddings_dtype
+            if image_csv_override is not None:
+                manifest_candidate = image_csv_override.expanduser()
+            else:
+                manifest_candidate = (model.image_csv or self.defaults.image_csv)
+
+            if manifest_candidate is not None:
+                manifest_candidate = manifest_candidate.expanduser()
+                if manifest_candidate.is_absolute():
+                    manifest_path = manifest_candidate.resolve()
+                else:
+                    candidate_in_dataset = (base_dataset_root / manifest_candidate).resolve()
+                    if candidate_in_dataset.exists():
+                        manifest_path = candidate_in_dataset
+                    else:
+                        manifest_path = manifest_candidate.resolve()
+            else:
+                manifest_path = None
 
             base_batch = max(1, int(base_batch))
             last_high_resolution: Optional[int] = None
@@ -388,6 +425,7 @@ class MultiPrecomputeConfig:
                         hf_auth_token=model.hf_auth_token,
                         vae_kind=model.vae_kind,
                         display_resolution=resolution.display,
+                        image_csv=manifest_path,
                     )
                 )
 
