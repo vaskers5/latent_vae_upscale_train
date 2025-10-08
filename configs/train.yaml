@@ -91,7 +91,6 @@ embeddings:
   enabled: true
   cache_dir: ./cache_vae_embeddings
   dtype: float16
-  variants_per_sample: 2
   overwrite: false
   precompute_batch_size: 64
   precompute_num_workers: 4

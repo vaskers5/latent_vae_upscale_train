@@ -3,7 +3,6 @@ dataset_root: ./unpacked_original_ds/full_dataset
 cache_root: cache_vae_embeddings
 
 defaults:
-  variants_per_sample: 1
   num_workers: 6
   embeddings_dtype: float32
   store_distribution: true
