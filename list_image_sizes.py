@@ -12,7 +12,7 @@ from itertools import chain, repeat
 from pathlib import Path
 from typing import Iterator, Sequence
 
-import cv2
+from PIL import Image
 from tqdm.auto import tqdm
 
 IMAGE_EXTENSIONS: Sequence[str] = (
@@ -73,10 +73,9 @@ def _process_image(
         return (True, display_path, size_bytes, None, None, None, True)
 
     try:
-        image = cv2.imread(path_str, cv2.IMREAD_UNCHANGED)
-        if image is None:
-            raise ValueError("OpenCV could not read the image data.")
-        height, width = image.shape[:2]
+        image = Image.open(path_str)
+        width, height = image.size
+        image = image.convert("RGB")  # Ensure image is loaded
         return (True, display_path, size_bytes, int(width), int(height), None, False)
     except Exception as exc:  # pragma: no cover - guard rail
         if fail_on_error:
@@ -84,7 +83,7 @@ def _process_image(
         return (
             True,
             display_path,
-            size_bytes,
+            None,
             None,
             None,
             f"Could not read image {path}: {exc}",
