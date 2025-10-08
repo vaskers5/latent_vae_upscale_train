@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 import torch
 
@@ -281,12 +281,19 @@ class ModelConfig:
 @dataclass
 class LossConfig:
     lpips_backbone: str
+    components: List[Dict[str, Any]]
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "LossConfig":
         section = data.get("loss", {})
         backbone = section.get("lpips_backbone", data.get("lpips_backbone", "vgg"))
-        return cls(lpips_backbone=str(backbone))
+        raw_components = section.get("components") or data.get("loss_components") or []
+        components: List[Dict[str, Any]] = []
+        if isinstance(raw_components, list):
+            for item in raw_components:
+                if isinstance(item, Mapping):
+                    components.append(dict(item))
+        return cls(lpips_backbone=str(backbone), components=components)
 
 
 @dataclass
@@ -317,6 +324,7 @@ class LatentUpscalerConfig:
     blocks: Optional[int]
     nerf_blocks: Optional[int]
     groups: Optional[int]
+    extra: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "LatentUpscalerConfig":
@@ -335,6 +343,7 @@ class LatentUpscalerConfig:
             blocks=_maybe_int(section.get("blocks") or section.get("nerf_blocks")),
             nerf_blocks=_maybe_int(section.get("nerf_blocks")),
             groups=_maybe_int(section.get("groups")),
+            extra=dict(section),
         )
 
 
@@ -465,4 +474,3 @@ class TrainingConfig:
             embeddings=embeddings,
             seed=seed,
         )
-

@@ -8,7 +8,7 @@ save_root_dir: ./runs
 # Absolute or relative path to the dataset root.
 ds_path: ./datasets/test_dataset
 # Optional experiment metadata used when creating the run directory layout.
-exp_name: pixnerf-upscale-baseline
+exp_name: pixnerf-upscale-multiloss
 generated_folder_name: samples
 seed: 1337
 
@@ -22,7 +22,7 @@ dataset:
 
 # --- OptimizerConfig section ---
 optimizer:
-  batch_size: 512
+  batch_size: 128
   base_learning_rate: 0.005
   min_learning_rate: 0.0001
   num_epochs: 250
@@ -65,6 +65,22 @@ model:
 # --- LossConfig section ---
 loss:
   lpips_backbone: vgg
+  components:
+    - type: MSELoss
+      name: latent_mse
+      loss_weight: 0.7
+      reduction: mean
+    - type: L1Loss
+      name: latent_l1
+      loss_weight: 0.3
+      reduction: mean
+    - type: WeightedTVLoss
+      name: smooth_tv
+      loss_weight: 0.01
+      reduction: mean
+      inputs:
+        - pred
+
 
 # --- LoggingConfig section ---
 logging:
@@ -75,16 +91,16 @@ logging:
 # --- LatentUpscalerConfig section ---
 latent_upscaler:
   model_name: swin
-  model: swin
   window: 8
   depth: 6
-  heads: 4
-  mlp_ratio: 2.0
-  liif_hidden: 256
-  patch_size: 4
-  blocks: 256
-  nerf_blocks: 128
-  groups: 4
+  heads: 8
+  mlp_ratio: 4.0
+  patch_size: 1
+  embed_dim: 128
+  depths: [6, 6, 6, 6]
+  num_heads: [8, 8, 8, 8]
+  drop_path_rate: 0.2
+  upsampler: pixelshuffle
 
 # --- EmbeddingsConfig section ---
 embeddings:

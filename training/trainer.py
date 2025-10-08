@@ -6,7 +6,7 @@ import logging
 import math
 import random
 from dataclasses import asdict, is_dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -15,9 +15,10 @@ from torch import nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from .config import TrainingConfig
+from .config import TrainingConfig, _resolve_bool
 from .dataset import UpscaleDataset
 from .helpers import get_latent_upscaler
+from .losses import LossManager
 from .sample_logging import SampleLogger
 from .wandb_logger import WandbLogger
 
@@ -71,7 +72,6 @@ class VAETrainer:
         self.accelerator = Accelerator(
             gradient_accumulation_steps=self.cfg.optimiser.gradient_accumulation_steps
         )
-        self.accelerator.seed_everything(self.cfg.seed)
         self.logger = _create_logger(self.__class__.__name__)
         self.logger.disabled = not self.accelerator.is_local_main_process
         self.device = self.accelerator.device
@@ -182,6 +182,47 @@ class VAETrainer:
             mlp_ratio = getattr(upscaler_cfg, "mlp_ratio", None)
             if mlp_ratio:
                 upscaler_kwargs["mlp_ratio"] = float(mlp_ratio)
+            extra_opts = getattr(upscaler_cfg, "extra", {}) or {}
+            embed_dim = extra_opts.get("embed_dim")
+            if embed_dim is not None:
+                upscaler_kwargs["embed_dim"] = int(embed_dim)
+            stages = extra_opts.get("stages")
+            if stages is not None:
+                upscaler_kwargs["stages"] = int(stages)
+            depths = extra_opts.get("depths")
+            if isinstance(depths, str):
+                tokens = [token.strip() for token in depths.split(",") if token.strip()]
+                try:
+                    depths = [int(token) for token in tokens]
+                except ValueError:
+                    depths = None
+            if depths is not None:
+                upscaler_kwargs["depths"] = depths
+            heads_list = extra_opts.get("num_heads") or extra_opts.get("num_heads_list")
+            if isinstance(heads_list, str):
+                tokens = [token.strip() for token in heads_list.split(",") if token.strip()]
+                try:
+                    heads_list = [int(token) for token in tokens]
+                except ValueError:
+                    heads_list = None
+            if heads_list is not None:
+                upscaler_kwargs["num_heads"] = heads_list
+            for key in ("drop_rate", "attn_drop_rate", "drop_path_rate", "img_range"):
+                value = extra_opts.get(key)
+                if value is not None:
+                    upscaler_kwargs[key] = float(value)
+            for key in ("img_size", "scale"):
+                value = extra_opts.get(key)
+                if value is not None:
+                    upscaler_kwargs[key] = int(value)
+            for key in ("ape", "patch_norm", "use_checkpoint"):
+                value = extra_opts.get(key)
+                if value is not None:
+                    upscaler_kwargs[key] = _resolve_bool(value, default=False)
+            for key in ("resi_connection", "upsampler"):
+                value = extra_opts.get(key)
+                if value is not None:
+                    upscaler_kwargs[key] = str(value)
             if upscaler_name == "swin_liif":
                 liif_hidden = getattr(upscaler_cfg, "liif_hidden", None)
                 if liif_hidden:
@@ -201,13 +242,17 @@ class VAETrainer:
         ).to(self.device)
         self.upscaler_name = upscaler_name
         self.param_dtype = next(self.model.parameters()).dtype
-
-        self.criterion = nn.MSELoss()
+        if self.cfg.losses.components:
+            self.criterion = LossManager(self.cfg.losses.components)
+            loss_names = ", ".join(comp.get("name", comp.get("type", "unknown")) for comp in self.cfg.losses.components)
+            self.logger.info("Configured custom losses: %s", loss_names)
+        else:
+            self.criterion = nn.MSELoss()
         self.grad_accum_steps = max(1, self.cfg.optimiser.gradient_accumulation_steps)
         self.optimizer = self._build_optimizer()
         self.scheduler = self._build_scheduler(self.grad_accum_steps)
 
-        prepare_targets: List[Any] = [self.model, self.optimizer, *self.dataloaders]
+        prepare_targets: List[Any] = [self.model, self.optimizer, self.criterion, *self.dataloaders]
         scheduler_present = self.scheduler is not None
         if scheduler_present:
             prepare_targets.append(self.scheduler)
@@ -215,7 +260,8 @@ class VAETrainer:
         prepared = self.accelerator.prepare(*prepare_targets)
         self.model = prepared[0]
         self.optimizer = prepared[1]
-        loaders_start = 2
+        self.criterion = prepared[2]
+        loaders_start = 3
         loaders_end = loaders_start + len(self.dataloaders)
         self.dataloaders = list(prepared[loaders_start:loaders_end])
         if scheduler_present:
@@ -338,7 +384,7 @@ class VAETrainer:
             )
         return None
 
-    def step(self, batch: Dict[str, torch.Tensor]) -> float:
+    def step(self, batch: Dict[str, torch.Tensor]) -> Tuple[float, Dict[str, float]]:
         low = batch["low"].to(self.device, dtype=self.param_dtype)
         high = batch["high"].to(self.device, dtype=self.param_dtype)
 
@@ -348,12 +394,33 @@ class VAETrainer:
 
         gathered = self.accelerator.gather(loss.detach())
         loss_value = float(gathered.mean().item())
-        return loss_value
+
+        metrics: Dict[str, float] = {"loss": loss_value}
+        criterion_module = self.accelerator.unwrap_model(self.criterion)
+        raw_metrics = getattr(criterion_module, "raw_metrics", None)
+        if isinstance(raw_metrics, dict) and raw_metrics:
+            for name, tensor in raw_metrics.items():
+                metric = tensor.detach()
+                if metric.dim() > 0:
+                    metric = metric.mean()
+                metric = metric.to(device=loss.device, dtype=loss.dtype)
+                gathered_metric = self.accelerator.gather(metric)
+                metrics[name] = float(gathered_metric.mean().item())
+
+        return loss_value, metrics
 
     def _optimizer_step(self, clip_norm: float) -> None:
         if clip_norm > 0:
             self.accelerator.clip_grad_norm_(self.model.parameters(), clip_norm)
-        self.accelerator.step(self.optimizer)
+        step_fn = getattr(self.accelerator, "optimizer_step", None)
+        if callable(step_fn):
+            step_fn(self.optimizer)
+        else:
+            compat_step = getattr(self.accelerator, "step", None)
+            if callable(compat_step):
+                compat_step(self.optimizer)
+            else:
+                self.optimizer.step()
         if self.scheduler is not None:
             self.scheduler.step()
         self.optimizer.zero_grad(set_to_none=True)
@@ -381,24 +448,33 @@ class VAETrainer:
         accum_loss_by_vae = [0.0 for _ in self.dataloaders]
         accum_counts_by_vae = [0 for _ in self.dataloaders]
         accum_counter = 0
+        component_accum: Dict[str, float] = {}
+        component_counts: Dict[str, int] = {}
         num_vaes = len(self.dataloaders)
 
         def flush_accumulated() -> None:
-            nonlocal accum_total_loss, accum_loss_by_vae, accum_counts_by_vae, accum_counter
+            nonlocal accum_total_loss, accum_loss_by_vae, accum_counts_by_vae, accum_counter, component_accum, component_counts
             if accum_counter == 0 or not self.accelerator.is_main_process:
                 accum_total_loss = 0.0
                 accum_loss_by_vae = [0.0 for _ in range(num_vaes)]
                 accum_counts_by_vae = [0 for _ in range(num_vaes)]
                 accum_counter = 0
+                component_accum = {}
+                component_counts = {}
                 return
 
             effective_counter = accum_counter
             metrics: Dict[str, float] = {
-                "train/mse_loss": accum_total_loss / max(1, effective_counter),
+                "train/loss": accum_total_loss / max(1, effective_counter),
             }
             for idx, count in enumerate(accum_counts_by_vae):
                 if count > 0:
-                    metrics[f"train/mse_loss/{self.vae_metric_names[idx]}"] = accum_loss_by_vae[idx] / count
+                    metrics[f"train/loss/{self.vae_metric_names[idx]}"] = accum_loss_by_vae[idx] / count
+
+            for name, total in component_accum.items():
+                count = component_counts.get(name, 0)
+                if count > 0:
+                    metrics[f"train/loss_components/{name}"] = total / count
 
             self._log_step_metrics(metrics)
 
@@ -406,6 +482,8 @@ class VAETrainer:
             accum_loss_by_vae = [0.0 for _ in range(num_vaes)]
             accum_counts_by_vae = [0 for _ in range(num_vaes)]
             accum_counter = 0
+            component_accum = {}
+            component_counts = {}
 
         for epoch in tqdm(
             range(1, num_epochs + 1),
@@ -431,12 +509,18 @@ class VAETrainer:
                 for vae_index, loader_iter in enumerate(loader_iters):
                     batch = next(loader_iter)
                     with self.accelerator.accumulate(self.model):
-                        loss_value = self.step(batch)
+                        loss_value, step_metrics = self.step(batch)
                         epoch_loss_totals[vae_index] += loss_value
                         accum_total_loss += loss_value
                         accum_loss_by_vae[vae_index] += loss_value
                         accum_counts_by_vae[vae_index] += 1
                         accum_counter += 1
+
+                        for name, value in step_metrics.items():
+                            if name == "loss":
+                                continue
+                            component_accum[name] = component_accum.get(name, 0.0) + value
+                            component_counts[name] = component_counts.get(name, 0) + 1
 
                         if self.accelerator.sync_gradients:
                             self._optimizer_step(clip_norm)
