@@ -5,7 +5,11 @@ from __future__ import annotations
 import logging
 import math
 import random
+import json
+import shutil
 from dataclasses import asdict, is_dataclass
+from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -130,10 +134,10 @@ class VAETrainer:
                 )
             per_dataset_steps.append(per_process_batches)
 
-        self.steps_per_epoch = min(per_dataset_steps)
-        if self.steps_per_epoch <= 0:
+        self.steps_per_cycle = min(per_dataset_steps)
+        if self.steps_per_cycle <= 0:
             raise RuntimeError("No training batches available – check the embedding caches, batch size, and world size.")
-        self.total_batches_per_epoch = self.steps_per_epoch * len(self.dataloaders)
+        self.total_batches_per_cycle = self.steps_per_cycle * len(self.dataloaders)
         total_dataset_size = sum(dataset_sizes)
 
         example = self.datasets[0][0]
@@ -269,18 +273,31 @@ class VAETrainer:
 
         self.optimizer.zero_grad(set_to_none=True)
 
+        load_source = getattr(self.cfg.latent_upscaler, "load_from", None)
+        self.resume_dir: Optional[Path] = None
+        if load_source:
+            try:
+                self.resume_dir = Path(str(load_source)).expanduser().resolve()
+            except Exception as exc:
+                self.logger.warning("Unable to resolve load_from path '%s': %s", load_source, exc)
+                self.resume_dir = None
+
+        self.save_interval = max(0, int(getattr(self.cfg.logging, "save_each_n_steps", 0)))
+        self.best_checkpoint_loss: float = float("inf")
+        self.best_checkpoint_step: Optional[int] = None
+
         self.global_step = 0  # counts optimiser steps
         parameter_source = self.accelerator.unwrap_model(self.model)
         total_params = sum(param.numel() for param in parameter_source.parameters())
         trainable_params = sum(param.numel() for param in parameter_source.parameters() if param.requires_grad)
 
         self.logger.info(
-            "Initialised trainer | device=%s | datasets=%d | total_pairs=%d | batch_size=%d | epochs=%d",
+            "Initialised trainer | device=%s | datasets=%d | total_pairs=%d | batch_size=%d | max_steps=%d",
             self.device,
             len(self.datasets),
             total_dataset_size,
             self.cfg.optimiser.batch_size,
-            self.cfg.optimiser.num_epochs,
+            self.cfg.optimiser.max_train_steps,
         )
         self.logger.info(
             "Model parameters | total=%d | trainable=%d | dtype=%s | upscaler=%s",
@@ -298,7 +315,7 @@ class VAETrainer:
         )
         for name, cache_dir, size, loader in zip(self.vae_names, cache_dirs, dataset_sizes, self.dataloaders):
             self.logger.info(
-                "Dataset[%s] | cache=%s | pairs=%d | batches_per_epoch=%d",
+                "Dataset[%s] | cache=%s | pairs=%d | batches_per_cycle=%d",
                 name,
                 cache_dir,
                 size,
@@ -318,17 +335,23 @@ class VAETrainer:
             "metadata/datasets": len(self.datasets),
             "metadata/dataset_size_total": total_dataset_size,
             "metadata/batch_size": self.cfg.optimiser.batch_size,
-            "metadata/num_epochs": self.cfg.optimiser.num_epochs,
+            "metadata/max_train_steps": self.cfg.optimiser.max_train_steps,
             "metadata/optimizer": self.cfg.optimiser.optimizer_type,
             "metadata/scheduler": self.cfg.optimiser.scheduler or "none",
             "metadata/clip_grad_norm": self.cfg.optimiser.clip_grad_norm,
             "metadata/latent_channels": channels,
             "metadata/latent_scale": inferred_scale,
             "metadata/vae_names": ", ".join(self.vae_names),
+            "metadata/steps_per_cycle": self.steps_per_cycle,
+            "metadata/save_each_n_steps": self.save_interval,
         }
+        if self.cfg.optimiser.legacy_num_epochs is not None:
+            metadata["metadata/legacy_num_epochs"] = self.cfg.optimiser.legacy_num_epochs
+        if self.resume_dir is not None:
+            metadata["metadata/load_from"] = str(self.resume_dir)
         for name, size, loader in zip(self.vae_names, dataset_sizes, self.dataloaders):
             metadata[f"metadata/dataset_size/{name}"] = size
-            metadata[f"metadata/batches_per_epoch/{name}"] = len(loader)
+            metadata[f"metadata/batches_per_cycle/{name}"] = len(loader)
 
         self.sample_logger: Optional[SampleLogger] = None
         unwrapped_model = self.accelerator.unwrap_model(self.model)
@@ -352,6 +375,9 @@ class VAETrainer:
                 self.logger.warning("Failed to initialise sample logger: %s", exc)
                 self.sample_logger = None
 
+        if self.resume_dir is not None:
+            self._maybe_resume_from(self.resume_dir)
+
     def _build_optimizer(self) -> torch.optim.Optimizer:
         lr = self.cfg.optimiser.base_learning_rate
         betas = (0.9, self.cfg.optimiser.beta2)
@@ -368,18 +394,15 @@ class VAETrainer:
         return torch.optim.Adam(self.model.parameters(), lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
 
     def _build_scheduler(self, accum_steps: int) -> Optional[torch.optim.lr_scheduler._LRScheduler]:
+        del accum_steps
         scheduler_type = (self.cfg.optimiser.scheduler or "").lower()
         if scheduler_type == "cosine":
-            batches_per_epoch = getattr(self, "total_batches_per_epoch", 0)
-            if batches_per_epoch <= 0:
-                return None
-            effective_batches = math.ceil(batches_per_epoch / max(1, accum_steps))
-            total_steps = self.cfg.optimiser.num_epochs * effective_batches
+            total_steps = int(self.cfg.optimiser.max_train_steps)
             if total_steps <= 0:
                 return None
             return torch.optim.lr_scheduler.CosineAnnealingLR(
                 self.optimizer,
-                T_max=total_steps,
+                T_max=max(1, total_steps),
                 eta_min=self.cfg.optimiser.min_learning_rate,
             )
         return None
@@ -438,12 +461,147 @@ class VAETrainer:
                 self.logger.warning("Sample logging failed at step %d: %s", self.global_step, sample_exc)
                 self.sample_logger = None
 
+    def _reset_directory(self, directory: Path) -> None:
+        if directory.exists():
+            shutil.rmtree(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+
+    def _write_checkpoint_metadata(self, directory: Path, *, step: int, tag: str, loss: Optional[float]) -> None:
+        metadata = {
+            "tag": tag,
+            "step": step,
+            "loss": float(loss) if loss is not None else None,
+            "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        }
+        metadata_path = directory / "training_metadata.json"
+        with metadata_path.open("w", encoding="utf-8") as handle:
+            json.dump(metadata, handle, indent=2)
+
+    def _save_state_to(self, directory: Path, *, step: int, tag: str, loss: Optional[float] = None) -> None:
+        self.accelerator.wait_for_everyone()
+        if self.accelerator.is_main_process:
+            self._reset_directory(directory)
+            self.accelerator.save_state(str(directory))
+            self._write_checkpoint_metadata(directory, step=step, tag=tag, loss=loss)
+            self.logger.info("Saved %s checkpoint at step %d to %s", tag, step, directory)
+        self.accelerator.wait_for_everyone()
+
+    def _maybe_save_periodic_checkpoint(self, step: int) -> None:
+        if self.save_interval <= 0 or step <= 0:
+            return
+        if step % self.save_interval != 0:
+            return
+        checkpoint_dir = self.cfg.paths.checkpoints_dir / f"step_{step:08d}"
+        self._save_state_to(checkpoint_dir, step=step, tag="checkpoint")
+
+    def _save_best_checkpoint(self, step: int, loss: float) -> None:
+        if step <= 0:
+            return
+        self.best_checkpoint_loss = loss
+        self.best_checkpoint_step = step
+        self._save_state_to(self.cfg.paths.best_dir, step=step, tag="best", loss=loss)
+
+    def _save_final_checkpoint(self, step: int, loss: Optional[float]) -> None:
+        if step <= 0 and loss is None:
+            return
+        self._save_state_to(self.cfg.paths.final_dir, step=step, tag="final", loss=loss)
+
+    def _load_checkpoint_metadata(self, directory: Path) -> Optional[Dict[str, Any]]:
+        path = directory / "training_metadata.json"
+        if not path.is_file():
+            return None
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            return data if isinstance(data, dict) else None
+        except Exception as exc:
+            self.logger.warning("Failed to read checkpoint metadata at %s: %s", path, exc)
+            return None
+
+    def _locate_weights_file(self, directory: Path) -> Optional[Path]:
+        candidates = (
+            "pytorch_model.bin",
+            "pytorch_model.pt",
+            "pytorch_model.pth",
+            "model.safetensors",
+            "pytorch_model.safetensors",
+            "weights.pth",
+        )
+        for name in candidates:
+            path = directory / name
+            if path.is_file():
+                return path
+        return None
+
+    def _load_weights_file(self, path: Path) -> None:
+        model = self.accelerator.unwrap_model(self.model)
+        suffix = path.suffix.lower()
+        if suffix in {".bin", ".pt", ".pth"}:
+            state = torch.load(path, map_location="cpu")
+            model.load_state_dict(state, strict=False)
+            return
+        if suffix == ".safetensors":
+            try:
+                from safetensors.torch import load_file  # type: ignore
+            except ImportError as exc:
+                raise RuntimeError("safetensors is required to load .safetensors checkpoints") from exc
+            state = load_file(str(path))
+            model.load_state_dict(state, strict=False)
+            return
+        raise RuntimeError(f"Unsupported checkpoint file format: {path}")
+
+    def _maybe_resume_from(self, directory: Path) -> None:
+        if not directory.exists():
+            self.logger.warning("Requested load_from path does not exist: %s", directory)
+            return
+        metadata = None
+        try:
+            self.accelerator.load_state(str(directory))
+            metadata = self._load_checkpoint_metadata(directory)
+            if metadata:
+                loaded_step = int(metadata.get("step", self.global_step))
+                self.global_step = max(self.global_step, loaded_step)
+                loss = metadata.get("loss")
+                if loss is not None:
+                    self.best_checkpoint_loss = float(loss)
+                    self.best_checkpoint_step = loaded_step
+            self.logger.info(
+                "Restored full training state from %s at step %d", directory, self.global_step
+            )
+            return
+        except Exception as exc:
+            self.logger.warning(
+                "Failed to restore full training state from %s (%s). Falling back to weights only.",
+                directory,
+                exc,
+            )
+        weights_file = self._locate_weights_file(directory)
+        if weights_file is None:
+            self.logger.error("Unable to locate model weights inside %s; continuing without restore.", directory)
+            return
+        try:
+            self._load_weights_file(weights_file)
+        except Exception as exc:
+            self.logger.error("Failed to load model weights from %s: %s", weights_file, exc)
+            return
+        metadata = metadata or self._load_checkpoint_metadata(directory)
+        if metadata:
+            loaded_step = int(metadata.get("step", self.global_step))
+            self.global_step = max(self.global_step, loaded_step)
+            loss = metadata.get("loss")
+            if loss is not None:
+                self.best_checkpoint_loss = float(loss)
+                self.best_checkpoint_step = loaded_step
+        self.logger.info("Loaded model weights from %s; resuming at step %d", weights_file, self.global_step)
+
     def train(self) -> None:
-        num_epochs = self.cfg.optimiser.num_epochs
+        max_steps = int(self.cfg.optimiser.max_train_steps)
+        if max_steps <= 0:
+            raise ValueError("optimizer.max_train_steps must be positive.")
         clip_norm = self.cfg.optimiser.clip_grad_norm
 
-        final_epoch_loss: Optional[float] = None
-        best_epoch_loss: float = float("inf")
+        final_cycle_loss: Optional[float] = None
+        best_cycle_loss: float = float("inf")
         accum_total_loss = 0.0
         accum_loss_by_vae = [0.0 for _ in self.dataloaders]
         accum_counts_by_vae = [0 for _ in self.dataloaders]
@@ -451,6 +609,7 @@ class VAETrainer:
         component_accum: Dict[str, float] = {}
         component_counts: Dict[str, int] = {}
         num_vaes = len(self.dataloaders)
+        cycle_index = 0
 
         def flush_accumulated() -> None:
             nonlocal accum_total_loss, accum_loss_by_vae, accum_counts_by_vae, accum_counter, component_accum, component_counts
@@ -485,36 +644,42 @@ class VAETrainer:
             component_accum = {}
             component_counts = {}
 
-        for epoch in tqdm(
-            range(1, num_epochs + 1),
-            desc="Training epochs",
-            unit="epoch",
-            disable=not self.accelerator.is_local_main_process,
-        ):
-            epoch_loss_totals = [0.0 for _ in self.dataloaders]
-
-            for loader in self.dataloaders:
-                sampler = getattr(loader, "sampler", None)
-                if sampler is not None and hasattr(sampler, "set_epoch"):
-                    sampler.set_epoch(epoch)
-
-            loader_iters = [iter(loader) for loader in self.dataloaders]
-
-            for _ in tqdm(
-                range(self.steps_per_epoch),
-                desc=f"Epoch {epoch} steps",
+        step_progress = (
+            tqdm(
+                total=max_steps,
+                initial=self.global_step,
+                desc="Training steps",
                 unit="step",
                 disable=not self.accelerator.is_local_main_process,
-            ):
-                for vae_index, loader_iter in enumerate(loader_iters):
-                    batch = next(loader_iter)
-                    with self.accelerator.accumulate(self.model):
-                        loss_value, step_metrics = self.step(batch)
-                        epoch_loss_totals[vae_index] += loss_value
-                        accum_total_loss += loss_value
-                        accum_loss_by_vae[vae_index] += loss_value
-                        accum_counts_by_vae[vae_index] += 1
-                        accum_counter += 1
+            )
+            if self.accelerator.is_local_main_process
+            else None
+        )
+
+        try:
+            while self.global_step < max_steps:
+                cycle_index += 1
+                cycle_loss_totals = [0.0 for _ in self.dataloaders]
+                cycle_counts_by_vae = [0 for _ in self.dataloaders]
+
+                for loader in self.dataloaders:
+                    sampler = getattr(loader, "sampler", None)
+                    if sampler is not None and hasattr(sampler, "set_epoch"):
+                        sampler.set_epoch(cycle_index)
+
+                loader_iters = [iter(loader) for loader in self.dataloaders]
+
+                for _ in range(self.steps_per_cycle):
+                    for vae_index, loader_iter in enumerate(loader_iters):
+                        batch = next(loader_iter)
+                        with self.accelerator.accumulate(self.model):
+                            loss_value, step_metrics = self.step(batch)
+                            cycle_loss_totals[vae_index] += loss_value
+                            cycle_counts_by_vae[vae_index] += 1
+                            accum_total_loss += loss_value
+                            accum_loss_by_vae[vae_index] += loss_value
+                            accum_counts_by_vae[vae_index] += 1
+                            accum_counter += 1
 
                         for name, value in step_metrics.items():
                             if name == "loss":
@@ -525,26 +690,59 @@ class VAETrainer:
                         if self.accelerator.sync_gradients:
                             self._optimizer_step(clip_norm)
                             flush_accumulated()
+                            self._maybe_save_periodic_checkpoint(self.global_step)
+                            if step_progress is not None:
+                                step_progress.update(1)
+                            if self.global_step >= max_steps:
+                                break
+                    if self.global_step >= max_steps:
+                        break
 
-            avg_losses = [total / max(1, self.steps_per_epoch) for total in epoch_loss_totals]
-            combined_avg = sum(avg_losses) / len(avg_losses)
-            final_epoch_loss = combined_avg
-            if combined_avg < best_epoch_loss:
-                best_epoch_loss = combined_avg
+                total_processed = sum(cycle_counts_by_vae)
+                if total_processed == 0:
+                    self.logger.warning("No batches processed during cycle %d; ending training early.", cycle_index)
+                    break
 
-            per_vae_summary = " | ".join(f"{name}=%.6f" % avg for name, avg in zip(self.vae_names, avg_losses))
-            self.logger.info("Epoch %d/%d | loss=%.6f | %s", epoch, num_epochs, combined_avg, per_vae_summary)
+                avg_losses = [
+                    cycle_loss_totals[idx] / max(1, cycle_counts_by_vae[idx]) for idx in range(len(self.dataloaders))
+                ]
+                combined_avg = sum(avg_losses) / max(1, len(avg_losses))
+                final_cycle_loss = combined_avg
+                if combined_avg < best_cycle_loss:
+                    best_cycle_loss = combined_avg
+                    self._save_best_checkpoint(min(self.global_step, max_steps), combined_avg)
 
-            if self.wandb_logger.is_active:
-                metrics = {"train/epoch_loss": combined_avg}
-                for suffix, avg in zip(self.vae_metric_names, avg_losses):
-                    metrics[f"train/epoch_loss/{suffix}"] = avg
-                self.wandb_logger.log(metrics, step=self.global_step)
+                per_vae_summary = " | ".join(f"{name}=%.6f" % avg for name, avg in zip(self.vae_names, avg_losses))
+                self.logger.info(
+                    "Cycle %d | step=%d/%d | loss=%.6f | %s",
+                    cycle_index,
+                    min(self.global_step, max_steps),
+                    max_steps,
+                    combined_avg,
+                    per_vae_summary,
+                )
+
+                if self.wandb_logger.is_active:
+                    metrics: Dict[str, float] = {
+                        "train/cycle_loss": combined_avg,
+                        "train/epoch_loss": combined_avg,
+                    }
+                    for suffix, avg in zip(self.vae_metric_names, avg_losses):
+                        metrics[f"train/cycle_loss/{suffix}"] = avg
+                        metrics[f"train/epoch_loss/{suffix}"] = avg
+                    self.wandb_logger.log(metrics, step=self.global_step)
+        finally:
+            if step_progress is not None:
+                step_progress.close()
+
+        flush_accumulated()
+        final_step = min(self.global_step, max_steps)
+        self._save_final_checkpoint(final_step, final_cycle_loss)
 
         if self.wandb_logger.is_active:
-            summary: Dict[str, Any] = {"best_epoch_loss": best_epoch_loss}
-            if final_epoch_loss is not None:
-                summary["final_loss"] = final_epoch_loss
+            summary: Dict[str, Any] = {"best_cycle_loss": best_cycle_loss}
+            if final_cycle_loss is not None:
+                summary["final_loss"] = final_cycle_loss
             self.wandb_logger.log_summary(summary)
             self.wandb_logger.finish()
         self.accelerator.wait_for_everyone()

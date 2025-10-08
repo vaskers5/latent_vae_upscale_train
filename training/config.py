@@ -136,7 +136,7 @@ class OptimizerConfig:
     batch_size: int
     base_learning_rate: float
     min_learning_rate: float
-    num_epochs: int
+    max_train_steps: int
     optimizer_type: str
     beta2: float
     eps: float
@@ -145,15 +145,25 @@ class OptimizerConfig:
     weight_decay: float
     gradient_accumulation_steps: int
     scheduler: str
+    legacy_num_epochs: Optional[int] = None
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "OptimizerConfig":
         section = data.get("optimizer", {})
+        raw_max_steps = section.get("max_train_steps", data.get("max_train_steps"))
+        max_train_steps = int(raw_max_steps) if raw_max_steps is not None else 0
+        raw_legacy_epochs = section.get("num_epochs", data.get("num_epochs"))
+        legacy_num_epochs = int(raw_legacy_epochs) if raw_legacy_epochs is not None else None
+        if max_train_steps <= 0:
+            if legacy_num_epochs is not None and legacy_num_epochs > 0:
+                max_train_steps = legacy_num_epochs
+            else:
+                raise ValueError("optimizer.max_train_steps must be a positive integer.")
         return cls(
             batch_size=int(section.get("batch_size", data.get("batch_size", 8))),
             base_learning_rate=float(section.get("base_learning_rate", data.get("base_learning_rate", 1e-4))),
             min_learning_rate=float(section.get("min_learning_rate", data.get("min_learning_rate", 1e-5))),
-            num_epochs=int(section.get("num_epochs", data.get("num_epochs", 10))),
+            max_train_steps=max_train_steps,
             optimizer_type=str(section.get("optimizer_type", data.get("optimizer_type", "adam8bit"))),
             beta2=float(section.get("beta2", data.get("beta2", 0.99))),
             eps=float(section.get("eps", data.get("eps", 1e-6))),
@@ -164,6 +174,7 @@ class OptimizerConfig:
                 section.get("gradient_accumulation_steps", data.get("gradient_accumulation_steps", 1))
             ),
             scheduler=str(section.get("scheduler", data.get("scheduler", "cosine"))).lower(),
+            legacy_num_epochs=legacy_num_epochs,
         )
 
 
@@ -301,6 +312,7 @@ class LoggingConfig:
     use_wandb: bool
     wandb_run_name: Optional[str]
     global_sample_interval: int
+    save_each_n_steps: int
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any], timestamp: str) -> "LoggingConfig":
@@ -308,7 +320,17 @@ class LoggingConfig:
         use_wandb = _resolve_bool(section.get("use_wandb", data.get("use_wandb", False)))
         run_name = section.get("wandb_run_name") or data.get("wandb_run_name") or timestamp
         sample_interval = int(section.get("global_sample_interval", data.get("GLOBAL_SAMPLE_INTERVAL", 500)))
-        return cls(use_wandb=use_wandb, wandb_run_name=run_name, global_sample_interval=max(1, sample_interval))
+        raw_save_steps = section.get("save_each_n_steps", data.get("save_each_n_steps", 0))
+        try:
+            save_steps = int(raw_save_steps)
+        except (TypeError, ValueError):
+            save_steps = 0
+        return cls(
+            use_wandb=use_wandb,
+            wandb_run_name=run_name,
+            global_sample_interval=max(1, sample_interval),
+            save_each_n_steps=max(0, save_steps),
+        )
 
 
 @dataclass
@@ -324,6 +346,7 @@ class LatentUpscalerConfig:
     blocks: Optional[int]
     nerf_blocks: Optional[int]
     groups: Optional[int]
+    load_from: Optional[str]
     extra: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -343,6 +366,7 @@ class LatentUpscalerConfig:
             blocks=_maybe_int(section.get("blocks") or section.get("nerf_blocks")),
             nerf_blocks=_maybe_int(section.get("nerf_blocks")),
             groups=_maybe_int(section.get("groups")),
+            load_from=str(section.get("load_from") or data.get("latent_upscaler_load_from") or "").strip() or None,
             extra=dict(section),
         )
 
