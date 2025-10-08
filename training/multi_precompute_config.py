@@ -89,7 +89,6 @@ class ResolutionSpec:
 @dataclass
 class MultiPrecomputeDefaults:
     cache_subdir: str = "cache_embeddings"
-    variants_per_sample: int = 1
     batch_size: int = 16
     num_workers: int = 4
     resize_long_side: Optional[int] = None
@@ -97,11 +96,12 @@ class MultiPrecomputeDefaults:
     store_distribution: bool = True
     embeddings_dtype: torch.dtype = torch.float16
     device: Optional[str] = None
+    devices: Optional[List[str]] = None
+    image_csv: Optional[Path] = None
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "MultiPrecomputeDefaults":
         cache_subdir = str(data.get("cache_subdir", "cache_embeddings"))
-        variants = int(data.get("variants_per_sample", 1))
         batch = int(data.get("batch_size", 16))
         workers = int(data.get("num_workers", 4))
         resize = data.get("resize_long_side")
@@ -109,10 +109,34 @@ class MultiPrecomputeDefaults:
         store_distribution = data.get("store_distribution")
         dtype_value = data.get("embeddings_dtype")
         device = data.get("device")
+        devices_raw = data.get("devices")
+        image_csv_raw = (
+            data.get("image_csv")
+            or data.get("paths_csv")
+            or data.get("image_manifest")
+            or data.get("dataset_csv")
+        )
+
+        devices: Optional[List[str]]
+        if devices_raw is None:
+            devices = None
+        elif isinstance(devices_raw, str):
+            items = [part.strip() for part in devices_raw.split(",")]
+            devices = [item for item in items if item]
+        elif isinstance(devices_raw, (list, tuple, set)):
+            cleaned: List[str] = []
+            for entry in devices_raw:
+                text = str(entry).strip()
+                if text:
+                    cleaned.append(text)
+            devices = cleaned or None
+        else:
+            raise TypeError("defaults.devices must be a string, list, or tuple of device names")
+
+        image_csv = Path(image_csv_raw).expanduser() if image_csv_raw else None
 
         return cls(
             cache_subdir=cache_subdir,
-            variants_per_sample=max(1, variants),
             batch_size=max(1, batch),
             num_workers=max(0, workers),
             resize_long_side=int(resize) if resize is not None else None,
@@ -120,6 +144,8 @@ class MultiPrecomputeDefaults:
             store_distribution=_resolve_bool(store_distribution, default=True),
             embeddings_dtype=_resolve_dtype(dtype_value or "float16"),
             device=str(device) if device else None,
+            devices=devices,
+            image_csv=image_csv,
         )
 
 
@@ -138,12 +164,12 @@ class MultiVaeConfig:
     dataset_root: Optional[Path]
     dataset_subdir: Optional[Path]
     cache_subdir: Optional[Path]
-    variants_per_sample: Optional[int]
     batch_size: Optional[int]
     num_workers: Optional[int]
     resize_long_side: Optional[int]
     limit: Optional[int]
     store_distribution: Optional[bool]
+    image_csv: Optional[Path]
     resolutions: List[ResolutionSpec] = field(default_factory=list)
 
     @classmethod
@@ -168,12 +194,17 @@ class MultiVaeConfig:
         cache_subdir = data.get("cache_subdir")
         weights_dtype = data.get("weights_dtype")
         embeddings_dtype = data.get("embeddings_dtype")
-        variants = data.get("variants_per_sample")
         batch = data.get("batch_size")
         workers = data.get("num_workers")
         resize = data.get("resize_long_side")
         limit = data.get("limit")
         store_distribution = data.get("store_distribution")
+        image_csv_raw = (
+            data.get("image_csv")
+            or data.get("paths_csv")
+            or data.get("image_manifest")
+            or data.get("dataset_csv")
+        )
 
         slug = _slugify(name) or name.replace("/", "_")
 
@@ -191,7 +222,6 @@ class MultiVaeConfig:
             dataset_root=Path(dataset_root).expanduser() if dataset_root else None,
             dataset_subdir=Path(dataset_subdir).expanduser() if dataset_subdir else None,
             cache_subdir=Path(cache_subdir).expanduser() if cache_subdir else None,
-            variants_per_sample=int(variants) if variants is not None else None,
             batch_size=int(batch) if batch is not None else None,
             num_workers=int(workers) if workers is not None else None,
             resize_long_side=int(resize) if resize is not None else None,
@@ -199,6 +229,7 @@ class MultiVaeConfig:
             store_distribution=(
                 _resolve_bool(store_distribution) if store_distribution is not None else None
             ),
+            image_csv=Path(image_csv_raw).expanduser() if image_csv_raw else None,
             resolutions=resolutions,
         )
 
@@ -213,7 +244,6 @@ class MultiPrecomputeTask:
     model_resolution: int
     resize_long_side: int
     limit: int
-    variants_per_sample: int
     batch_size: int
     num_workers: int
     store_distribution: bool
@@ -226,6 +256,7 @@ class MultiPrecomputeTask:
     hf_auth_token: Optional[str]
     vae_kind: Optional[str]
     display_resolution: str
+    image_csv: Optional[Path]
 
 
 @dataclass
@@ -268,9 +299,9 @@ class MultiPrecomputeConfig:
         *,
         dataset_root_override: Optional[Path] = None,
         cache_override: Optional[Path] = None,
-        variants_override: Optional[int] = None,
         batch_override: Optional[int] = None,
         workers_override: Optional[int] = None,
+        image_csv_override: Optional[Path] = None,
     ) -> List[MultiPrecomputeTask]:
         base_dataset_root = dataset_root_override or self.dataset_root
         if base_dataset_root is None:
@@ -315,7 +346,6 @@ class MultiPrecomputeConfig:
                     else (cache_root / model.cache_subdir).resolve()
                 )
 
-            variants = variants_override or model.variants_per_sample or self.defaults.variants_per_sample
             base_batch = batch_override or model.batch_size or self.defaults.batch_size
             workers = workers_override or model.num_workers or self.defaults.num_workers
             resize = model.resize_long_side if model.resize_long_side is not None else self.defaults.resize_long_side
@@ -324,6 +354,23 @@ class MultiPrecomputeConfig:
                 model.store_distribution if model.store_distribution is not None else self.defaults.store_distribution
             )
             embeddings_dtype = model.embeddings_dtype or self.defaults.embeddings_dtype
+            if image_csv_override is not None:
+                manifest_candidate = image_csv_override.expanduser()
+            else:
+                manifest_candidate = (model.image_csv or self.defaults.image_csv)
+
+            if manifest_candidate is not None:
+                manifest_candidate = manifest_candidate.expanduser()
+                if manifest_candidate.is_absolute():
+                    manifest_path = manifest_candidate.resolve()
+                else:
+                    candidate_in_dataset = (base_dataset_root / manifest_candidate).resolve()
+                    if candidate_in_dataset.exists():
+                        manifest_path = candidate_in_dataset
+                    else:
+                        manifest_path = manifest_candidate.resolve()
+            else:
+                manifest_path = None
 
             base_batch = max(1, int(base_batch))
             last_high_resolution: Optional[int] = None
@@ -356,7 +403,6 @@ class MultiPrecomputeConfig:
                         model_resolution=resolution.model_resolution,
                         resize_long_side=int(resize_long_side),
                         limit=int(limit) if limit is not None else 0,
-                        variants_per_sample=max(1, int(variants)),
                         batch_size=effective_batch,
                         num_workers=max(0, int(workers)),
                         store_distribution=bool(store_distribution),
@@ -369,6 +415,7 @@ class MultiPrecomputeConfig:
                         hf_auth_token=model.hf_auth_token,
                         vae_kind=model.vae_kind,
                         display_resolution=resolution.display,
+                        image_csv=manifest_path,
                     )
                 )
 

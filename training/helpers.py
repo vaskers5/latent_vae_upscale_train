@@ -12,6 +12,20 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+from .models import SwinIR
+
+
+def _as_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "yes", "y"}:
+            return True
+        if lowered in {"false", "0", "no", "n"}:
+            return False
+    return bool(value)
+
 
 # ---------------------------
 # Small utility components
@@ -316,14 +330,76 @@ def get_latent_upscaler(model_name: str, channels: int, **kwargs) -> nn.Module:
     """
     Build a latent upscaler by name.
     model_name in {
-        'swin',                 # LatentSwinUpscaler
+        'swin',                 # SwinIR (official implementation)
+        'swinir',               # alias for SwinIR
+        'swin_lite',            # LatentSwinUpscaler (lightweight)
         'naf',                  # LatentNAFUpscaler
         'swin_liif',            # LatentSwinLIIFUpscaler (2× here)
         'naf_freq',             # LatentNAFUpscalerFreq
     }
     """
     name = model_name.lower()
-    if name == 'swin':
+    if name in {'swin', 'swinir'}:
+        window = int(kwargs.get('window', 8))
+        patch_size = int(kwargs.get('patch_size', 1))
+        mlp_ratio = float(kwargs.get('mlp_ratio', 4.0))
+        embed_dim = int(kwargs.get('embed_dim', max(64, channels * 4)))
+
+        stages = int(kwargs.get('stages', 4))
+        depths_raw = kwargs.get('depths')
+        if depths_raw is None:
+            base_depth = int(kwargs.get('depth', 6))
+            depth_values = tuple(base_depth for _ in range(max(1, stages)))
+        elif isinstance(depths_raw, (list, tuple)):
+            depth_values = tuple(int(d) for d in depths_raw)
+            stages = len(depth_values)
+        else:
+            depth_values = tuple(int(depths_raw) for _ in range(max(1, stages)))
+
+        heads_raw = kwargs.get('num_heads') or kwargs.get('heads')
+        if heads_raw is None:
+            base_heads = int(kwargs.get('heads', 6))
+            num_heads = tuple(base_heads for _ in range(len(depth_values)))
+        elif isinstance(heads_raw, (list, tuple)):
+            num_heads = tuple(int(h) for h in heads_raw)
+        else:
+            num_heads = tuple(int(heads_raw) for _ in range(len(depth_values)))
+        if len(num_heads) != len(depth_values):
+            num_heads = tuple(num_heads[0] for _ in range(len(depth_values)))
+
+        drop_rate = float(kwargs.get('drop_rate', 0.0))
+        attn_drop_rate = float(kwargs.get('attn_drop_rate', 0.0))
+        drop_path_rate = float(kwargs.get('drop_path_rate', 0.1))
+        ape = _as_bool(kwargs.get('ape', False), default=False)
+        patch_norm = _as_bool(kwargs.get('patch_norm', True), default=True)
+        use_checkpoint = _as_bool(kwargs.get('use_checkpoint', False), default=False)
+        resi_connection = str(kwargs.get('resi_connection', '1conv'))
+        upsampler = str(kwargs.get('upsampler', 'pixelshuffle'))
+        img_range = float(kwargs.get('img_range', 1.0))
+        scale = int(kwargs.get('scale', 2))
+        img_size = int(kwargs.get('img_size', window * patch_size))
+
+        return SwinIR(
+            img_size=img_size,
+            patch_size=patch_size,
+            in_chans=channels,
+            embed_dim=embed_dim,
+            depths=depth_values,
+            num_heads=num_heads,
+            window_size=window,
+            mlp_ratio=mlp_ratio,
+            drop_rate=drop_rate,
+            attn_drop_rate=attn_drop_rate,
+            drop_path_rate=drop_path_rate,
+            ape=ape,
+            patch_norm=patch_norm,
+            use_checkpoint=use_checkpoint,
+            upscale=scale,
+            img_range=img_range,
+            upsampler=upsampler,
+            resi_connection=resi_connection,
+        )
+    if name in {'swin_lite', 'swinlite'}:
         return LatentSwinUpscaler(channels=channels,
                                   depth=kwargs.get('depth', 4),
                                   heads=kwargs.get('heads', 4),

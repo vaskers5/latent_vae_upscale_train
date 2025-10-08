@@ -1,47 +1,55 @@
 # Basic configuration for precomputing latent embeddings compatible with the test dataset.
-dataset_root: ./datasets/full_dataset
+dataset_root: ./unpacked_original_ds/full_dataset
 cache_root: cache_vae_embeddings
 
 defaults:
-  variants_per_sample: 1
-  num_workers: 24
-  embeddings_dtype: float16
+  num_workers: 6
+  embeddings_dtype: float32
   store_distribution: true
+  image_csv: ./clear_images.csv
+  devices:
+    - cuda:0
+    - cuda:1
+    - cuda:2
+    - cuda:3
+    # - cuda:4
+    # - cuda:5
+    # - cuda:6
+    # - cuda:7
 
 models:
-  # sd_vae:
-  #   hf_repo: stabilityai/sd-vae-ft-mse
-  #   vae_kind: kl
-  #   weights_dtype: float32
-  #   cache_subdir: sd_vae
-  #   resolutions_with_batchsize:
-  #     - [128, 512]
-  #     - [256, 224]
-  #     - [512, 100]
-  # sd_vae_midjourneyv6:
-  #   hf_repo: lavinal712/sd-vae-ft-mse-midjourneyv6
-  #   vae_kind: kl
-  #   weights_dtype: float32
-  #   cache_subdir: sd_vae_midjourneyv6
-  #   resolutions_with_batchsize:
-  #     - [128, 512]
-  #     - [256, 224]
-  #     - [512, 100]
   flux_vae:
     hf_repo: wolfgangblack/flux_vae
     vae_kind: kl
-    weights_dtype: float32
     cache_subdir: flux_vae
     resolutions_with_batchsize:
-      - [128, 512]
+      - [128, 1024]
       - [256, 224]
-      # - [512, 48]
+      - [512, 48]
   sd3_vae_anime_ft:
     hf_repo: Disty0/sd3_vae_anime_ft
     vae_kind: kl
-    weights_dtype: float32
     cache_subdir: sd3_vae_anime_ft
     resolutions_with_batchsize:
-      - [128, 512]
+      - [128, 1024]
       - [256, 128]
-      # - [512, 32]
+      - [512, 32]
+  ostris_vae:
+    hf_repo: ostris/vae-kl-f8-d16
+    vae_kind: kl
+    weights_dtype: float32
+    cache_subdir: ostris_vae
+    resolutions_with_batchsize:
+      - [128, 1024]
+      - [256, 512]
+      - [512, 64]
+  AuraDiffusion_16ch_vae:
+    hf_repo: AuraDiffusion/16ch-vae
+    vae_kind: kl
+    weights_dtype: float32
+    cache_subdir: AuraDiffusion_16ch_vae
+    resolutions_with_batchsize:
+      - [128, 1024]
+      - [256, 512]
+      - [512, 64]
+    

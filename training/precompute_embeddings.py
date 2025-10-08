@@ -7,7 +7,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Iterable, List, Sequence
+from typing import Callable, Iterable, List, Sequence
 
 import torch
 from diffusers import (
@@ -27,6 +27,7 @@ __all__ = ["main", "parse_args"]
 
 
 def parse_args() -> argparse.Namespace:
+    print("[Embeddings] Parsing command-line arguments...")
     parser = argparse.ArgumentParser(description="Precompute latent embeddings for one or more VAEs")
     parser.add_argument("--config", type=Path, required=True, help="Path to the multi-VAE YAML config")
     parser.add_argument(
@@ -58,12 +59,6 @@ def parse_args() -> argparse.Namespace:
         help="Optional list of torch devices used to run tasks in parallel (e.g. cuda:0 cuda:1)",
     )
     parser.add_argument(
-        "--variants-per-sample",
-        type=int,
-        default=None,
-        help="Number of cached variants to generate per image",
-    )
-    parser.add_argument(
         "--batch-size",
         type=int,
         default=None,
@@ -85,11 +80,20 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip tasks whose caches are already complete (validated before encoding)",
     )
+    parser.add_argument(
+        "--image-csv",
+        type=Path,
+        default=None,
+        help="Override the CSV manifest listing images to encode",
+    )
 
-    return parser.parse_args()
+    args = parser.parse_args()
+    print(f"[Embeddings] Arguments parsed: config={args.config}, dataset_root={args.dataset_root}, device={args.device}, etc.")
+    return args
 
 
 def _load_vae(task: MultiPrecomputeTask) -> torch.nn.Module:
+    print(f"[Embeddings] Loading VAE for task '{task.vae_name}'...")
     load_path = Path(task.load_from).expanduser() if task.load_from else None
     path_exists = load_path is not None and load_path.exists()
 
@@ -143,7 +147,7 @@ def _load_vae(task: MultiPrecomputeTask) -> torch.nn.Module:
                 vae = AsymmetricAutoencoderKL.from_pretrained(source, **kwargs)
 
     display_source = str(load_path) if path_exists else source
-    print(f"[Embeddings] Loading VAE from: {display_source}")
+    print(f"[Embeddings] VAE loaded from: {display_source}")
     return vae
 
 def _parse_device_string(spec: str) -> torch.device:
@@ -206,25 +210,20 @@ def _ensure_cuda_context(device: torch.device) -> None:
         torch.cuda.set_device(device)
 
 
-def _ensure_expected_counts(cache: EmbeddingCache, image_paths: Iterable[Path], expected_variants: int) -> None:
+def _ensure_expected_counts(cache: EmbeddingCache, image_paths: Iterable[Path]) -> None:
     paths = list(image_paths)
-    missing: List[Path] = []
-    for path in paths:
-        variants = cache.available_variants(path)
-        if len(variants) != expected_variants:
-            missing.append(path)
+    missing = [path for path in paths if not cache.has_variant(path, 0)]
 
     if missing:
         raise RuntimeError(
-            f"Embedding cache is incomplete. Expected {expected_variants} variant(s) per image but "
+            f"Embedding cache is incomplete. Expected one embedding per image but "
             f"{len(missing)} file(s) are missing."
         )
 
-    expected_total = len(paths) * expected_variants
-    produced = len([p for p in cache.cache_root.rglob("*.pt") if p.is_file()])
-    if produced != expected_total:
+    produced = sum(1 for path in paths if cache.has_variant(path, 0))
+    if produced != len(paths):
         raise RuntimeError(
-            f"Embedding count mismatch: expected {expected_total} cache files, found {produced}."
+            f"Embedding count mismatch: expected {len(paths)} cache files, found {produced}."
         )
 
 
@@ -236,8 +235,13 @@ def _execute_task(
     skip_existing: bool,
     index: int,
     total: int,
+    progress_position: int | None = None,
+    progress_desc: str | None = None,
+    log: Callable[[str], None] | None = None,
 ) -> None:
-    print(
+    logger = log or print
+
+    logger(
         f"[Embeddings] Task {index}/{total} :: {task.vae_name} at {task.display_resolution}"
         f" [device={device}]"
     )
@@ -259,7 +263,6 @@ def _execute_task(
         enabled=True,
         cache_dir=task.cache_dir,
         dtype=task.embeddings_dtype,
-        variants_per_sample=task.variants_per_sample,
         overwrite=overwrite,
         precompute_batch_size=task.batch_size,
         num_workers=task.num_workers,
@@ -269,6 +272,7 @@ def _execute_task(
     )
 
     cache = EmbeddingCache(embeddings_cfg, dataset_cfg, task.dataset_path)
+    logger(f"[Embeddings] EmbeddingCache initialized for task '{task.vae_name}'")
 
     dataset = ImageFolderDataset(
         root=task.dataset_path,
@@ -277,15 +281,17 @@ def _execute_task(
         limit=task.limit,
         embedding_cache=None,
         model_resolution=task.model_resolution,
+        paths_csv=task.image_csv,
     )
+    logger(f"[Embeddings] Dataset created: Collected {len(dataset.paths)} paths")
 
     if skip_existing and not overwrite:
         try:
-            _ensure_expected_counts(cache, dataset.paths, embeddings_cfg.variants_per_sample)
+            _ensure_expected_counts(cache, dataset.paths)
         except RuntimeError:
             pass
         else:
-            print(
+            logger(
                 (
                     f"[Embeddings] Cache already complete for {task.vae_name}"
                     f" ({task.display_resolution}); skipping."
@@ -294,6 +300,7 @@ def _execute_task(
             return
 
     start = time.perf_counter()
+    logger(f"[Embeddings] Starting VAE encoding for task '{task.vae_name}'...")
 
     _ensure_cuda_context(device)
     vae = _load_vae(task)
@@ -302,6 +309,7 @@ def _execute_task(
         to_kwargs["dtype"] = task.weights_dtype
     vae = vae.to(**to_kwargs)
     vae.eval()
+    logger(f"[Embeddings] VAE moved to device {device} with dtype {to_kwargs.get('dtype', 'default')}")
 
     cache.ensure_populated(
         dataset,
@@ -310,12 +318,15 @@ def _execute_task(
         encode_dtype=next(vae.parameters()).dtype,
         seed=0,
         accelerator=None,
+        progress_position=progress_position,
+        progress_desc=progress_desc,
+        log=logger,
     )
 
-    _ensure_expected_counts(cache, dataset.paths, embeddings_cfg.variants_per_sample)
+    _ensure_expected_counts(cache, dataset.paths)
     elapsed = time.perf_counter() - start
 
-    print(
+    logger(
         f"[Embeddings] Finished {task.vae_name} ({task.display_resolution}) in {elapsed:.1f}s"
     )
 
@@ -323,6 +334,7 @@ def _execute_task(
     if device.type == "cuda":
         _ensure_cuda_context(device)
         torch.cuda.empty_cache()
+        logger(f"[Embeddings] CUDA cache cleared for device {device}")
 
 
 def _run_parallel_tasks(
@@ -336,56 +348,89 @@ def _run_parallel_tasks(
     enumerator = iter(enumerate(tasks, start=1))
     total = len(tasks)
 
+    from tqdm.auto import tqdm
+
+    tqdm.set_lock(threading.RLock())
+    overall_progress = tqdm(
+        total=total,
+        desc="VAE tasks",
+        position=len(devices),
+        leave=True,
+        dynamic_ncols=True,
+        unit="task",
+    )
+    log = tqdm.write
+    device_positions = {str(device): idx for idx, device in enumerate(devices)}
+
     def worker(device: torch.device) -> None:
         _ensure_cuda_context(device)
+        position = device_positions[str(device)]
         while True:
             with lock:
                 try:
                     index, task = next(enumerator)
                 except StopIteration:
                     return
-            _execute_task(
-                task,
-                device=device,
-                overwrite=overwrite,
-                skip_existing=skip_existing,
-                index=index,
-                total=total,
-            )
+            desc = f"{task.vae_name} ({task.display_resolution})"
+            try:
+                _execute_task(
+                    task,
+                    device=device,
+                    overwrite=overwrite,
+                    skip_existing=skip_existing,
+                    index=index,
+                    total=total,
+                    progress_position=position,
+                    progress_desc=desc,
+                    log=log,
+                )
+            except Exception:
+                raise
+            else:
+                overall_progress.update(1)
 
-    with ThreadPoolExecutor(max_workers=len(devices)) as executor:
-        futures = [executor.submit(worker, device) for device in devices]
-        for future in futures:
-            # Propagate any exception raised inside the worker threads.
-            future.result()
+    try:
+        with ThreadPoolExecutor(max_workers=len(devices)) as executor:
+            futures = [executor.submit(worker, device) for device in devices]
+            for future in futures:
+                # Propagate any exception raised inside the worker threads.
+                future.result()
+    finally:
+        overall_progress.close()
 
 
 def _run_from_config(args: argparse.Namespace) -> None:
+    print("[Embeddings] Loading configuration...")
     raw_config = load_config([args.config])
     multi_cfg = MultiPrecomputeConfig.from_dict(raw_config)
+    print("[Embeddings] Configuration loaded successfully")
 
     dataset_override = args.dataset_root.expanduser() if args.dataset_root else None
     cache_override = Path(args.cache_subdir).expanduser() if args.cache_subdir else None
-    variants_override = int(args.variants_per_sample) if args.variants_per_sample is not None else None
     batch_override = int(args.batch_size) if args.batch_size is not None else None
     workers_override = int(args.num_workers) if args.num_workers is not None else None
+    image_csv_override = args.image_csv.expanduser() if args.image_csv else None
 
+    print("[Embeddings] Generating tasks from configuration...")
     tasks = multi_cfg.generate_tasks(
         dataset_root_override=dataset_override,
         cache_override=cache_override,
-        variants_override=variants_override,
         batch_override=batch_override,
         workers_override=workers_override,
+        image_csv_override=image_csv_override,
     )
+    print(f"[Embeddings] Generated {len(tasks)} task(s)")
 
     if not tasks:
         raise RuntimeError("No VAE tasks were defined in the configuration file")
 
+    default_device_list = multi_cfg.defaults.devices
     devices = _resolve_device_list(
         single_device=args.device,
-        device_list=args.devices,
+        device_list=args.devices if args.devices is not None else default_device_list,
         default_device=multi_cfg.defaults.device,
     )
+    print(f"[Embeddings] Resolved {len(devices)} device(s): {[str(d) for d in devices]}")
 
     print(
         f"[Embeddings] Prepared {len(tasks)} task(s) for multi-VAE precomputation"
@@ -396,7 +441,9 @@ def _run_from_config(args: argparse.Namespace) -> None:
 
     if len(devices) == 1:
         device = devices[0]
+        print(f"[Embeddings] Running tasks sequentially on single device {device}")
         for index, task in enumerate(tasks, start=1):
+            desc = f"{task.vae_name} ({task.display_resolution})"
             _execute_task(
                 task,
                 device=device,
@@ -404,8 +451,10 @@ def _run_from_config(args: argparse.Namespace) -> None:
                 skip_existing=args.skip_existing,
                 index=index,
                 total=len(tasks),
+                progress_desc=desc,
             )
     else:
+        print(f"[Embeddings] Running tasks in parallel on {len(devices)} devices")
         _run_parallel_tasks(
             tasks,
             devices,

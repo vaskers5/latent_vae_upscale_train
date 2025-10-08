@@ -6,16 +6,16 @@
 project: pixnerf-upscale
 save_root_dir: ./runs
 # Absolute or relative path to the dataset root.
-ds_path: ./datasets/test_dataset
+ds_path: ./datasets/full_dataset
 # Optional experiment metadata used when creating the run directory layout.
-exp_name: pixnerf-upscale-baseline
+exp_name: pixnerf-upscale-multiloss
 generated_folder_name: samples
 seed: 1337
 
 # --- DatasetConfig section ---
 dataset:
-  high_resolution: 512
-  model_resolution: 256
+  high_resolution: 256
+  model_resolution: 128
   resize_long_side: 0
   limit: 0
   num_workers: 24
@@ -25,7 +25,7 @@ optimizer:
   batch_size: 512
   base_learning_rate: 0.005
   min_learning_rate: 0.0001
-  num_epochs: 250
+  max_train_steps: 78000
   optimizer_type: adamw
   beta2: 0.99
   eps: 1.0e-08
@@ -43,19 +43,19 @@ model:
   hf_revision: main
   hf_auth_token: null
   vae_kind: kl
-  weights_dtype: bf16
+  weights_dtype: float32
   sample_vaes:
     flux:
-      load_from: ./weights/flux_vae.ckpt
-      hf_repo: black-forest-labs/FLUX.1-schnell
+      # load_from: ./weights/flux_vae.ckpt
+      hf_repo: wolfgangblack/flux_vae
       hf_subfolder: vae
       hf_revision: main
       hf_auth_token: null
       vae_kind: kl
-      weights_dtype: float16
+      weights_dtype: float32
     sdxl:
-      load_from: null
-      hf_repo: stabilityai/sdxl-vae
+      # load_from: null
+      hf_repo: Disty0/sd3_vae_anime_ft
       hf_subfolder: null
       hf_revision: main
       hf_auth_token: null
@@ -65,33 +65,50 @@ model:
 # --- LossConfig section ---
 loss:
   lpips_backbone: vgg
+  components:
+    - type: MSELoss
+      name: latent_mse
+      loss_weight: 0.2
+      reduction: mean
+    - type: L1Loss
+      name: latent_l1
+      loss_weight: 0.6
+      reduction: mean
+    - type: WeightedTVLoss
+      name: smooth_tv
+      loss_weight: 0.2
+      reduction: mean
+      inputs:
+        - pred
+
 
 # --- LoggingConfig section ---
 logging:
   use_wandb: true
   wandb_run_name: pixnerf-upscale
-  global_sample_interval: 1000
+  global_sample_interval: 2000
+  save_each_n_steps: 3000
 
 # --- LatentUpscalerConfig section ---
 latent_upscaler:
   model_name: swin
-  model: swin
   window: 8
   depth: 6
-  heads: 4
-  mlp_ratio: 2.0
-  liif_hidden: 256
-  patch_size: 4
-  blocks: 256
-  nerf_blocks: 128
-  groups: 4
+  heads: 8
+  mlp_ratio: 4.0
+  patch_size: 1
+  embed_dim: 128
+  depths: [6, 6, 6, 6]
+  num_heads: [8, 8, 8, 8]
+  drop_path_rate: 0.2
+  upsampler: pixelshuffle
+  load_from: null
 
 # --- EmbeddingsConfig section ---
 embeddings:
   enabled: true
   cache_dir: ./cache_vae_embeddings
-  dtype: float16
-  variants_per_sample: 2
+  dtype: float32
   overwrite: false
   precompute_batch_size: 64
   precompute_num_workers: 4
