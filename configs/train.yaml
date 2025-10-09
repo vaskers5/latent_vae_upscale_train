@@ -112,6 +112,7 @@ embeddings:
   precompute_batch_size: 64
   precompute_num_workers: 4
   store_distribution: true
+  csv_path: ../clear_images_with_embeddings.csv
   vae_names:
     - flux_vae
     - sd3_vae_anime_ft

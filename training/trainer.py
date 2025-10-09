@@ -26,6 +26,30 @@ from .losses import LossManager
 from .sample_logging import SampleLogger
 from .wandb_logger import WandbLogger
 
+import logging
+import math
+import random
+import json
+import shutil
+from dataclasses import asdict, is_dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+import torch
+from accelerate import Accelerator
+from torch import nn
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+
+from .config import TrainingConfig, _resolve_bool
+from .dataset import UpscaleDataset
+from .helpers import get_latent_upscaler
+from .losses import LossManager
+from .sample_logging import SampleLogger
+from .wandb_logger import WandbLogger
+
 __all__ = ["VAETrainer", "run"]
 
 
@@ -103,6 +127,7 @@ class VAETrainer:
                 cache_dir=str(cache_dir),
                 low_res=low_res,
                 high_res=high_res,
+                csv_path=str(self.cfg.embeddings.csv_path) if self.cfg.embeddings.csv_path else None,
             )
             if len(dataset) == 0:
                 raise RuntimeError(f"No latent pairs were found in cache '{cache_dir}' for VAE '{name}'.")

@@ -197,9 +197,16 @@ class ImageFolderDataset(Dataset):
 class UpscaleDataset(Dataset):
     """Dataset that loads precomputed low/high resolution tensor pairs."""
 
-    def __init__(self, cache_dir: str, low_res: int, high_res: int) -> None:
-        print(f"[Dataset] Initializing UpscaleDataset with cache_dir={cache_dir}, low_res={low_res}, high_res={high_res}")
+    def __init__(self, cache_dir: str, low_res: int, high_res: int, csv_path: Optional[str] = None) -> None:
+        print(f"[Dataset] Initializing UpscaleDataset with cache_dir={cache_dir}, low_res={low_res}, high_res={high_res}, csv_path={csv_path}")
         self.pairs = []
+        if csv_path:
+            self._load_from_csv(csv_path, low_res, high_res)
+        else:
+            self._load_from_cache(cache_dir, low_res, high_res)
+        print(f"[Dataset] Collected {len(self.pairs)} valid low/high pairs")
+
+    def _load_from_cache(self, cache_dir: str, low_res: int, high_res: int) -> None:
         low_res_files = glob.glob(
             f"{cache_dir}/{low_res}px/**/*.pt", recursive=True
         )
@@ -211,7 +218,17 @@ class UpscaleDataset(Dataset):
             )
             if os.path.exists(high_path):
                 self.pairs.append((low_path, high_path))
-        print(f"[Dataset] Collected {len(self.pairs)} valid low/high pairs")
+
+    def _load_from_csv(self, csv_path: str, low_res: int, high_res: int) -> None:
+        df = pd.read_csv(csv_path)
+        for _, row in df.iterrows():
+            embeddings = eval(row['available_embeddings'])
+            low_embs = [e for e in embeddings if f'/{low_res}px/' in e]
+            high_embs = [e for e in embeddings if f'/{high_res}px/' in e]
+            for low_emb in low_embs:
+                high_emb = low_emb.replace(f'/{low_res}px/', f'/{high_res}px/')
+                if high_emb in high_embs:
+                    self.pairs.append((low_emb, high_emb))
 
     def __len__(self) -> int:
         return len(self.pairs)

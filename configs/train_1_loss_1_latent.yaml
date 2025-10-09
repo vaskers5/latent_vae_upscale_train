@@ -91,7 +91,7 @@ latent_upscaler:
   num_heads: [8, 8, 8, 8]
   drop_path_rate: 0.2
   upsampler: pixelshuffle
-  load_from: null
+  load_from: runs/2025_10_09_08_pixnerf-upscale-multiloss/best/
 
 # --- EmbeddingsConfig section ---
 embeddings:
@@ -102,6 +102,7 @@ embeddings:
   precompute_batch_size: 64
   precompute_num_workers: 4
   store_distribution: true
+  csv_path: ./clear_images_with_embeddings.csv
   vae_names:
     - flux_vae
     # - sd3_vae_anime_ft

@@ -400,6 +400,7 @@ class EmbeddingsConfig:
     store_distribution: bool
     vae_names: tuple[str, ...]
     vae_cache_dirs: tuple[Path, ...]
+    csv_path: Optional[Path] = None
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any], dataset_root: Path) -> "EmbeddingsConfig":
@@ -427,6 +428,11 @@ class EmbeddingsConfig:
             vae_names = [fallback]
         cache_dirs = [_resolve_cache_dir(cache_dir, name) for name in vae_names]
 
+        csv_path_raw = section.get("csv_path") or data.get("embeddings_csv_path")
+        csv_path = Path(csv_path_raw) if csv_path_raw else None
+        if csv_path and not csv_path.is_absolute():
+            csv_path = (dataset_root / csv_path).resolve()
+
         return cls(
             enabled=enabled,
             cache_dir=cache_dir,
@@ -437,6 +443,7 @@ class EmbeddingsConfig:
             store_distribution=store_distribution,
             vae_names=tuple(vae_names),
             vae_cache_dirs=tuple(cache_dirs),
+            csv_path=csv_path,
         )
 
 
