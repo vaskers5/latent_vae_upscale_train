@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""List image files in a dataset along with their file size and resolution."""
+"""
+List image files in a dataset, validate them against size and pixel limits,
+and optionally delete offending files.
+"""
 
 from __future__ import annotations
 
@@ -15,6 +18,9 @@ from typing import Iterator, Sequence
 from PIL import Image
 from tqdm.auto import tqdm
 
+# Disable Pillow's own limit since we are implementing our own check.
+Image.MAX_IMAGE_PIXELS = None
+
 IMAGE_EXTENSIONS: Sequence[str] = (
     ".png",
     ".jpg",
@@ -25,7 +31,11 @@ IMAGE_EXTENSIONS: Sequence[str] = (
     ".tiff",
 )
 
+# Default limit of 10 MB for file size
 MAX_IMAGE_SIZE_BYTES = 10 * 1024 * 1024
+# Default pixel limit, based on Pillow's default DecompressionBombWarning
+# 93438718 pixels is ~9.6k x 9.6k resolution
+MAX_IMAGE_PIXELS = 4000000
 COMBINED_HEADER: Sequence[str] = ("stage", "path", "size_bytes", "width", "height", "over_limit")
 
 
@@ -57,60 +67,89 @@ def _process_image(
     relative: bool,
     fail_on_error: bool,
     size_limit: int,
+    pixel_limit: int,  # NEW
+    delete: bool,      # NEW
 ) -> tuple[bool, str, int | None, int | None, int | None, str | None, bool]:
     path = Path(path_str)
     root = Path(root_str)
     display_path = format_display_path(path, root, relative)
+    width, height = None, None
 
+    # 1. Check file size first (it's cheap)
     try:
         size_bytes = path.stat().st_size
     except OSError as exc:
         if fail_on_error:
             raise
-        return (False, display_path, None, None, None, f"Could not read file size for {path}: {exc}", False)
+        return (False, display_path, None, None, None, f"Could not read file size: {exc}", False)
 
     if size_bytes > size_limit:
+        reason = f"File size {size_bytes} exceeds limit of {size_limit}"
+        if delete:
+            try:
+                path.unlink()
+                return (False, display_path, size_bytes, None, None, f"DELETED: {reason}", True)
+            except OSError as exc:
+                return (False, display_path, size_bytes, None, None, f"DELETE FAILED ({reason}): {exc}", True)
+        # Return as skipped if not deleting
         return (True, display_path, size_bytes, None, None, None, True)
 
+    # 2. Check image content (pixels, corruption)
     try:
-        image = Image.open(path_str)
-        width, height = image.size
-        image = image.convert("RGB")  # Ensure image is loaded
-        return (True, display_path, size_bytes, int(width), int(height), None, False)
-    except Exception as exc:  # pragma: no cover - guard rail
+        # Use 'with' to ensure the file handle is closed before a potential delete operation
+        with Image.open(path) as image:
+            width, height = image.size
+            num_pixels = width * height
+
+            if num_pixels > pixel_limit:
+                reason = f"Pixel count {num_pixels} exceeds limit of {pixel_limit}"
+                # The 'with' block will close the image, then we can delete below.
+            else:
+                image.convert("RGB")  # Fully load the image to check for internal errors
+                return (True, display_path, size_bytes, int(width), int(height), None, False)
+
+    except Exception as exc:  # Catches corrupt images, etc.
+        reason = f"Could not read image: {exc}"
+        if delete:
+            try:
+                path.unlink(missing_ok=True)
+                return (False, display_path, size_bytes, None, None, f"DELETED corrupt file: {reason}", False)
+            except OSError as unlink_exc:
+                return (False, display_path, size_bytes, None, None, f"DELETE FAILED (corrupt): {unlink_exc}", False)
+        # If not deleting, just report the error
         if fail_on_error:
             raise
-        return (
-            True,
-            display_path,
-            None,
-            None,
-            None,
-            f"Could not read image {path}: {exc}",
-            False,
-        )
+        return (True, display_path, size_bytes, None, None, f"Error processing {path}: {exc}", False)
+
+    # 3. This part is reached only if pixel count was too high. 'reason' is set.
+    if delete:
+        try:
+            path.unlink()
+            return (False, display_path, size_bytes, width, height, f"DELETED: {reason}", False)
+        except OSError as exc:
+            return (False, display_path, size_bytes, width, height, f"DELETE FAILED ({reason}): {exc}", False)
+
+    # If not deleting, report as an invalid file with a reason
+    return (True, display_path, size_bytes, width, height, f"INVALID: {reason}", False)
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Walk a dataset directory and output image file paths, file sizes, and resolutions. "
-            "All three stages (collect, size check, validate) are executed sequentially. "
-            "Skips decoding images larger than 10 MB."
+            "Walk a dataset directory, validate images, and optionally delete invalid ones."
         )
     )
     parser.add_argument(
         "--root",
         type=Path,
+        required=True,
         help="Path to the root of the dataset containing image files.",
     )
     parser.add_argument(
         "--output",
         "-o",
         type=Path,
-        help=(
-            "Optional path to a CSV file to save the combined results. Defaults to stdout."
-        ),
+        help="Optional path to a CSV file to save the combined results. Defaults to stdout.",
     )
     parser.add_argument(
         "--relative",
@@ -121,7 +160,6 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         "--extensions",
         type=str,
         nargs="+",
-        choices=None,
         default=None,
         help=(
             "Override the list of file extensions to consider as images. "
@@ -136,7 +174,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument(
         "--quiet",
         action="store_true",
-        help="Suppress warnings about unreadable images.",
+        help="Suppress warnings and info messages about individual images.",
     )
     parser.add_argument(
         "--no-progress",
@@ -153,10 +191,19 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         "--size-limit",
         type=int,
         default=MAX_IMAGE_SIZE_BYTES,
-        help=(
-            "Maximum file size in bytes to decode image resolutions. Files above this limit "
-            "will be reported but skipped for decoding. Defaults to 10485760 (10 MB)."
-        ),
+        help=f"Max file size in bytes to process. Defaults to {MAX_IMAGE_SIZE_BYTES} (10 MB).",
+    )
+    # NEW ARGUMENTS
+    parser.add_argument(
+        "--pixel-limit",
+        type=int,
+        default=MAX_IMAGE_PIXELS,
+        help=f"Max number of pixels (width * height). Defaults to {MAX_IMAGE_PIXELS}.",
+    )
+    parser.add_argument(
+        "--delete-offending",
+        action="store_true",
+        help="WARNING: Permanently deletes images that are corrupt or exceed size/pixel limits.",
     )
 
     args = parser.parse_args(argv)
@@ -166,6 +213,8 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         args.extensions = tuple(IMAGE_EXTENSIONS)
     if args.size_limit <= 0:
         parser.error("--size-limit must be a positive integer")
+    if args.pixel_limit <= 0: # NEW
+        parser.error("--pixel-limit must be a positive integer")
     return args
 
 
@@ -180,24 +229,15 @@ def run_stage_collect(
     logger.info("Found %d image files matching %s", len(paths), ", ".join(extensions))
 
     def rows() -> Iterator[tuple[str]]:
-        progress_bar = None
-        iterable = paths
-        try:
-            if show_progress:
-                progress_bar = tqdm(
-                    paths,
-                    total=len(paths),
-                    unit="image",
-                    desc="Collecting image paths",
-                    leave=False,
-                    disable=False,
-                )
-                iterable = progress_bar
-            for path in iterable:
-                yield (format_display_path(path, root, relative),)
-        finally:
-            if progress_bar is not None:
-                progress_bar.close()
+        iterable = tqdm(
+            paths,
+            total=len(paths),
+            unit="image",
+            desc="Collecting image paths",
+            disable=not show_progress,
+        )
+        for path in iterable:
+            yield (format_display_path(path, root, relative),)
 
     return (("path",), rows())
 
@@ -214,42 +254,26 @@ def run_stage_sizes(
     paths = resolve_image_paths(root, extensions)
 
     def rows() -> Iterator[tuple[str, int, bool]]:
-        progress_bar = None
-        iterable = paths
-        try:
-            if show_progress:
-                progress_bar = tqdm(
-                    paths,
-                    total=len(paths),
-                    unit="image",
-                    desc="Checking image sizes",
-                    leave=False,
-                    disable=False,
-                )
-                iterable = progress_bar
-            for path in iterable:
-                display_path = format_display_path(path, root, relative)
-                try:
-                    size_bytes = path.stat().st_size
-                except OSError as exc:
-                    message = f"Could not read file size for {path}: {exc}"
-                    if fail_on_error:
-                        raise
-                    logger.warning("%s", message)
-                    continue
+        iterable = tqdm(
+            paths,
+            total=len(paths),
+            unit="image",
+            desc="Checking image sizes",
+            disable=not show_progress,
+        )
+        for path in iterable:
+            display_path = format_display_path(path, root, relative)
+            try:
+                size_bytes = path.stat().st_size
+            except OSError as exc:
+                message = f"Could not read file size for {path}: {exc}"
+                if fail_on_error:
+                    raise
+                logger.warning("%s", message)
+                continue
 
-                over_limit = size_bytes > size_limit
-                if over_limit:
-                    logger.info(
-                        "File %s is %.2f MB (> %.2f MB limit)",
-                        display_path,
-                        size_bytes / (1024 * 1024),
-                        size_limit / (1024 * 1024),
-                    )
-                yield (display_path, size_bytes, over_limit)
-        finally:
-            if progress_bar is not None:
-                progress_bar.close()
+            over_limit = size_bytes > size_limit
+            yield (display_path, size_bytes, over_limit)
 
     return (("path", "size_bytes", "over_limit"), rows())
 
@@ -263,6 +287,8 @@ def run_stage_validate(
     max_workers: int | None,
     show_progress: bool,
     size_limit: int,
+    pixel_limit: int, # NEW
+    delete: bool,     # NEW
 ) -> tuple[tuple[str, ...], Iterator[tuple[str, int, int | None, int | None]]]:
     return (
         ("path", "size_bytes", "width", "height"),
@@ -275,6 +301,8 @@ def run_stage_validate(
             max_workers=max_workers,
             show_progress=show_progress,
             size_limit=size_limit,
+            pixel_limit=pixel_limit, # NEW
+            delete=delete,           # NEW
         ),
     )
 
@@ -302,9 +330,10 @@ def iter_images(
     max_workers: int | None,
     show_progress: bool,
     size_limit: int = MAX_IMAGE_SIZE_BYTES,
+    pixel_limit: int = MAX_IMAGE_PIXELS, # NEW
+    delete: bool = False,                # NEW
 ) -> Iterator[tuple[str, int, int | None, int | None]]:
     paths = resolve_image_paths(root, extensions)
-
     if not paths:
         return
 
@@ -316,48 +345,40 @@ def iter_images(
             repeat(relative),
             repeat(fail_on_error),
             repeat(size_limit),
+            repeat(pixel_limit), # NEW
+            repeat(delete),      # NEW
             chunksize=32,
         )
 
-        progress_bar = None
-        if show_progress:
-            progress_bar = tqdm(
-                results_iter,
-                total=len(paths),
-                unit="image",
-                desc="Processing images",
-                leave=False,
-                disable=False,
-            )
-            iterator = progress_bar
-        else:
-            iterator = results_iter
+        iterator = tqdm(
+            results_iter,
+            total=len(paths),
+            unit="image",
+            desc="Processing images",
+            disable=not show_progress,
+        )
 
-        try:
-            for (
-                success,
-                display_path,
-                size_bytes,
-                width,
-                height,
-                error_message,
-                skipped_for_size,
-            ) in iterator:
-                if skipped_for_size and size_bytes is not None:
-                    logger.info(
-                        "Skipping resolution read for %s (%.2f MB exceeds %.2f MB limit)",
-                        display_path,
-                        size_bytes / (1024 * 1024),
-                        size_limit / (1024 * 1024),
-                    )
-                if error_message:
-                    logger.warning("%s", error_message)
-                if not success:
-                    continue
-                yield (display_path, size_bytes, width, height)
-        finally:
-            if progress_bar is not None:
-                progress_bar.close()
+        for (
+            success,
+            display_path,
+            size_bytes,
+            width,
+            height,
+            error_message,
+            skipped_for_size,
+        ) in iterator:
+            if skipped_for_size and size_bytes is not None and not delete: # Don't log skips if we're deleting them
+                logger.info(
+                    "Skipping resolution read for %s (%.2f MB > %.2f MB limit)",
+                    display_path,
+                    size_bytes / (1024 * 1024),
+                    size_limit / (1024 * 1024),
+                )
+            if error_message:
+                logger.info("%s", error_message) # Changed to info to show DELETED messages
+            if not success:
+                continue
+            yield (display_path, size_bytes, width, height)
 
 
 def write_csv(
@@ -379,11 +400,30 @@ def write_csv(
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
-    logging.basicConfig(level=logging.WARNING if args.quiet else logging.INFO)
-    logger = logging.getLogger("image_sizes")
+    logging.basicConfig(level=logging.WARNING if args.quiet else logging.INFO, format="%(message)s")
+    logger = logging.getLogger("image_validator")
+
+    # NEW: Safety confirmation prompt before deleting files
+    if args.delete_offending:
+        print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!", file=sys.stderr)
+        print("!!! WARNING: --delete-offending is enabled.                !!!", file=sys.stderr)
+        print("!!! This will PERMANENTLY DELETE images from your disk.    !!!", file=sys.stderr)
+        print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!", file=sys.stderr)
+        try:
+            response = input(" > Type 'yes' to proceed with deletion: ")
+            if response.lower() != 'yes':
+                print("Aborted by user.", file=sys.stderr)
+                return 1
+        except (KeyboardInterrupt, EOFError):
+            print("\nAborted by user.", file=sys.stderr)
+            return 1
 
     try:
         show_progress = not args.no_progress and not args.quiet and sys.stderr.isatty()
+
+        # NOTE: The original script's logic of running three separate stages is inefficient
+        # as it walks the directory tree multiple times. This structure is preserved here,
+        # but a more optimized script might combine these into a single pass.
 
         _, collect_rows = run_stage_collect(
             root=args.root,
@@ -410,6 +450,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_workers=args.workers,
             show_progress=show_progress,
             size_limit=args.size_limit,
+            pixel_limit=args.pixel_limit,       # NEW
+            delete=args.delete_offending,       # NEW
         )
 
         rows = chain(

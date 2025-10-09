@@ -75,7 +75,7 @@ loss:
 logging:
   use_wandb: true
   wandb_run_name: pixnerf-upscale
-  global_sample_interval: 500
+  global_sample_interval: 1000
   save_each_n_steps: 3000
 
 # --- LatentUpscalerConfig section ---
@@ -91,7 +91,7 @@ latent_upscaler:
   num_heads: [8, 8, 8, 8]
   drop_path_rate: 0.2
   upsampler: pixelshuffle
-  load_from: runs/2025_10_09_08_pixnerf-upscale-multiloss/best/
+  # load_from: runs/2025_10_09_08_pixnerf-upscale-multiloss/best/
 
 # --- EmbeddingsConfig section ---
 embeddings:

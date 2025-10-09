@@ -6,6 +6,7 @@ df = pd.read_csv('result_cleared_df.csv')
 validate_df = df[df['stage'] == 'validate']
 clear_df = validate_df.dropna(subset=['width', 'size_bytes', 'height'])
 clear_df_normal_images = clear_df[clear_df['size_bytes'] < 10 * 1024 * 1024]
+clear_df_normal_images = clear_df.loc[~((clear_df.height +clear_df.width) > 10000)]
 clear_df_normal_images.to_csv('clear_images.csv', index=False)
 
 # Load the CSV with paths to keep
