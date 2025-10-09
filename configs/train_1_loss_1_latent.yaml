@@ -8,24 +8,24 @@ save_root_dir: ./runs
 # Absolute or relative path to the dataset root.
 ds_path: ./unpacked_original_ds/full_dataset
 # Optional experiment metadata used when creating the run directory layout.
-exp_name: pixnerf-upscale-multiloss
+exp_name: pixnerf-upscale-single_loss
 generated_folder_name: samples
 seed: 1337
 
 # --- DatasetConfig section ---
 dataset:
-  high_resolution: 256
-  model_resolution: 128
+  high_resolution: 512
+  model_resolution: 256
   resize_long_side: 0
   limit: 0
   num_workers: 24
 
 # --- OptimizerConfig section ---
 optimizer:
-  batch_size: 1024
+  batch_size: 164
   base_learning_rate: 0.005
   min_learning_rate: 0.0001
-  max_train_steps: 78000
+  max_train_steps: 75000
   optimizer_type: adamw
   beta2: 0.99
   eps: 1.0e-08
@@ -75,7 +75,7 @@ loss:
 logging:
   use_wandb: true
   wandb_run_name: pixnerf-upscale
-  global_sample_interval: 1000
+  global_sample_interval: 250
   save_each_n_steps: 3000
 
 # --- LatentUpscalerConfig section ---
@@ -84,14 +84,14 @@ latent_upscaler:
   window: 8
   depth: 6
   heads: 8
-  mlp_ratio: 4.0
+  mlp_ratio: 2.0
   patch_size: 1
-  embed_dim: 128
-  depths: [6, 6, 6, 6]
-  num_heads: [8, 8, 8, 8]
+  embed_dim: 180
+  depths: [6, 6, 6, 6, 6, 6]
+  num_heads: [6, 6, 6, 6, 6, 6]
   drop_path_rate: 0.2
   upsampler: pixelshuffle
-  # load_from: runs/2025_10_09_08_pixnerf-upscale-multiloss/best/
+  # load_from: pretrained_weights
 
 # --- EmbeddingsConfig section ---
 embeddings:

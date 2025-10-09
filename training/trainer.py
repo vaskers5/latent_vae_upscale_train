@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import math
 import random
 import json
 import shutil
@@ -19,36 +18,16 @@ from torch import nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from .config import TrainingConfig, _resolve_bool
+from training.models.swinir import SwinIR
+
+from .config import TrainingConfig
 from .dataset import UpscaleDataset
-from .helpers import get_latent_upscaler
 from .losses import LossManager
 from .sample_logging import SampleLogger
 from .wandb_logger import WandbLogger
 
-import logging
-import math
-import random
-import json
-import shutil
-from dataclasses import asdict, is_dataclass
-from datetime import datetime
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
 
-import numpy as np
-import torch
-from accelerate import Accelerator
-from torch import nn
-from torch.utils.data import DataLoader
-from tqdm import tqdm
 
-from .config import TrainingConfig, _resolve_bool
-from .dataset import UpscaleDataset
-from .helpers import get_latent_upscaler
-from .losses import LossManager
-from .sample_logging import SampleLogger
-from .wandb_logger import WandbLogger
 
 __all__ = ["VAETrainer", "run"]
 
@@ -195,80 +174,21 @@ class VAETrainer:
 
         upscaler_cfg = self.cfg.latent_upscaler
         upscaler_name = getattr(upscaler_cfg, "model_name", getattr(upscaler_cfg, "model", None)) or "swin"
-        upscaler_kwargs: Dict[str, Any] = {}
-        if upscaler_name.startswith("swin"):
-            window = getattr(upscaler_cfg, "window", None)
-            if window is None:
-                window = getattr(upscaler_cfg, "patch_size", None)
-            if window:
-                upscaler_kwargs["window"] = int(window)
-            depth = getattr(upscaler_cfg, "depth", None)
-            if depth:
-                upscaler_kwargs["depth"] = int(depth)
-            heads = getattr(upscaler_cfg, "heads", None)
-            if heads:
-                upscaler_kwargs["heads"] = int(heads)
-            mlp_ratio = getattr(upscaler_cfg, "mlp_ratio", None)
-            if mlp_ratio:
-                upscaler_kwargs["mlp_ratio"] = float(mlp_ratio)
-            extra_opts = getattr(upscaler_cfg, "extra", {}) or {}
-            embed_dim = extra_opts.get("embed_dim")
-            if embed_dim is not None:
-                upscaler_kwargs["embed_dim"] = int(embed_dim)
-            stages = extra_opts.get("stages")
-            if stages is not None:
-                upscaler_kwargs["stages"] = int(stages)
-            depths = extra_opts.get("depths")
-            if isinstance(depths, str):
-                tokens = [token.strip() for token in depths.split(",") if token.strip()]
-                try:
-                    depths = [int(token) for token in tokens]
-                except ValueError:
-                    depths = None
-            if depths is not None:
-                upscaler_kwargs["depths"] = depths
-            heads_list = extra_opts.get("num_heads") or extra_opts.get("num_heads_list")
-            if isinstance(heads_list, str):
-                tokens = [token.strip() for token in heads_list.split(",") if token.strip()]
-                try:
-                    heads_list = [int(token) for token in tokens]
-                except ValueError:
-                    heads_list = None
-            if heads_list is not None:
-                upscaler_kwargs["num_heads"] = heads_list
-            for key in ("drop_rate", "attn_drop_rate", "drop_path_rate", "img_range"):
-                value = extra_opts.get(key)
-                if value is not None:
-                    upscaler_kwargs[key] = float(value)
-            for key in ("img_size", "scale"):
-                value = extra_opts.get(key)
-                if value is not None:
-                    upscaler_kwargs[key] = int(value)
-            for key in ("ape", "patch_norm", "use_checkpoint"):
-                value = extra_opts.get(key)
-                if value is not None:
-                    upscaler_kwargs[key] = _resolve_bool(value, default=False)
-            for key in ("resi_connection", "upsampler"):
-                value = extra_opts.get(key)
-                if value is not None:
-                    upscaler_kwargs[key] = str(value)
-            if upscaler_name == "swin_liif":
-                liif_hidden = getattr(upscaler_cfg, "liif_hidden", None)
-                if liif_hidden:
-                    upscaler_kwargs["liif_hidden"] = int(liif_hidden)
-        elif upscaler_name.startswith("naf"):
-            blocks = getattr(upscaler_cfg, "blocks", None) or getattr(upscaler_cfg, "nerf_blocks", None)
-            if blocks:
-                upscaler_kwargs["blocks"] = int(blocks)
-            groups = getattr(upscaler_cfg, "groups", None)
-            if groups:
-                upscaler_kwargs["groups"] = int(groups)
 
-        self.model = get_latent_upscaler(
-            model_name=upscaler_name,
-            channels=channels,
-            **upscaler_kwargs,
+        self.model = SwinIR(
+        upscale=2,  # 2x upscaling
+        in_chans=16,  # RGB input
+        # img_size=16,  # Training patch size (matches DIV2K_s48w8)
+        window_size=8,  # Window size
+        img_range=1.0,  # Image range
+        depths=[6, 6, 6, 6, 6, 6],  # Depths for each stage (6 stages)
+        embed_dim=180,  # Embedding dimension
+        num_heads=[6, 6, 6, 6, 6, 6],  # Number of attention heads (6 stages)
+        mlp_ratio=2,  # MLP ratio
+        upsampler="pixelshuffle",  # Upsampler
+        resi_connection="1conv",  # Residual connection
         ).to(self.device)
+        
         self.upscaler_name = upscaler_name
         self.param_dtype = next(self.model.parameters()).dtype
         if self.cfg.losses.components:

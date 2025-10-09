@@ -220,7 +220,7 @@ class UpscaleDataset(Dataset):
                 self.pairs.append((low_path, high_path))
 
     def _load_from_csv(self, csv_path: str, low_res: int, high_res: int) -> None:
-        df = pd.read_csv(csv_path)
+        df = pd.read_csv(csv_path).sample(frac=0.3, random_state=42)
         for _, row in df.iterrows():
             embeddings = eval(row['available_embeddings'])
             low_embs = [e for e in embeddings if f'/{low_res}px/' in e]

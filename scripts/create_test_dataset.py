@@ -86,4 +86,3 @@ def main():
 
 if __name__ == "__main__":
     main()</content>
-<parameter name="filePath">/data/kazanplova/latent_vae_upscale_train/scripts/create_test_dataset.py
