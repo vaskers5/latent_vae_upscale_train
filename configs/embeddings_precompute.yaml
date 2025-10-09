@@ -10,38 +10,38 @@ defaults:
   devices:
     - cuda:0
     - cuda:1
-    - cuda:2
-    - cuda:3
+    # - cuda:2
+    # - cuda:3
     # - cuda:4
     # - cuda:5
     # - cuda:6
     # - cuda:7
 
 models:
-  flux_vae:
-    hf_repo: wolfgangblack/flux_vae
-    vae_kind: kl
-    cache_subdir: flux_vae
-    resolutions_with_batchsize:
-      - [128, 1024]
-      - [256, 224]
-      - [512, 48]
-  sd3_vae_anime_ft:
-    hf_repo: Disty0/sd3_vae_anime_ft
-    vae_kind: kl
-    cache_subdir: sd3_vae_anime_ft
-    resolutions_with_batchsize:
-      - [128, 1024]
-      - [256, 128]
-      - [512, 32]
+  # flux_vae:
+  #   hf_repo: wolfgangblack/flux_vae
+  #   vae_kind: kl
+  #   cache_subdir: flux_vae
+  #   resolutions_with_batchsize:
+  #     - [128, 1024]
+  #     - [256, 224]
+  #     - [512, 48]
+  # sd3_vae_anime_ft:
+  #   hf_repo: Disty0/sd3_vae_anime_ft
+  #   vae_kind: kl
+  #   cache_subdir: sd3_vae_anime_ft
+  #   resolutions_with_batchsize:
+  #     - [128, 1024]
+  #     - [256, 128]
+  #     - [512, 32]
   ostris_vae:
     hf_repo: ostris/vae-kl-f8-d16
     vae_kind: kl
     weights_dtype: float32
     cache_subdir: ostris_vae
     resolutions_with_batchsize:
-      - [128, 1024]
-      - [256, 512]
+      # - [128, 1024]
+      - [256, 256]
       - [512, 64]
   AuraDiffusion_16ch_vae:
     hf_repo: AuraDiffusion/16ch-vae
@@ -50,6 +50,6 @@ models:
     cache_subdir: AuraDiffusion_16ch_vae
     resolutions_with_batchsize:
       - [128, 1024]
-      - [256, 512]
+      - [256, 256]
       - [512, 64]
     
