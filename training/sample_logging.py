@@ -24,7 +24,7 @@ from diffusers import (
 import lpips
 import wandb
 import torchvision.transforms.functional as T
-from .config import SampleVaeConfig, TrainingConfig
+from .config import SampleVaeConfig, TrainingConfig, _resolve_dtype
 from .wandb_logger import WandbLogger
 
 __all__ = ["SampleLogger"]
@@ -264,6 +264,8 @@ class SampleLogger:
         hf_auth_token = spec.hf_auth_token if spec and spec.hf_auth_token else model_cfg.hf_auth_token
         kind = (spec.vae_kind if spec and spec.vae_kind else model_cfg.vae_kind or "").strip().lower()
         weights_dtype = spec.weights_dtype if spec and spec.weights_dtype else model_cfg.weights_dtype
+        if isinstance(weights_dtype, str):
+            weights_dtype = _resolve_dtype(weights_dtype)
 
         if kind == "qwen":
             if path_exists:
@@ -309,7 +311,9 @@ class SampleLogger:
                 else:
                     vae = AsymmetricAutoencoderKL.from_pretrained(source, **kwargs)
 
-        vae = vae.to(dtype=weights_dtype).eval()
+        if weights_dtype is not None:
+            vae = vae.to(dtype=weights_dtype)
+        vae = vae.eval()
         is_video = _is_video_vae(vae)
         return vae, is_video
 
@@ -344,8 +348,10 @@ class SampleLogger:
         *,
         treat_as_video: bool,
     ) -> torch.Tensor:
-        decoder_dtype = next(vae.parameters()).dtype
-        inputs = latents.to(dtype=decoder_dtype)
+        params = next(vae.parameters())
+        decoder_dtype = params.dtype
+        vae_device = params.device
+        inputs = latents.to(device=vae_device, dtype=decoder_dtype)
         if treat_as_video and inputs.dim() == 4:
             inputs = inputs.unsqueeze(2)
         try:
