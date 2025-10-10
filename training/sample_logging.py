@@ -525,27 +525,3 @@ class SampleLogger:
 
         if self._wandb is not None and self._wandb.is_active:
             self._wandb.log(log_payload, step=step)
-        plt.close(fig)
-
-        overall_scores = [score for result in results for score in result.lpips_scores]
-        overall_avg = float(np.mean(overall_scores)) if overall_scores else 0.0
-
-        log_payload: Dict[str, Any] = {
-            "samples/lpips_mean": overall_avg,
-            "samples/pairs": wandb.Image(
-                str(pairs_path),
-                caption=f"{rows} VAEs × {self.sample_count} samples (real + decoded)",
-            ),
-        }
-
-        for result in results:
-            if result.lpips_scores:
-                log_payload[f"samples/lpips_mean/{result.slug}"] = float(np.mean(result.lpips_scores))
-            for index, pair_path in enumerate(result.pair_paths):
-                log_payload[f"samples/{result.slug}/pair_{index}"] = wandb.Image(str(pair_path))
-            if result.primary_pair_paths:
-                for index, pair_path in enumerate(result.primary_pair_paths):
-                    log_payload[f"samples/pair_{index}"] = wandb.Image(str(pair_path))
-
-        if self._wandb is not None and self._wandb.is_active:
-            self._wandb.log(log_payload, step=step)
