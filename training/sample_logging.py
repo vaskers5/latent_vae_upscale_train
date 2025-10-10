@@ -46,7 +46,21 @@ _DEFAULT_SAMPLE_VAE_SOURCES: Dict[str, Dict[str, Any]] = {
 
 def _to_pil_uint8(tensor: torch.Tensor) -> Image.Image:
     """Convert a tensor in [-1, 1] to a uint8 PIL image."""
-    return T.to_pil_image(tensor)
+
+    tensor = tensor.detach().cpu()
+    tensor = torch.clamp(tensor, -1.0, 1.0)
+    tensor = torch.round((tensor + 1.0) * 127.5).clamp(0, 255).to(torch.uint8)
+
+    if tensor.ndim == 3:
+        if tensor.shape[0] == 1:
+            tensor = tensor[0]
+        else:
+            tensor = tensor.permute(1, 2, 0)
+    elif tensor.ndim != 2:
+        raise ValueError("Expected image tensor to have 2 or 3 dimensions.")
+
+    array = tensor.contiguous().numpy()
+    return Image.fromarray(array)
 
 
 
