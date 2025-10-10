@@ -23,7 +23,7 @@ from diffusers import (
 )
 import lpips
 import wandb
-
+import torchvision.transforms.functional as T
 from .config import SampleVaeConfig, TrainingConfig
 from .wandb_logger import WandbLogger
 
@@ -46,13 +46,8 @@ _DEFAULT_SAMPLE_VAE_SOURCES: Dict[str, Dict[str, Any]] = {
 
 def _to_pil_uint8(tensor: torch.Tensor) -> Image.Image:
     """Convert a tensor in [-1, 1] to a uint8 PIL image."""
+    return T.to_pil_image(tensor)
 
-    image = tensor.detach().cpu().clamp(-1.0, 1.0)
-    image = (image + 1.0) * 0.5  # [-1, 1] -> [0, 1]
-    image = image.mul(255.0).clamp(0.0, 255.0).byte()
-    if image.dim() == 4:
-        image = image.squeeze(0)
-    return Image.fromarray(image.permute(1, 2, 0).numpy())
 
 
 def _concat_side_by_side(left: Image.Image, right: Image.Image) -> Image.Image:
