@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import ast
-import os
 import shutil
 import warnings
+from collections import defaultdict
 from multiprocessing import Pool, cpu_count
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
 from PIL import Image
@@ -14,14 +14,21 @@ from tqdm.auto import tqdm
 
 
 CSV_PATH = Path("clear_images_with_maniqa_scores.csv")
-DESTINATION_ROOT = Path("upscale_df_quality_10k_per_metric_v1")
-COUNT_PER_METRIC = 10000
+DESTINATION_ROOT = Path("upscale_df_quality_100k_per_metric_v3")
+COUNT_PER_METRIC = 100000
 SAMPLE_SIZE = 10  # set to 0 to disable additional sampling
 MODEL_NAMES: Sequence[str] = ("flux_vae", "sd3_vae_anime_ft")
+# Required resolutions for each model - all must be present for an image to be included
+REQUIRED_RESOLUTIONS: Dict[str, List[str]] = {
+    "flux_vae": ["128px", "256px", "512px"],
+    "sd3_vae_anime_ft": ["128px", "256px", "512px"],
+}
 RESIZE_LONG_SIDE = 1024
-RESIZE_DIR_NAME = "resized_1024"
-RESIZE_WORKERS = 120
+IMAGE_WORKERS = 120
 EMBEDDING_WORKERS = 40
+DATASET_DIR_NAME = "dataset"
+IMAGES_SUBDIR = "images"
+EMBEDDINGS_SUBDIR = "train_embeddings"
 OVERWRITE_EXISTING = False
 REMOVE_DESTINATION_FIRST = True  # mirrors the explicit `rm -rf` step in the notebook
 VERBOSE = True
@@ -43,26 +50,16 @@ def _new_size(width: int, height: int, long_side: int) -> Tuple[int, int]:
     return max(1, int(round(width * scale))), max(1, int(round(height * scale)))
 
 
-def _iter_paths_maybe_nested(items: Iterable[Any]) -> Iterator[Path]:
-    for item in items:
-        if isinstance(item, (list, tuple, set)):
-            yield from _iter_paths_maybe_nested(item)
-        elif isinstance(item, (Path, str)):
-            yield Path(item)
-
-
-def _filter_by_model(paths: Iterable[Path], model_names: Optional[Sequence[str]]) -> Iterator[Path]:
+def _should_include_model(path: Path, model_names: Optional[Sequence[str]]) -> bool:
     if not model_names:
-        yield from paths
-        return
-    for candidate in paths:
-        candidate_str = str(candidate)
-        if any(name in candidate_str for name in model_names):
-            yield candidate
+        return True
+    candidate = str(path)
+    return any(name in candidate for name in model_names)
 
 
-def _resize_task(job: Tuple[str, str, int]) -> Tuple[str, Optional[str]]:
-    src, dst, long_side = job
+def _copy_and_resize_image(src: Path, dst: Path, long_side: int, overwrite: bool) -> Optional[str]:
+    if dst.exists() and not overwrite:
+        return "skipped"
     try:
         with warnings.catch_warnings():
             warnings.filterwarnings(
@@ -75,26 +72,88 @@ def _resize_task(job: Tuple[str, str, int]) -> Tuple[str, Optional[str]]:
                 new_size = _new_size(*image.size, long_side)
                 if new_size != image.size:
                     image = image.resize(new_size, Image.LANCZOS)
-                Path(dst).parent.mkdir(parents=True, exist_ok=True)
+                dst.parent.mkdir(parents=True, exist_ok=True)
                 image.save(dst)
-        return src, None
+        return None
     except UserWarning:
-        return src, "skipped: palette transparency (bytes)"
+        return "skipped: palette transparency (bytes)"
     except Exception as exc:  # pylint: disable=broad-except
-        return src, str(exc)
+        return str(exc)
 
 
-def _copy_embedding_task(job: Tuple[str, str, bool]) -> Tuple[str, Optional[str]]:
-    src, dst, overwrite = job
+def _copy_embedding_file(src: Path, dst: Path, overwrite: bool) -> Optional[str]:
+    if dst.exists() and not overwrite:
+        return "skipped"
     try:
-        dst_path = Path(dst)
-        if dst_path.exists() and not overwrite:
-            return src, "skipped"
-        dst_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dst_path)
-        return src, None
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+        return None
     except Exception as exc:  # pylint: disable=broad-except
-        return src, str(exc)
+        return str(exc)
+
+
+def _image_job_worker(job: Tuple[int, str, str, int, bool]) -> Tuple[int, str, str, Optional[str]]:
+    row_index, src, dst, long_side, overwrite = job
+    message = _copy_and_resize_image(Path(src), Path(dst), long_side, overwrite)
+    return row_index, src, dst, message
+
+
+def _embedding_job_worker(job: Tuple[int, int, str, str, bool]) -> Tuple[int, int, str, str, Optional[str]]:
+    row_index, order, src, dst, overwrite = job
+    message = _copy_embedding_file(Path(src), Path(dst), overwrite)
+    return row_index, order, src, dst, message
+
+
+def _extract_model_and_size(relative_path: Path) -> Tuple[str, str]:
+    parts = list(relative_path.parts)
+    model = parts[0] if parts else "unknown_model"
+    size = next((part for part in parts[1:] if part.endswith("px")), "default")
+    return model, size
+
+
+def _has_complete_embeddings(
+    embedding_list: List[str],
+    model_names: Optional[Sequence[str]],
+    required_resolutions: Dict[str, List[str]],
+) -> bool:
+    """Check if the embedding list contains all required model/resolution combinations."""
+    if not model_names or not required_resolutions:
+        return True
+    
+    # Track which (model, resolution) pairs we've found
+    found_combinations = set()
+    
+    for embedding_src_str in embedding_list:
+        embedding_src_path = Path(embedding_src_str)
+        
+        if not _should_include_model(embedding_src_path, model_names):
+            continue
+        
+        try:
+            relative_after_cache = _rel_after_cache_root(embedding_src_path)
+            model_name, resolution = _extract_model_and_size(relative_after_cache)
+            found_combinations.add((model_name, resolution))
+        except ValueError:
+            continue
+    
+    # Check if all required combinations are present
+    for model in model_names:
+        if model not in required_resolutions:
+            continue
+        for resolution in required_resolutions[model]:
+            if (model, resolution) not in found_combinations:
+                return False
+    
+    return True
+
+
+def _destination_roots(destination_root: Path) -> Tuple[Path, Path, Path]:
+    dataset_root = destination_root / DATASET_DIR_NAME
+    image_root = dataset_root / IMAGES_SUBDIR
+    embedding_root = dataset_root / EMBEDDINGS_SUBDIR
+    image_root.mkdir(parents=True, exist_ok=True)
+    embedding_root.mkdir(parents=True, exist_ok=True)
+    return dataset_root, image_root, embedding_root
 
 
 def _load_quality_dataframe(csv_path: Path, count_per_metric: int) -> pd.DataFrame:
@@ -125,114 +184,166 @@ def _parse_embedding_column(raw_value: Any) -> List[str]:
     return []
 
 
-def process_images_and_embeddings(
+def build_dataset(
     *,
-    image_paths: Iterable[Any],
-    embedding_paths: Iterable[Any],
+    quality_df: pd.DataFrame,
+    parsed_embeddings: List[List[str]],
     destination_root: Path,
     overwrite: bool,
     verbose: bool,
     resize_long_side: int,
-    resize_dir_name: str,
-    resize_workers: Optional[int],
-    embedding_workers: Optional[int],
     model_names: Optional[Sequence[str]],
-) -> Dict[str, str]:
-    images = [Path(path) for path in _iter_paths_maybe_nested(image_paths)]
-    flat_embeddings = list(_filter_by_model(_iter_paths_maybe_nested(embedding_paths), model_names))
-
-    path_mapping: Dict[str, str] = {}
-
-    if not images and not flat_embeddings:
-        if verbose:
-            print("Nothing to process.")
-        return path_mapping
-
+    required_resolutions: Dict[str, List[str]],
+) -> Tuple[pd.DataFrame, List[str], List[List[str]], Dict[str, Dict[str, int]], Path, Path, Path]:
     if resize_long_side <= 0:
         raise ValueError("resize_long_side must be positive")
 
     dest_root = destination_root.expanduser().resolve()
-    dest_root.mkdir(parents=True, exist_ok=True)
+    dataset_root, image_root, embedding_root = _destination_roots(dest_root)
 
-    img_ok = img_err = img_skipped = 0
-    if images:
-        try:
-            dataset_root = Path(os.path.commonpath([str(p.parent) for p in images]))
-        except ValueError:
-            dataset_root = images[0].parent
+    # Filter to keep only images with complete embedding sets
+    if verbose:
+        print("Filtering images to keep only those with complete embedding sets...")
+    
+    filtered_indices = []
+    for idx, embedding_list in enumerate(parsed_embeddings):
+        if _has_complete_embeddings(embedding_list, model_names, required_resolutions):
+            filtered_indices.append(idx)
+    
+    if verbose:
+        print(f"Filtered: {len(quality_df)} -> {len(filtered_indices)} images with complete embeddings")
+        dropped = len(quality_df) - len(filtered_indices)
+        if dropped > 0:
+            print(f"Dropped {dropped} images due to missing embeddings")
+    
+    # Update dataframe and embeddings to only include filtered rows
+    quality_df = quality_df.iloc[filtered_indices].reset_index(drop=True)
+    parsed_embeddings = [parsed_embeddings[i] for i in filtered_indices]
 
-        resize_root = dest_root / resize_dir_name
-        resize_root.mkdir(parents=True, exist_ok=True)
+    image_stats = {"ok": 0, "skipped": 0, "failed": 0, "filtered_out": len(quality_df) - len(filtered_indices)}
+    embedding_stats = {"ok": 0, "skipped": 0, "failed": 0}
 
-        jobs: List[Tuple[str, str, int]] = []
-        for img_path in tqdm(images, desc="Preparing resize jobs", leave=False):
-            dst = resize_root / img_path.relative_to(dataset_root)
-            if dst.exists() and not overwrite:
+    row_iterator = zip(quality_df["path"], parsed_embeddings)
+    progress = tqdm(row_iterator, total=len(quality_df), desc="Preparing jobs", leave=False)
+
+    new_image_paths: List[str] = []
+    embedding_placeholders: List[List[Optional[str]]] = []
+    image_jobs: List[Tuple[int, str, str, int, bool]] = []
+    embedding_jobs: List[Tuple[int, int, str, str, bool]] = []
+
+    for row_index, (image_src, embedding_list) in enumerate(progress):
+        image_src_path = Path(image_src)
+        image_dst_path = image_root / f"{row_index}.png"
+
+        new_image_paths.append(str(image_dst_path))
+        embedding_placeholders.append([])
+
+        image_jobs.append(
+            (
+                row_index,
+                str(image_src_path),
+                str(image_dst_path),
+                resize_long_side,
+                overwrite,
+            )
+        )
+
+        per_bucket_counter: Dict[Tuple[str, str], int] = defaultdict(int)
+
+        for embedding_src_str in embedding_list:
+            embedding_src_path = Path(embedding_src_str)
+            if not _should_include_model(embedding_src_path, model_names):
                 continue
-            jobs.append((str(img_path), str(dst), int(resize_long_side)))
 
-        if jobs:
-            worker_count = max(1, min(resize_workers or cpu_count(), cpu_count()))
-            if verbose:
-                print(
-                    f"Resizing {len(jobs)} images with {worker_count} worker(s) to max {resize_long_side}px"
-                )
-            with Pool(processes=worker_count) as pool, tqdm(total=len(jobs), desc="Resizing images", leave=False) as bar:
-                for _, message in pool.imap_unordered(_resize_task, jobs):
-                    if message is None:
-                        img_ok += 1
-                    elif message.startswith("skipped:"):
-                        img_skipped += 1
-                    else:
-                        img_err += 1
-                    bar.update(1)
-        if verbose:
-            print(
-                f"Images -> ok: {img_ok}, skipped (palette byte transparency): {img_skipped}, errors: {img_err}. "
-                f"Output dir: {resize_root}"
+            try:
+                relative_after_cache = _rel_after_cache_root(embedding_src_path)
+            except ValueError:
+                embedding_stats["failed"] += 1
+                if verbose:
+                    print(f"Embedding path does not include cache root: {embedding_src_path}")
+                continue
+
+            model_name, resolution = _extract_model_and_size(relative_after_cache)
+            suffix = "".join(embedding_src_path.suffixes) or ".pt"
+
+            bucket_key = (model_name, resolution)
+            order_within_bucket = per_bucket_counter[bucket_key]
+            per_bucket_counter[bucket_key] += 1
+
+            filename = f"{row_index}" if order_within_bucket == 0 else f"{row_index}_{order_within_bucket}"
+            embedding_dst_path = (
+                embedding_root / model_name / resolution / f"{filename}{suffix}"
             )
 
-    copied = skipped = failed = 0
-    copy_jobs: List[Tuple[str, str, bool]] = []
-    seen_destinations: Set[Path] = set()
+            order_in_row = len(embedding_placeholders[row_index])
+            embedding_placeholders[row_index].append(None)
+            embedding_jobs.append(
+                (
+                    row_index,
+                    order_in_row,
+                    str(embedding_src_path),
+                    str(embedding_dst_path),
+                    overwrite,
+                )
+            )
 
-    for emb_path in tqdm(flat_embeddings, desc="Preparing embedding copy jobs", leave=False):
-        try:
-            rel = _rel_after_cache_root(emb_path)
-        except ValueError:
-            failed += 1
-            continue
-
-        dst_path = dest_root / "cache_vae_embeddings" / rel
-        src_key = str(emb_path)
-        dst_value = str(dst_path)
-
-        path_mapping[src_key] = dst_value
-
-        if not overwrite and dst_path in seen_destinations:
-            skipped += 1
-            continue
-
-        seen_destinations.add(dst_path)
-        copy_jobs.append((str(emb_path), str(dst_path), overwrite))
-
-    if copy_jobs:
-        worker_count = max(1, min(embedding_workers or cpu_count(), cpu_count()))
+    if image_jobs:
+        desired = IMAGE_WORKERS or cpu_count()
+        worker_count = max(1, min(desired, cpu_count()))
         if verbose:
-            print(f"Copying {len(copy_jobs)} embeddings with {worker_count} worker(s)")
-        with Pool(processes=worker_count) as pool, tqdm(total=len(copy_jobs), desc="Copying embeddings", leave=False) as bar:
-            for _, message in pool.imap_unordered(_copy_embedding_task, copy_jobs, chunksize=32):
+            print(
+                f"Resizing {len(image_jobs)} images with {worker_count} worker(s) to max {resize_long_side}px"
+            )
+        with Pool(processes=worker_count) as pool, tqdm(
+            total=len(image_jobs), desc="Resizing images", leave=False
+        ) as bar:
+            for row_index, src, dst, message in pool.imap_unordered(_image_job_worker, image_jobs):
                 if message is None:
-                    copied += 1
-                elif message == "skipped":
-                    skipped += 1
+                    image_stats["ok"] += 1
+                elif message.startswith("skipped"):
+                    image_stats["skipped"] += 1
                 else:
-                    failed += 1
+                    image_stats["failed"] += 1
+                    if verbose:
+                        print(f"Failed to process image {src} -> {dst}: {message}")
                 bar.update(1)
-        if verbose:
-            print(f"Embeddings -> copied: {copied}, skipped: {skipped}, failed: {failed}.")
 
-    return path_mapping
+    if embedding_jobs:
+        desired = EMBEDDING_WORKERS or cpu_count()
+        worker_count = max(1, min(desired, cpu_count()))
+        if verbose:
+            print(f"Copying {len(embedding_jobs)} embeddings with {worker_count} worker(s)")
+        with Pool(processes=worker_count) as pool, tqdm(
+            total=len(embedding_jobs), desc="Copying embeddings", leave=False
+        ) as bar:
+            for row_index, order, src, dst, message in pool.imap_unordered(
+                _embedding_job_worker, embedding_jobs, chunksize=32
+            ):
+                if message is None:
+                    embedding_stats["ok"] += 1
+                    embedding_placeholders[row_index][order] = dst
+                elif message == "skipped":
+                    embedding_stats["skipped"] += 1
+                    embedding_placeholders[row_index][order] = dst
+                else:
+                    embedding_stats["failed"] += 1
+                    if verbose:
+                        print(f"Failed to copy embedding {src} -> {dst}: {message}")
+                bar.update(1)
+
+    summaries = {"images": image_stats, "embeddings": embedding_stats}
+    final_embedding_paths = [
+        [path for path in row if path is not None] for row in embedding_placeholders
+    ]
+    return (
+        quality_df,
+        new_image_paths,
+        final_embedding_paths,
+        summaries,
+        dataset_root,
+        image_root,
+        embedding_root,
+    )
 
 
 def main() -> None:
@@ -263,26 +374,42 @@ def main() -> None:
 
     parsed_embeddings = quality_df["available_embeddings"].apply(_parse_embedding_column).tolist()
 
-    path_mapping = process_images_and_embeddings(
-        image_paths=quality_df["path"],
-        embedding_paths=parsed_embeddings,
+    (
+        filtered_df,
+        new_image_paths,
+        new_embedding_paths,
+        summaries,
+        dataset_root,
+        image_root,
+        embedding_root,
+    ) = build_dataset(
+        quality_df=quality_df,
+        parsed_embeddings=parsed_embeddings,
         destination_root=dest_root,
         overwrite=OVERWRITE_EXISTING,
         verbose=VERBOSE,
         resize_long_side=RESIZE_LONG_SIDE,
-        resize_dir_name=RESIZE_DIR_NAME,
-        resize_workers=RESIZE_WORKERS,
-        embedding_workers=EMBEDDING_WORKERS,
         model_names=MODEL_NAMES,
+        required_resolutions=REQUIRED_RESOLUTIONS,
     )
 
-    quality_df = quality_df.copy()
-    quality_df["available_embeddings"] = [
-        [path_mapping.get(str(Path(emb)), emb) for emb in embeddings]
-        for embeddings in parsed_embeddings
-    ]
+    if VERBOSE:
+        image_summary = summaries["images"]
+        embedding_summary = summaries["embeddings"]
+        print(
+            f"Images -> ok: {image_summary['ok']}, skipped: {image_summary['skipped']}, failed: {image_summary['failed']}. "
+            f"Output dir: {image_root}"
+        )
+        print(
+            f"Embeddings -> ok: {embedding_summary['ok']}, skipped: {embedding_summary['skipped']}, failed: {embedding_summary['failed']}. "
+            f"Output dir: {embedding_root}"
+        )
 
-    output_csv = dest_root / "quality_df_with_emb_paths.csv"
+    quality_df = filtered_df.copy()
+    quality_df["path"] = new_image_paths
+    quality_df["available_embeddings"] = new_embedding_paths
+
+    output_csv = dataset_root / "quality_df_with_emb_paths.csv"
     quality_df.to_csv(output_csv, index=False)
     if VERBOSE:
         print(f"Saved updated DataFrame with embedding paths to {output_csv}")
