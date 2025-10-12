@@ -12,6 +12,10 @@ import pandas as pd
 from PIL import Image
 from tqdm.auto import tqdm
 
+# ResizeRight imports
+from utils.resize_utils import pil_resize_right
+from utils import interp_methods
+
 
 CSV_PATH = Path("clear_images_with_maniqa_scores.csv")
 DESTINATION_ROOT = Path("upscale_df_quality_100k_per_metric_v3")
@@ -71,7 +75,8 @@ def _copy_and_resize_image(src: Path, dst: Path, long_side: int, overwrite: bool
                 image = image.convert("RGB")
                 new_size = _new_size(*image.size, long_side)
                 if new_size != image.size:
-                    image = image.resize(new_size, Image.LANCZOS)
+                    # Use ResizeRight with Lanczos3 for high-quality resizing
+                    image = pil_resize_right(image, new_size, interp_method=interp_methods.lanczos3, antialiasing=True)
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 image.save(dst)
         return None

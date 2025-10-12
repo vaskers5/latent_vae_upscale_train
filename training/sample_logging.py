@@ -26,6 +26,12 @@ import wandb
 import torchvision.transforms.functional as T
 from .config import SampleVaeConfig, TrainingConfig, _resolve_dtype
 from .wandb_logger import WandbLogger
+# ResizeRight imports
+import sys
+from pathlib import Path as ResizePath
+sys.path.insert(0, str(ResizePath(__file__).parent.parent))
+from utils.resize_utils import torch_resize_right
+from utils import interp_methods
 
 __all__ = ["SampleLogger"]
 
@@ -402,11 +408,12 @@ class SampleLogger:
                     decoded_images = self._decode_latents(group.name, vae, predicted_latents, treat_as_video=is_video)
 
                     if decoded_images.shape[-2:] != real_images.shape[-2:]:
-                        decoded_images = F.interpolate(
+                        # Use ResizeRight for high-quality resizing
+                        decoded_images = torch_resize_right(
                             decoded_images,
                             size=real_images.shape[-2:],
-                            mode="bilinear",
-                            align_corners=False,
+                            interp_method=interp_methods.cubic,
+                            antialiasing=True,
                         )
 
                     lpips_scores: List[float] = []

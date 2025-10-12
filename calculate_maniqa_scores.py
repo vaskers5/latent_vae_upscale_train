@@ -12,15 +12,28 @@ from tqdm.auto import tqdm
 
 import pyiqa
 
+# ResizeRight imports
+from utils.resize_utils import pil_resize_right
+from utils import interp_methods
+
 SUPPORTED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 
 
+class ResizeRightTransform:
+    """Custom transform using ResizeRight for high-quality resizing."""
+    def __init__(self, size: int):
+        self.size = size
+    
+    def __call__(self, img: Image.Image) -> Image.Image:
+        return pil_resize_right(img, (self.size, self.size), 
+                               interp_method=interp_methods.cubic, 
+                               antialiasing=True)
 
 
 def build_transform(resize_shorter_side: int) -> transforms.Compose:
     ops = []
     if resize_shorter_side and resize_shorter_side > 0:
-        ops.append(transforms.Resize((resize_shorter_side, resize_shorter_side)))
+        ops.append(ResizeRightTransform(resize_shorter_side))
     ops.append(transforms.ToTensor())
     return transforms.Compose(ops)
 

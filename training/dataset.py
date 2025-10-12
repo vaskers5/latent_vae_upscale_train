@@ -16,6 +16,12 @@ import torchvision.transforms.functional as TF
 from torch.utils.data import Dataset
 
 from .embeddings import EmbeddingCache, TransformParams
+# ResizeRight imports
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from utils.resize_utils import torch_resize_right, pil_resize_right
+from utils import interp_methods
 
 __all__ = ["ImageFolderDataset", "UpscaleDataset"]
 
@@ -153,15 +159,38 @@ class ImageFolderDataset(Dataset):
     def _downsample_for_model(self, tensor: torch.Tensor) -> torch.Tensor:
         if not self._needs_model_downsample:
             return tensor
-        batched = tensor.unsqueeze(0)
-        resized = F.interpolate(
-            batched,
+        # Use ResizeRight for high-quality downsampling
+        resized = torch_resize_right(
+            tensor,
             size=(self.model_resolution, self.model_resolution),
-            mode="bilinear",
-            align_corners=False,
+            interp_method=interp_methods.cubic,
+            antialiasing=True,
         )
-        return resized.squeeze(0)
+        return resized
 
+    def _fit_image(self, img: Image.Image, target_size: int) -> Image.Image:
+        """Fit image to target size with center crop and ResizeRight resize."""
+        width, height = img.size
+        
+        # Calculate the scale to fit the image
+        scale = max(target_size / width, target_size / height)
+        new_width = int(round(width * scale))
+        new_height = int(round(height * scale))
+        
+        # Resize using ResizeRight
+        if new_width != width or new_height != height:
+            img = pil_resize_right(img, (new_width, new_height), 
+                                 interp_method=interp_methods.lanczos3, 
+                                 antialiasing=True)
+        
+        # Center crop
+        left = (new_width - target_size) // 2
+        top = (new_height - target_size) // 2
+        right = left + target_size
+        bottom = top + target_size
+        
+        return img.crop((left, top, right, bottom))
+    
     def _resize_if_needed(self, img: Image.Image) -> Image.Image:
         if self.resize_long_side <= 0:
             return img
@@ -171,7 +200,8 @@ class ImageFolderDataset(Dataset):
             return img
         scale = self.resize_long_side / float(longest)
         new_size = (int(round(width * scale)), int(round(height * scale)))
-        return img.resize(new_size, Image.LANCZOS)
+        # Use ResizeRight with Lanczos3 for high-quality resizing
+        return pil_resize_right(img, new_size, interp_method=interp_methods.lanczos3, antialiasing=True)
 
     def _apply_transforms(
         self,
@@ -185,12 +215,8 @@ class ImageFolderDataset(Dataset):
             return img, TransformParams(flip=False, crop_x=0, crop_y=0)
 
         img = self._resize_if_needed(img)
-        img = ImageOps.fit(
-            img,
-            (self.high_resolution, self.high_resolution),
-            Image.LANCZOS,
-            centering=(0.5, 0.5),
-        )
+        # Use our ResizeRight-based fit function instead of ImageOps.fit
+        img = self._fit_image(img, self.high_resolution)
         return img, TransformParams(flip=False, crop_x=0, crop_y=0)
 
 
