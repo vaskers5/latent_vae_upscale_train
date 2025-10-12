@@ -7,7 +7,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Callable, Iterable, List, Sequence
+from typing import Callable, List, Sequence
 
 import torch
 from diffusers import (
@@ -80,13 +80,6 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip tasks whose caches are already complete (validated before encoding)",
     )
-    parser.add_argument(
-        "--image-csv",
-        type=Path,
-        default=None,
-        help="Override the CSV manifest listing images to encode",
-    )
-
     args = parser.parse_args()
     print(f"[Embeddings] Arguments parsed: config={args.config}, dataset_root={args.dataset_root}, device={args.device}, etc.")
     return args
@@ -210,23 +203,6 @@ def _ensure_cuda_context(device: torch.device) -> None:
         torch.cuda.set_device(device)
 
 
-def _ensure_expected_counts(cache: EmbeddingCache, image_paths: Iterable[Path]) -> None:
-    paths = list(image_paths)
-    missing = [path for path in paths if not cache.has_variant(path, 0)]
-
-    if missing:
-        raise RuntimeError(
-            f"Embedding cache is incomplete. Expected one embedding per image but "
-            f"{len(missing)} file(s) are missing."
-        )
-
-    produced = sum(1 for path in paths if cache.has_variant(path, 0))
-    if produced != len(paths):
-        raise RuntimeError(
-            f"Embedding count mismatch: expected {len(paths)} cache files, found {produced}."
-        )
-
-
 def _execute_task(
     task: MultiPrecomputeTask,
     *,
@@ -277,17 +253,18 @@ def _execute_task(
     dataset = ImageFolderDataset(
         root=task.dataset_path,
         high_resolution=task.high_resolution,
-        resize_long_side=task.resize_long_side,
-        limit=task.limit,
-        embedding_cache=None,
-        model_resolution=task.model_resolution,
-        paths_csv=task.image_csv,
+    resize_long_side=task.resize_long_side,
+    limit=task.limit,
+    embedding_cache=None,
+    model_resolution=task.model_resolution,
     )
-    logger(f"[Embeddings] Dataset created: Collected {len(dataset.paths)} paths")
+    logger(
+        f"[Embeddings] Dataset created: Collected {len(dataset.paths)} paths from {task.dataset_path}"
+    )
 
     if skip_existing and not overwrite:
         try:
-            _ensure_expected_counts(cache, dataset.paths)
+            cache.validate_dataset(dataset)
         except RuntimeError:
             pass
         else:
@@ -323,7 +300,7 @@ def _execute_task(
         log=logger,
     )
 
-    _ensure_expected_counts(cache, dataset.paths)
+    cache.validate_dataset(dataset)
     elapsed = time.perf_counter() - start
 
     logger(
@@ -372,6 +349,10 @@ def _run_parallel_tasks(
                 except StopIteration:
                     return
             desc = f"{task.vae_name} ({task.display_resolution})"
+            log(
+                f"[Embeddings] Device {device} starting task {task.vae_name}"
+                f" at {task.display_resolution}"
+            )
             try:
                 _execute_task(
                     task,
@@ -388,6 +369,10 @@ def _run_parallel_tasks(
                 raise
             else:
                 overall_progress.update(1)
+                log(
+                    f"[Embeddings] Device {device} finished task {task.vae_name}"
+                    f" at {task.display_resolution}"
+                )
 
     try:
         with ThreadPoolExecutor(max_workers=len(devices)) as executor:
@@ -409,15 +394,16 @@ def _run_from_config(args: argparse.Namespace) -> None:
     cache_override = Path(args.cache_subdir).expanduser() if args.cache_subdir else None
     batch_override = int(args.batch_size) if args.batch_size is not None else None
     workers_override = int(args.num_workers) if args.num_workers is not None else None
-    image_csv_override = args.image_csv.expanduser() if args.image_csv else None
-
+    print(
+        f"[Embeddings] Overrides -> dataset_root: {dataset_override}, cache_subdir: {cache_override},"
+        f" batch_size: {batch_override}, num_workers: {workers_override}"
+    )
     print("[Embeddings] Generating tasks from configuration...")
     tasks = multi_cfg.generate_tasks(
         dataset_root_override=dataset_override,
         cache_override=cache_override,
         batch_override=batch_override,
         workers_override=workers_override,
-        image_csv_override=image_csv_override,
     )
     print(f"[Embeddings] Generated {len(tasks)} task(s)")
 
@@ -444,6 +430,10 @@ def _run_from_config(args: argparse.Namespace) -> None:
         print(f"[Embeddings] Running tasks sequentially on single device {device}")
         for index, task in enumerate(tasks, start=1):
             desc = f"{task.vae_name} ({task.display_resolution})"
+            print(
+                f"[Embeddings] Queueing task {index}/{len(tasks)}: {task.vae_name}"
+                f" at {task.display_resolution}"
+            )
             _execute_task(
                 task,
                 device=device,
