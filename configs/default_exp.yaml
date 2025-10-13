@@ -1,9 +1,9 @@
 # general settings
 # CUDA_VISIBLE_DEVICES=0,1,2,3 python -m torch.distributed.launch --nproc_per_node=4 --master_port=4321 basicsr/train.py -opt options/train/SwinIR/train_SwinIR_latent_sr_kaggle.yml --launcher pytorch
-name: train_SwinIR_latent_SRx2_wallpapers_flux_170k_train_slow
+name: train_SwinIR_latent_SRx2_default_l1
 model_type: SwinIRLatentModel
 scale: 2
-num_gpu: 4
+num_gpu: 8
 manual_seed: 0
 
 # dataset and data loader settings
@@ -117,7 +117,7 @@ train:
 
 # validation settings
 val:
-  val_freq: 5000
+  val_freq: 100
   save_img: true
   metrics:
     # --- Latent Space Metrics ---

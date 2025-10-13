@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Sequence, Tuple
 
 import torch
 from torch.utils import data as data
+from tqdm.auto import tqdm
 
 from basicsr.utils.registry import DATASET_REGISTRY
 from training.dataset import UpscaleDataset
@@ -40,7 +41,7 @@ class LatentCacheDataset(data.Dataset):
 
         self._datasets: List[_DatasetEntry] = []
         self._index: List[Tuple[int, int]] = []
-        for idx, cache_dir in enumerate(cache_dirs):
+        for idx, cache_dir in enumerate(tqdm(cache_dirs, desc="Loading latent caches", unit="cache")):
             vae_name = vae_names[idx] if vae_names else str(cache_dir)
             dataset = UpscaleDataset(cache_dir=cache_dir, low_res=low_res, high_res=high_res, csv_path=csv_path)
             entry_index = len(self._datasets)

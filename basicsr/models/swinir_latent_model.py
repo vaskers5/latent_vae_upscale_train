@@ -140,14 +140,14 @@ class SwinIRLatentModel(SwinIRModel):
             return criterion(prediction, target) if target is not None else criterion(prediction)
 
         signature = inspect.signature(forward)
-        params = list(signature.parameters.values())[1:]
+        params = list(signature.parameters.values())
         required = [
             param
             for param in params
             if param.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
             and param.default is inspect._empty
         ]
-        if target is not None and len(required) >= 2:
+        if target is not None and (len(required) >= 2 or any(param.name == "target" for param in params)):
             return criterion(prediction, target)
         return criterion(prediction)
 
