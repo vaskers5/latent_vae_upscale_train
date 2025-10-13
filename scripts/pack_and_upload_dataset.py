@@ -40,6 +40,7 @@ IMAGE_EXTENSIONS = {
     ".gif",
     ".tiff",
     ".tif",
+    ".pt"
 }
 
 
@@ -77,7 +78,7 @@ def parse_args() -> ArchivingConfig:
     parser.add_argument(
         "--max-files-per-archive",
         type=int,
-        default=50_000,
+        default=5000,
         help="Maximum number of files packed into a single archive",
     )
     parser.add_argument(
@@ -90,7 +91,7 @@ def parse_args() -> ArchivingConfig:
         "--compress-level",
         type=int,
         choices=range(1, 10),
-        default=9,
+        default=3,
         help="gzip compression level (1=fastest, 9=smallest)",
     )
     parser.add_argument(
@@ -136,9 +137,7 @@ def parse_args() -> ArchivingConfig:
 
 def discover_files(root: Path, extensions: Sequence[str], follow_symlinks: bool) -> List[Path]:
     candidates: List[Path] = []
-    for path in root.rglob("*"):
-        if not follow_symlinks and path.is_symlink():
-            continue
+    for path in tqdm(root.rglob("*"), desc="Discovering files", unit="file"):
         if path.is_file() and path.suffix.lower() in extensions:
             candidates.append(path)
     if not candidates:
@@ -171,7 +170,7 @@ def chunk_files(
     current: List[Path] = []
     current_bytes = 0
 
-    for file_path in files:
+    for file_path in tqdm(files, desc="Chunking files", unit="file"):
         file_size = file_path.stat().st_size
         if current and (
             len(current) >= max_files

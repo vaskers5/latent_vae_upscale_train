@@ -23,7 +23,7 @@ from diffusers import (
 )
 from tqdm.auto import tqdm
 
-from .config import DatasetConfig, EmbeddingsConfig, _resolve_bool, _resolve_dtype, _slugify
+from .legacy_config import DatasetConfig, EmbeddingsConfig, _resolve_bool, _resolve_dtype, _slugify
 from .config_loader import load_config
 
 if TYPE_CHECKING:  # pragma: no cover

@@ -24,7 +24,7 @@ from diffusers import (
 import lpips
 import wandb
 import torchvision.transforms.functional as T
-from .config import SampleVaeConfig, TrainingConfig, _resolve_dtype
+from .legacy_config import SampleVaeConfig, TrainingConfig as LegacyTrainingConfig, _resolve_dtype
 from .wandb_logger import WandbLogger
 # ResizeRight imports
 import sys
@@ -114,7 +114,7 @@ class SampleLogger:
 
     def __init__(
         self,
-        cfg: TrainingConfig,
+    cfg: LegacyTrainingConfig,
         *,
         dataset: Optional[Sequence] = None,
         datasets: Optional[Mapping[str, Sequence]] = None,
