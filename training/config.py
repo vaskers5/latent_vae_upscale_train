@@ -482,6 +482,7 @@ class TrainingConfig:
     latent_upscaler: LatentUpscalerConfig
     embeddings: EmbeddingsConfig
     seed: int
+    basicsr: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "TrainingConfig":
@@ -493,6 +494,12 @@ class TrainingConfig:
         logging = LoggingConfig.from_dict(data, timestamp=paths.timestamp)
         latent_upscaler = LatentUpscalerConfig.from_dict(data)
         embeddings = EmbeddingsConfig.from_dict(data, dataset_root=paths.dataset_root)
+        basicsr_raw = data.get("basicsr")
+        basicsr: Dict[str, Any]
+        if isinstance(basicsr_raw, Mapping):
+            basicsr = {str(key): value for key, value in basicsr_raw.items()}
+        else:
+            basicsr = {}
         seed = int(data.get("seed", int(datetime.now().strftime("%Y%m%d"))))
         return cls(
             paths=paths,
@@ -504,4 +511,5 @@ class TrainingConfig:
             latent_upscaler=latent_upscaler,
             embeddings=embeddings,
             seed=seed,
+            basicsr=basicsr,
         )

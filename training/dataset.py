@@ -13,7 +13,7 @@ import torch
 import torchvision.transforms.functional as TF
 from torch.utils.data import Dataset
 
-from .embeddings import EmbeddingCache, TransformParams
+from .precompute_embeddings import EmbeddingCache, TransformParams
 
 __all__ = ["ImageFolderDataset", "UpscaleDataset"]
 
@@ -205,7 +205,12 @@ class UpscaleDataset(Dataset):
         low_tensor, low_meta = self._extract_latent(low_record)
         high_tensor, high_meta = self._extract_latent(high_record)
 
-        sample: Dict[str, Any] = {"low": low_tensor, "high": high_tensor}
+        sample: Dict[str, Any] = {
+            "low": low_tensor,
+            "high": high_tensor,
+            "low_path": low_path,
+            "high_path": high_path,
+        }
         if low_meta:
             sample["low_meta"] = low_meta
         if high_meta:

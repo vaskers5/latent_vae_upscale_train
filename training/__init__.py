@@ -1,6 +1,6 @@
 """Training package exports."""
 
 from .config import TrainingConfig
-from .trainer import VAETrainer, run
+from .trainer import run
 
-__all__ = ["run", "TrainingConfig", "VAETrainer"]
+__all__ = ["run", "TrainingConfig"]

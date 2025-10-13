@@ -3,7 +3,7 @@ dataset_root: ./train_data_crops
 cache_root: cache_vae_embeddings
 
 defaults:
-  num_workers: 3
+  num_workers: 24
   embeddings_dtype: float32
   store_distribution: true
   # image_csv: ./clear_images.csv
