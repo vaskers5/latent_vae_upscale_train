@@ -1,104 +1,10 @@
-"""Loss implementations copied from new_folder (BasicSR-style)."""
-
-from __future__ import annotations
-
-from typing import Dict
-
 import torch
-from torch import nn
+from torch import nn as nn
 from torch.nn import functional as F
 
+from train.archs.vgg_arch import VGGFeatureExtractor
+from train.utils.registry import LOSS_REGISTRY
 from .loss_util import weighted_loss
-from .registry import LOSS_REGISTRY
-
-try:  # Prefer BasicSR's extractor if available
-    from train.archs.vgg_arch import VGGFeatureExtractor  # type: ignore
-except Exception:  # pragma: no cover - fallback implementation
-    from torchvision import models
-
-    class VGGFeatureExtractor(nn.Module):
-        """Minimal VGG feature extractor compatible with the original API."""
-
-        def __init__(
-            self,
-            layer_name_list,
-            vgg_type: str = "vgg19",
-            use_input_norm: bool = True,
-            range_norm: bool = False,
-        ):
-            super().__init__()
-            if vgg_type.lower() != "vgg19":
-                raise ValueError("Fallback VGGFeatureExtractor only supports vgg19.")
-
-            weights = getattr(models, "VGG19_Weights", None)
-            if weights is not None:
-                vgg = models.vgg19(weights=weights.IMAGENET1K_V1).features  # type: ignore[attr-defined]
-            else:  # torchvision<0.13 fallback
-                vgg = models.vgg19(pretrained=True).features  # type: ignore[call-arg]
-
-            # Build mapping from layer index to friendly name (convX_Y / reluX_Y)
-            layer_name_list = list(layer_name_list)
-            self.layer_name_list = layer_name_list
-            name_by_index: Dict[int, str] = {}
-            block = 1
-            conv = 0
-            for idx, layer in enumerate(vgg):
-                if isinstance(layer, nn.Conv2d):
-                    conv += 1
-                    name_by_index[idx] = f"conv{block}_{conv}"
-                elif isinstance(layer, nn.ReLU):
-                    name_by_index[idx] = f"relu{block}_{conv}"
-                elif isinstance(layer, nn.MaxPool2d):
-                    block += 1
-                    conv = 0
-
-            required_indices = [
-                idx for idx, name in name_by_index.items() if name in layer_name_list
-            ]
-            if not required_indices:
-                raise ValueError(
-                    f"No matching VGG layers found for names: {layer_name_list}"
-                )
-
-            max_index = max(required_indices)
-            self.layers = nn.ModuleList(list(vgg.children()))
-            for layer in self.layers:
-                layer.eval()
-                for param in layer.parameters():
-                    param.requires_grad = False
-
-            self._index_to_name = {
-                idx: name
-                for idx, name in name_by_index.items()
-                if name in layer_name_list
-            }
-            self._max_index = max_index
-            self.use_input_norm = use_input_norm
-            self.range_norm = range_norm
-            if use_input_norm:
-                mean = torch.Tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
-                std = torch.Tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
-                self.register_buffer("mean", mean)
-                self.register_buffer("std", std)
-            else:
-                self.mean = None  # type: ignore[assignment]
-                self.std = None  # type: ignore[assignment]
-
-        def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-            if self.range_norm:
-                x = (x + 1.0) / 2.0
-            if self.use_input_norm and self.mean is not None and self.std is not None:
-                x = (x - self.mean) / self.std
-            feats: Dict[str, torch.Tensor] = {}
-            out = x
-            for idx in range(self._max_index + 1):
-                layer = self.layers[idx]
-                out = layer(out)
-                name = self._index_to_name.get(idx)
-                if name:
-                    feats[name] = out
-            return feats
-
 
 _reduction_modes = ["none", "mean", "sum"]
 
