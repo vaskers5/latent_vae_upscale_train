@@ -208,6 +208,7 @@ def copy_opt_file(opt_file, experiments_root):
     import sys
     import time
     from shutil import copyfile
+    print(f'Copying config file {opt_file} to {experiments_root}')
     cmd = ' '.join(sys.argv)
     filename = osp.join(experiments_root, osp.basename(opt_file))
     copyfile(opt_file, filename)

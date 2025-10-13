@@ -3,16 +3,21 @@
 name: train_SwinIR_latent_SRx2_default_l1
 model_type: SwinIRLatentModel
 scale: 2
-num_gpu: 8
+num_gpu: 4
 manual_seed: 0
 
 # dataset and data loader settings
 datasets:
   train:
-    name: CombinedWallpapers
-    type: PairedLatentDataset
-    dataroot_gt: /data/kazanplova/datasets/midjourney_crops_flux_vae/cache_vae_embeddings/flux_vae/256px
-    dataroot_lq: /data/kazanplova/datasets/midjourney_crops_flux_vae/cache_vae_embeddings/flux_vae/128px
+    name: MidjourneyCropsFluxVAE_train
+    type: LatentCacheDataset
+
+    high_res: 256
+    low_res: 128
+    cache_dirs:
+      - /data/kazanplova/datasets/midjourney_crops_flux_vae/cache_vae_embeddings/flux_vae/
+    vae_names: flux_vae
+    phase: train
 
     filename_tmpl: "{}"
     io_backend:
@@ -31,14 +36,21 @@ datasets:
 
   val:
     name: WallpapersFlux
-    type: PairedLatentDataset
-    dataroot_gt: /data/kazanplova/datasets/midjourney_crops_flux_vae/cache_vae_embeddings_val/flux_vae/256px/Wallpapers
-    dataroot_lq: /data/kazanplova/datasets/midjourney_crops_flux_vae/cache_vae_embeddings_val/flux_vae/128px/Wallpapers
-    filename_tmpl: "{}"
+    type: LatentCacheDataset
+    high_res: 512
+    low_res: 256
+    cache_dirs:
+      - /data/kazanplova/latent_vae_upscale_train/flux_val/256_512/embeddings
+    vae_names: flux_vae
+    phase: val
+
     io_backend:
       type: disk
     scale: 2
-    phase: val
+    mean: null
+    std: null
+    batch_size_per_gpu: 128
+    pin_memory: true
 
 # network structures
 network_g:
@@ -75,7 +87,7 @@ train:
     milestones: [250000, 400000, 450000, 475000]
     gamma: 0.5
 
-  total_iter: 100000
+  total_iter: 20000
   warmup_iter: -1 # no warm up
 
   # losses
@@ -117,7 +129,7 @@ train:
 
 # validation settings
 val:
-  val_freq: 100
+  val_freq: 1000
   save_img: true
   metrics:
     # --- Latent Space Metrics ---

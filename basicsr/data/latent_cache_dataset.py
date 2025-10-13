@@ -1,21 +1,24 @@
-"""BasicSR dataset that wraps the project's latent cache datasets."""
+"""BasicSR dataset that exposes latent caches without relying on training helpers."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Sequence, Tuple
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 import torch
 from torch.utils import data as data
 from tqdm.auto import tqdm
 
 from basicsr.utils.registry import DATASET_REGISTRY
-from training.dataset import UpscaleDataset
 
 
-@dataclass
-class _DatasetEntry:
-    dataset: UpscaleDataset
+@dataclass(frozen=True)
+class _CacheSample:
+    """Represents a matched low/high latent pair within a cache."""
+
+    lq_path: Path
+    gt_path: Path
     vae_name: str
 
 
@@ -24,50 +27,124 @@ class LatentCacheDataset(data.Dataset):
     """Expose cached latent pairs to the BasicSR dataloader infrastructure."""
 
     def __init__(self, opt: Dict[str, Any]):  # type: ignore[override]
+        print("Initializing LatentCacheDataset")
         super().__init__()
         self.opt = dict(opt)
-        cache_dirs: Sequence[str] = self.opt.get("cache_dirs", [])
-        if isinstance(cache_dirs, str):
-            cache_dirs = [cache_dirs]
+
+        self.scale = opt["scale"]
+        self.phase = opt["phase"]
+
+        # Normalization parameters
+        self.mean = opt.get("mean", None)
+        self.std = opt.get("std", None)
+
+
+        cache_dirs = self._normalize_cache_dirs(self.opt.get("cache_dirs", []))
+        print(f"LatentCacheDataset using cache_dirs: {[str(path) for path in cache_dirs]}")
+
         if not cache_dirs:
-            raise ValueError("LatentCacheDataset requires at least one cache directory.")
+            raise RuntimeError("No cache directories supplied to LatentCacheDataset.")
 
-        low_res = int(self.opt.get("low_res"))
-        high_res = int(self.opt.get("high_res"))
-        csv_path = self.opt.get("csv_path")
-        vae_names: Sequence[str] = self.opt.get("vae_names") or []
-        if vae_names and len(vae_names) != len(cache_dirs):
-            raise ValueError("vae_names length must match cache_dirs length if provided.")
+        self._low_res = int(self.opt.get("low_res"))
+        self._high_res = int(self.opt.get("high_res"))
+        self._vae_names: Sequence[str] = tuple(self.opt.get("vae_names") or [])
 
-        self._datasets: List[_DatasetEntry] = []
-        self._index: List[Tuple[int, int]] = []
-        for idx, cache_dir in enumerate(tqdm(cache_dirs, desc="Loading latent caches", unit="cache")):
-            vae_name = vae_names[idx] if vae_names else str(cache_dir)
-            dataset = UpscaleDataset(cache_dir=cache_dir, low_res=low_res, high_res=high_res, csv_path=csv_path)
-            entry_index = len(self._datasets)
-            self._datasets.append(_DatasetEntry(dataset=dataset, vae_name=vae_name))
-            self._index.extend((entry_index, sample_idx) for sample_idx in range(len(dataset)))
-
-        if not self._index:
+        self._samples: List[_CacheSample] = []
+        self._gather_samples(cache_dirs)
+        if not self._samples:
             raise RuntimeError("No latent pairs found in the provided cache directories.")
 
+    @staticmethod
+    def _normalize_cache_dirs(cache_dirs: Any) -> List[Path]:
+        if isinstance(cache_dirs, (str, Path)):
+            return [Path(cache_dirs)]
+        normalized: List[Path] = []
+        for entry in cache_dirs or []:
+            normalized.append(Path(entry))
+        return normalized
+
+    def _gather_samples(self, cache_dirs: Sequence[Path]) -> None:
+        for idx, cache_dir in enumerate(tqdm(cache_dirs, desc="Loading latent caches", unit="cache")):
+            vae_name = self._vae_names[idx] if idx < len(self._vae_names) else str(cache_dir)
+            cache_dir = cache_dir.expanduser().resolve()
+            pairs = self._collect_pairs(cache_dir, vae_name)
+            self._samples.extend(_CacheSample(lq_path=low, gt_path=high, vae_name=vae_name) for low, high in pairs)
+
+    def _collect_pairs(self, cache_dir: Path, vae_name: str) -> List[Tuple[Path, Path]]:
+        low_dir = cache_dir / f"{self._low_res}px"
+        high_dir = cache_dir / f"{self._high_res}px"
+
+        if not low_dir.is_dir():
+            raise FileNotFoundError(f"Low-resolution cache directory missing: {low_dir}")
+        if not high_dir.is_dir():
+            raise FileNotFoundError(f"High-resolution cache directory missing: {high_dir}")
+
+        low_files = list(
+            tqdm(
+                self._iter_pt_files(low_dir),
+                desc=f"Scanning low-res files ({vae_name})",
+                unit="file",
+                leave=False,
+            )
+        )
+        high_filenames = {path.name for path in self._iter_pt_files(high_dir)}
+        matched_pairs = [
+            (low_path, high_dir / low_path.name)
+            for low_path in low_files
+            if low_path.name in high_filenames
+        ]
+        print(
+            f"LatentCacheDataset matched {len(matched_pairs)} pairs in '{cache_dir}' "
+            f"(low_res={self._low_res}, high_res={self._high_res})"
+        )
+        return matched_pairs
+
+    @staticmethod
+    def _iter_pt_files(directory: Path) -> Iterable[Path]:
+        return sorted(path for path in directory.glob("*.pt"))
+
     def __len__(self) -> int:
-        return len(self._index)
+        return len(self._samples)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:  # type: ignore[override]
-        dataset_idx, sample_idx = self._index[idx]
-        entry = self._datasets[dataset_idx]
-        sample = entry.dataset[sample_idx]
+        sample = self._samples[idx]
+        # Load latent tensors from .pt files
+        lq_data = torch.load(sample.lq_path, map_location="cpu")
+        gt_data = torch.load(sample.gt_path, map_location="cpu")
 
-        lq = sample["low"].float()
-        gt = sample["high"].float()
-        lq_path = sample.get("low_path") or sample.get("lq_path") or ""
-        gt_path = sample.get("high_path") or sample.get("gt_path") or ""
+        # Extract latents from the data dictionary
+        if isinstance(lq_data, dict) and "latents" in lq_data:
+            img_lq = lq_data["latents"]
+        else:
+            img_lq = lq_data
 
-        return {
-            "lq": lq,
-            "gt": gt,
-            "lq_path": lq_path,
-            "gt_path": gt_path,
-            "vae_name": entry.vae_name,
-        }
+        if isinstance(gt_data, dict) and "latents" in gt_data:
+            img_gt = gt_data["latents"]
+        else:
+            img_gt = gt_data
+
+        # Ensure tensors are float32
+        img_lq = img_lq.float()
+        img_gt = img_gt.float()
+
+        # For training, we can apply some basic augmentations
+        if self.phase == "train":
+            # Random horizontal flip (applied to both LQ and GT)
+            if torch.rand(1) < 0.5:
+                img_lq = torch.flip(img_lq, dims=[2])  # flip width dimension
+                img_gt = torch.flip(img_gt, dims=[2])
+
+            # Random vertical flip (applied to both LQ and GT)
+            if torch.rand(1) < 0.5:
+                img_lq = torch.flip(img_lq, dims=[1])  # flip height dimension
+                img_gt = torch.flip(img_gt, dims=[1])
+
+        # Normalize if specified
+        if self.mean is not None and self.std is not None:
+            # Apply normalization channel-wise
+            for c in range(img_lq.shape[0]):
+                img_lq[c] = (img_lq[c] - self.mean[c]) / self.std[c]
+            for c in range(img_gt.shape[0]):
+                img_gt[c] = (img_gt[c] - self.mean[c]) / self.std[c]
+        return {"lq": img_lq, "gt": img_gt, "lq_path": str(sample.lq_path), "gt_path": str(sample.gt_path)}
+

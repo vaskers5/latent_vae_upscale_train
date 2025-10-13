@@ -91,6 +91,7 @@ def load_resume_state(opt):
 def train_pipeline(root_path):
     # parse options, set distributed setting, set random seed
     opt, args = parse_options(root_path, is_train=True)
+    print("Parsed options:", opt)
     opt['root_path'] = root_path
 
     torch.backends.cudnn.benchmark = True
@@ -98,6 +99,7 @@ def train_pipeline(root_path):
 
     # load resume states if necessary
     resume_state = load_resume_state(opt)
+    print("Loaded resume state")
     # mkdir for experiments and logger
     if resume_state is None:
         make_exp_dirs(opt)
@@ -115,9 +117,10 @@ def train_pipeline(root_path):
     logger.info(dict2str(opt))
     # initialize wandb and tb loggers
     tb_logger = init_tb_loggers(opt)
-
+    print("Initialized TensorBoard logger")
     # create train and validation dataloaders
     result = create_train_val_dataloader(opt, logger)
+    print("Created train and validation dataloaders")
     train_loader, train_sampler, val_loaders, total_epochs, total_iters = result
 
     # create model

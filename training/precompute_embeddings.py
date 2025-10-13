@@ -28,7 +28,7 @@ from .config_loader import load_config
 
 if TYPE_CHECKING:  # pragma: no cover
     from accelerate import Accelerator
-    from .dataset import ImageFolderDataset
+    from .image_folder_dataset import ImageFolderDataset
 
 __all__ = [
     "EmbeddingCache",
@@ -1022,7 +1022,7 @@ def _execute_task(
     progress_desc: str | None = None,
     log: Callable[[str], None] | None = None,
 ) -> None:
-    from .dataset import ImageFolderDataset  # Local import to avoid circular dependency.
+    from .image_folder_dataset import ImageFolderDataset  # Local import to avoid circular dependency.
 
     logger = log or print
 

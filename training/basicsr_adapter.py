@@ -57,9 +57,11 @@ def _ensure_experiments_root(options: Dict[str, Any]) -> Path:
 
 def run_with_basicsr(config: TrainingConfig) -> None:
     options = config.to_basicsr_options()
+    LOGGER.info("Converted config to BasicSR options: %s", options)
     options["name"] = _resolve_run_name(options.get("name"))
+    LOGGER.info("Resolved experiment name: %s", options["name"])
     experiments_root = _ensure_experiments_root(options)
-
+    LOGGER.info("Using experiments root: %s", experiments_root)
     config_path = _write_options_file(options, experiments_root)
     LOGGER.info("Launching BasicSR training with config: %s", config_path)
 
