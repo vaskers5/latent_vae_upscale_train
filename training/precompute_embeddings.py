@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import torch
 from accelerate import Accelerator
@@ -15,11 +16,11 @@ from diffusers import (
     AutoencoderKLQwenImage,
     AutoencoderKLWan,
 )
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, DistributedSampler
 from tqdm.auto import tqdm
 
 from .config_loader import load_config
-from .embedding_io import TransformParams, save_record
+from .embedding_io import save_record
 from .image_folder_dataset import ImageFolderDataset
 
 __all__ = ["main", "parse_args"]
@@ -45,6 +46,9 @@ class ModelConfig:
     tasks: List[ResolutionTask]
 
 
+DeviceSpec = Union[str, int]
+
+
 def _parse_dtype(value: Any, *, default: Optional[torch.dtype]) -> Optional[torch.dtype]:
     if value is None:
         return default
@@ -63,30 +67,57 @@ def _parse_dtype(value: Any, *, default: Optional[torch.dtype]) -> Optional[torc
 
 def _collate_batch(batch: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     model_inputs = torch.stack([item["model_input"] for item in batch])
-    params = [item["params"] for item in batch]
     paths = [item["path"] for item in batch]
     return {
         "model_input": model_inputs,
-        "params": params,
         "paths": paths,
     }
 
 
 def _prepare_output_path(
     image_path: Path,
-    dataset_resolution_dir: Path,
+    dataset_dir: Path,
     embeddings_resolution_dir: Path,
 ) -> Path:
-    image_path = image_path.resolve()
-    dataset_resolution_dir = dataset_resolution_dir.resolve()
-    dataset_str = str(dataset_resolution_dir)
-    image_str = str(image_path)
-    if image_str.startswith(dataset_str):
-        suffix = image_str[len(dataset_str) :].lstrip("/\\")
-        relative = Path(suffix) if suffix else Path(image_path.name)
+    try:
+        relative_path = Path(image_path).resolve().relative_to(dataset_dir.resolve())
+    except ValueError:
+        relative_path = Path(image_path).name
+    return (embeddings_resolution_dir / relative_path).with_suffix(".pt")
+
+
+def _build_dataloader(
+    dataset: torch.utils.data.Dataset,
+    *,
+    accelerator: Accelerator,
+    batch_size: int,
+    num_workers: int,
+    pin_memory: bool,
+    collate_fn: Callable[[Sequence[Dict[str, Any]]], Dict[str, Any]],
+) -> DataLoader:
+    sampler: Optional[DistributedSampler]
+    if accelerator.num_processes > 1:
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=accelerator.num_processes,
+            rank=accelerator.process_index,
+            shuffle=False,
+            drop_last=False,
+        )
     else:
-        relative = Path(image_path.name)
-    return (embeddings_resolution_dir / relative).with_suffix(".pt")
+        sampler = None
+
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        sampler=sampler,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        collate_fn=collate_fn,
+        persistent_workers=num_workers > 0,
+    )
+    return dataloader
 
 
 def _load_vae(model_cfg: ModelConfig) -> torch.nn.Module:
@@ -158,6 +189,58 @@ def _gather_models(config: Dict[str, Any]) -> Tuple[Path, Path, Dict[str, Any], 
     return dataset_root, cache_root, defaults, models
 
 
+def _normalize_cuda_device(device: DeviceSpec) -> Optional[str]:
+    if device is None:
+        return None
+    if isinstance(device, int):
+        if device < 0:
+            raise ValueError(f"Negative CUDA device index: {device}")
+        return str(device)
+    if isinstance(device, str):
+        value = device.strip()
+        if not value:
+            return None
+        lower = value.lower()
+        if lower in {"auto", "all", "cpu"}:
+            return None
+        if "," in value:
+            raise ValueError("Comma-separated device specifications must be split beforehand.")
+        for prefix in ("cuda", "gpu"):
+            if lower.startswith(prefix):
+                remainder = value[len(prefix) :]
+                if remainder.startswith(":"):
+                    remainder = remainder[1:]
+                value = remainder
+                break
+        value = value.strip()
+        if not value:
+            raise ValueError(f"Empty CUDA device specification: {device!r}")
+        if not value.isdigit():
+            raise ValueError(f"Unsupported CUDA device specification: {device!r}")
+        return value
+    raise TypeError(f"Unsupported device specification type: {type(device)!r}")
+
+
+def _configure_cuda_devices(devices: Optional[Sequence[DeviceSpec]]) -> Optional[List[str]]:
+    if not devices:
+        return None
+    normalized: List[str] = []
+    for spec in devices:
+        if isinstance(spec, str) and "," in spec:
+            parts = [part.strip() for part in spec.split(",") if part.strip()]
+        else:
+            parts = [spec]
+        for part in parts:
+            normalized_device = _normalize_cuda_device(part)
+            if normalized_device is not None:
+                normalized.append(normalized_device)
+    if not normalized:
+        return None
+    unique_devices = list(dict.fromkeys(normalized))
+    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(unique_devices)
+    return unique_devices
+
+
 def _dataset_info(resolution: int, defaults: Dict[str, Any]) -> Dict[str, Any]:
     resize_long_side = int(defaults.get("resize_long_side", 0) or 0)
     return {
@@ -183,6 +266,7 @@ def _encode_resolution(
 ) -> None:
     device = accelerator.device
     vae.eval()
+    vae_module = accelerator.unwrap_model(vae)
     progress = None
     if accelerator.is_main_process:
         progress = tqdm(total=total_items, unit="img", desc=f"{resolution}px")
@@ -191,7 +275,8 @@ def _encode_resolution(
     with torch.no_grad():
         for batch in dataloader:
             inputs = batch["model_input"].to(device=device, dtype=encode_dtype)
-            encoding = vae.encode(inputs)
+            encoding = vae_module.encode(inputs)
+            
             latent_mean = encoding.latent_dist.mean.detach()
             latent_logvar = (
                 encoding.latent_dist.logvar.detach() if store_distribution else None
@@ -202,22 +287,20 @@ def _encode_resolution(
                 if latent_logvar is not None:
                     latent_logvar = latent_logvar.squeeze(2)
             latents = latent_mean.to(embeddings_dtype)
-
             for idx, image_path in enumerate(batch["paths"]):
-                params: TransformParams = batch["params"][idx]
                 record_path = _prepare_output_path(image_path, dataset_dir, embeddings_dir)
+                record_path.parent.mkdir(parents=True, exist_ok=True)
                 mean_tensor = latent_mean[idx] if store_distribution else None
                 logvar_tensor = latent_logvar[idx] if latent_logvar is not None else None
                 save_record(
                     record_path,
                     latents=latents[idx],
-                    params=params,
                     dataset_info=dataset_meta,
                     mean=mean_tensor,
                     logvar=logvar_tensor,
                 )
 
-            if progress is not None:
+            if progress is not None and accelerator.is_main_process:
                 local_count = torch.tensor(len(batch["paths"]), device=device, dtype=torch.long)
                 completed = accelerator.reduce(local_count, reduction="sum")
                 progress.update(int(completed.item()))
@@ -230,18 +313,25 @@ def _encode_resolution(
 def run_precompute(args: argparse.Namespace) -> None:
     config = load_config([args.config])
     dataset_root, cache_root, defaults, models = _gather_models(config)
-
-    if args.dataset_root:
-        dataset_root = Path(args.dataset_root).expanduser().resolve()
-    if args.cache_root:
-        cache_root = Path(args.cache_root).expanduser().resolve()
-
-    num_workers = int(args.num_workers or defaults.get("num_workers", 0))
+    num_workers = defaults.get("num_workers", 0)
     embeddings_dtype = _parse_dtype(defaults.get("embeddings_dtype"), default=torch.float32)
     store_distribution = bool(defaults.get("store_distribution", False))
+    default_devices = defaults.get("devices")
+    if isinstance(default_devices, (list, tuple)):
+        device_specs = list(default_devices)
+    elif default_devices is None:
+        device_specs = None
+    else:
+        device_specs = [default_devices]
+    selected_devices = _configure_cuda_devices(device_specs)
     accelerator = Accelerator()
 
     if accelerator.is_main_process:
+        if selected_devices:
+            formatted_devices = ", ".join(f"cuda:{dev}" for dev in selected_devices)
+            print(
+                f"[Embeddings] Using CUDA visible devices: {formatted_devices}"
+            )
         cache_root.mkdir(parents=True, exist_ok=True)
         print(
             f"[Embeddings] Starting precompute with {accelerator.num_processes} process(es) on {accelerator.device}."
@@ -265,16 +355,12 @@ def run_precompute(args: argparse.Namespace) -> None:
 
             dataset = ImageFolderDataset(
                 resolution_dir,
-                high_resolution=task.resolution,
-                resize_long_side=int(defaults.get("resize_long_side", 0) or 0),
-                limit=0,
-                embedding_cache=None,
-                model_resolution=task.resolution,
             )
-            dataloader = DataLoader(
+            per_device_batch_size = task.batch_size
+            dataloader = _build_dataloader(
                 dataset,
-                batch_size=int(args.batch_size or task.batch_size),
-                shuffle=False,
+                accelerator=accelerator,
+                batch_size=per_device_batch_size,
                 num_workers=num_workers,
                 pin_memory=torch.cuda.is_available(),
                 collate_fn=_collate_batch,
@@ -282,9 +368,9 @@ def run_precompute(args: argparse.Namespace) -> None:
             dataloader = accelerator.prepare(dataloader)
 
             if accelerator.is_main_process:
-                effective_bs = getattr(dataloader, "batch_size", task.batch_size)
+                global_bs = per_device_batch_size * accelerator.num_processes
                 print(
-                    f"[Embeddings] Encoding {len(dataset)} images at {task.resolution}px with batch size {effective_bs}."
+                    f"[Embeddings] Encoding {len(dataset)} images at {task.resolution}px with per-device batch size {per_device_batch_size} (global {global_bs})."
                 )
 
             _encode_resolution(
@@ -312,10 +398,6 @@ def run_precompute(args: argparse.Namespace) -> None:
 def parse_args(args: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Precompute latent embeddings with Accelerate")
     parser.add_argument("--config", type=Path, required=True, help="Path to the YAML config file")
-    parser.add_argument("--dataset-root", type=Path, default=None, help="Override dataset root")
-    parser.add_argument("--cache-root", type=Path, default=None, help="Override embeddings cache root")
-    parser.add_argument("--num-workers", type=int, default=None, help="Override DataLoader workers")
-    parser.add_argument("--batch-size", type=int, default=None, help="Override encoding batch size")
     return parser.parse_args(args)
 
 

@@ -13,31 +13,10 @@ __all__ = ["TransformParams", "save_record", "CACHE_VERSION"]
 CACHE_VERSION = 1
 
 
-@dataclass(frozen=True)
-class TransformParams:
-    """Metadata describing how an image tensor was prepared for the model."""
-
-    flip: bool
-    crop_x: int
-    crop_y: int
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {"flip": self.flip, "crop_x": int(self.crop_x), "crop_y": int(self.crop_y)}
-
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "TransformParams":
-        return cls(
-            flip=bool(data.get("flip", False)),
-            crop_x=int(data.get("crop_x", 0)),
-            crop_y=int(data.get("crop_y", 0)),
-        )
-
-
 def save_record(
     record_path: Path,
     *,
     latents: torch.Tensor,
-    params: TransformParams,
     dataset_info: Dict[str, Any],
     mean: Optional[torch.Tensor] = None,
     logvar: Optional[torch.Tensor] = None,
@@ -48,7 +27,6 @@ def save_record(
     payload: Dict[str, Any] = {
         "version": CACHE_VERSION,
         "latents": latents.cpu(),
-        "params": params.to_dict(),
         "variant": 0,
         "dataset": dataset_info,
         "storage_dtype": str(latents.dtype).replace("torch.", ""),
