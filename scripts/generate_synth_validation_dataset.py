@@ -35,11 +35,7 @@ from PIL import Image
 import torchvision.transforms as T
 from diffusers import FluxPipeline
 
-from training import precompute_embeddings as embedding_utils
-
-
-TransformParams = embedding_utils.TransformParams
-CACHE_VERSION = getattr(embedding_utils, "_CACHE_VERSION", 1)
+from training.embedding_io import CACHE_VERSION, TransformParams
 
 
 EMBEDDING_DTYPE = torch.float16

@@ -1,21 +1,21 @@
 # general settings
 # CUDA_VISIBLE_DEVICES=0,1,2,3 python -m torch.distributed.launch --nproc_per_node=4 --master_port=4321 basicsr/train.py -opt options/train/SwinIR/train_SwinIR_latent_sr_kaggle.yml --launcher pytorch
-name: swinirdefauilt_midjorneycrops_1stage_l1latent
+name: swinirdefauilt_midjorneycrops_1stage_l1latent_full_dataset
 model_type: SwinIRLatentModel
 scale: 2
-num_gpu: 4
+num_gpu: 6
 manual_seed: 0
 
 # dataset and data loader settings
 datasets:
   train:
-    name: MidjourneyCropsFluxVAE_train
+    name: MidjourneyCropsFluxVAE_train_1_2M
     type: LatentCacheDataset
 
     high_res: 256
     low_res: 128
     cache_dirs:
-      - /data/kazanplova/datasets/midjourney_crops_flux_vae/cache_vae_embeddings/flux_vae/
+      - /data/kazanplova/datasets/midjourney_full_ds_crops/embeddings/flux_vae
     vae_names: flux_vae
     phase: train
 
@@ -29,7 +29,7 @@ datasets:
     std: null
     # data loader
     num_worker_per_gpu: 24
-    batch_size_per_gpu: 512
+    batch_size_per_gpu: 672
     prefetch_mode: cuda
     pin_memory: true
 
@@ -87,7 +87,7 @@ train:
     milestones: [250000, 400000, 450000, 475000]
     gamma: 0.5
 
-  total_steps: 20000
+  total_steps: 30000
   warmup_iter: -1 # no warm up
 
   # losses
