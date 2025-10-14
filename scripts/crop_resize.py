@@ -39,11 +39,6 @@ from PIL import Image
 from tqdm import tqdm
 from PIL import Image
 
-
-# --- ResizeRight imports (as requested) ---
-from utils.resize_utils import pil_resize_right
-from utils import interp_methods
-
 TARGET_SIZES = (512, 256, 128)  # fixed order
 EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 

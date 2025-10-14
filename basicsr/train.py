@@ -29,6 +29,8 @@ def init_tb_loggers(opt):
 def create_train_val_dataloader(opt, logger):
     # create train and val dataloaders
     train_loader, val_loaders = None, []
+    steps_per_epoch, total_steps = None, None
+    train_sampler = None
     for phase, dataset_opt in opt['datasets'].items():
         if phase == 'train':
             dataset_enlarge_ratio = dataset_opt.get('dataset_enlarge_ratio', 1)
@@ -42,17 +44,26 @@ def create_train_val_dataloader(opt, logger):
                 sampler=train_sampler,
                 seed=opt['manual_seed'])
 
-            num_iter_per_epoch = math.ceil(
-                len(train_set) * dataset_enlarge_ratio / (dataset_opt['batch_size_per_gpu'] * opt['world_size']))
-            total_iters = int(opt['train']['total_iter'])
-            total_epochs = math.ceil(total_iters / (num_iter_per_epoch))
+            steps_per_epoch = max(
+                1,
+                math.ceil(
+                    len(train_set) * dataset_enlarge_ratio
+                    / (dataset_opt['batch_size_per_gpu'] * opt['world_size'])))
+
+            train_opt = opt['train']
+            if train_opt.get('total_steps') is None:
+                raise ValueError('Please specify "total_steps" in the training configuration.')
+            total_steps = int(train_opt['total_steps'])
+
+            approx_epochs = math.ceil(total_steps / steps_per_epoch) if steps_per_epoch else 'N/A'
             logger.info('Training statistics:'
                         f'\n\tNumber of train images: {len(train_set)}'
                         f'\n\tDataset enlarge ratio: {dataset_enlarge_ratio}'
                         f'\n\tBatch size per gpu: {dataset_opt["batch_size_per_gpu"]}'
                         f'\n\tWorld size (gpu number): {opt["world_size"]}'
-                        f'\n\tRequire iter number per epoch: {num_iter_per_epoch}'
-                        f'\n\tTotal epochs: {total_epochs}; iters: {total_iters}.')
+                        f'\n\tSteps per epoch: {steps_per_epoch}'
+                        f'\n\tConfigured training steps: {total_steps}'
+                        f'\n\tApproximate epochs to cover: {approx_epochs}.')
         elif phase.split('_')[0] == 'val':
             val_set = build_dataset(dataset_opt)
             val_loader = build_dataloader(
@@ -62,7 +73,10 @@ def create_train_val_dataloader(opt, logger):
         else:
             raise ValueError(f'Dataset phase {phase} is not recognized.')
 
-    return train_loader, train_sampler, val_loaders, total_epochs, total_iters
+    if train_loader is None or total_steps is None:
+        raise ValueError('Training dataset must be configured for the training pipeline.')
+
+    return train_loader, train_sampler, val_loaders, steps_per_epoch, total_steps
 
 
 def load_resume_state(opt):
@@ -121,7 +135,7 @@ def train_pipeline(root_path):
     # create train and validation dataloaders
     result = create_train_val_dataloader(opt, logger)
     print("Created train and validation dataloaders")
-    train_loader, train_sampler, val_loaders, total_epochs, total_iters = result
+    train_loader, train_sampler, val_loaders, _steps_per_epoch, total_steps = result
 
     # create model
     model = build_model(opt)
@@ -150,34 +164,46 @@ def train_pipeline(root_path):
         raise ValueError(f"Wrong prefetch_mode {prefetch_mode}. Supported ones are: None, 'cuda', 'cpu'.")
 
     # training
-    logger.info(f'Start training from epoch: {start_epoch}, iter: {current_iter}')
+    logger.info(f'Start training from epoch: {start_epoch}, step: {current_iter}')
     data_timer, iter_timer = AvgTimer(), AvgTimer()
     start_time = time.time()
 
-    for epoch in range(start_epoch, total_epochs + 1):
+    epoch = start_epoch
+    if train_sampler is not None:
         train_sampler.set_epoch(epoch)
-        prefetcher.reset()
-        train_data = prefetcher.next()
+    prefetcher.reset()
+    train_data = prefetcher.next()
 
-        while train_data is not None:
+    if train_data is None:
+        logger.warning('Training dataloader returned no data. Exiting without running any steps.')
+    else:
+        while current_iter < total_steps:
+            if train_data is None:
+                epoch += 1
+                if train_sampler is not None:
+                    train_sampler.set_epoch(epoch)
+                prefetcher.reset()
+                train_data = prefetcher.next()
+                if train_data is None:
+                    logger.warning('Training dataloader returned no data after reset. Stopping early.')
+                    break
+                continue
+
             data_timer.record()
 
             current_iter += 1
-            if current_iter > total_iters:
-                break
             # update learning rate
             model.update_learning_rate(current_iter, warmup_iter=opt['train'].get('warmup_iter', -1))
             # training
             model.feed_data(train_data)
             model.optimize_parameters(current_iter)
             iter_timer.record()
-            if current_iter == 1:
+            if resume_state is None and current_iter == 1:
                 # reset start time in msg_logger for more accurate eta_time
-                # not work in resume mode
                 msg_logger.reset_start_time()
             # log
             if current_iter % opt['logger']['print_freq'] == 0:
-                log_vars = {'epoch': epoch, 'iter': current_iter}
+                log_vars = {'epoch': epoch, 'step': current_iter}
                 log_vars.update({'lrs': model.get_current_learning_rate()})
                 log_vars.update({'time': iter_timer.get_avg_time(), 'data_time': data_timer.get_avg_time()})
                 log_vars.update(model.get_current_log())
@@ -198,9 +224,8 @@ def train_pipeline(root_path):
             data_timer.start()
             iter_timer.start()
             train_data = prefetcher.next()
-        # end of iter
 
-    # end of epoch
+    # end of training loop
 
     consumed_time = str(datetime.timedelta(seconds=int(time.time() - start_time)))
     logger.info(f'End of training. Time consumed: {consumed_time}')
