@@ -1,6 +1,6 @@
 # general settings
 # CUDA_VISIBLE_DEVICES=0,1,2,3 python -m torch.distributed.launch --nproc_per_node=4 --master_port=4321 basicsr/train.py -opt options/train/SwinIR/train_SwinIR_latent_sr_kaggle.yml --launcher pytorch
-name: train_SwinIR_latent_SRx2_default_l1
+name: swinirdefauilt_midjorneycrops_1stage_l1latent
 model_type: SwinIRLatentModel
 scale: 2
 num_gpu: 4
@@ -29,7 +29,7 @@ datasets:
     std: null
     # data loader
     num_worker_per_gpu: 24
-    batch_size_per_gpu: 256
+    batch_size_per_gpu: 512
     prefetch_mode: cuda
     pin_memory: true
 
@@ -69,7 +69,7 @@ network_g:
 
 # path
 path:
-  pretrain_network_g: ~
+  # pretrain_network_g: ./runs/2025_10_13_234001_train_SwinIR_latent_SRx2_default_l1/train_SwinIR_latent_SRx2_default_l1/models/net_g_latest.pth
   strict_load_g: true
   resume_state: ~
 
@@ -103,30 +103,6 @@ train:
     reduction: mean
     space: latent
 
-  # # --- Pixel Space Losses (requires VAE) ---
-  # l1_pixel_opt:
-  #   type: L1Loss
-  #   loss_weight: 0.5
-  #   reduction: mean
-  #   space: pixel
-
-  # Optional: Perceptual loss in pixel space
-  # perceptual_opt_pixel:
-  #   type: PerceptualLoss
-  #   layer_weights:
-  #     "conv1_2": 0.1
-  #     "conv2_2": 0.1
-  #     "conv3_4": 1
-  #     "conv4_4": 1
-  #     "conv5_4": 1
-  #   vgg_type: vgg19
-  #   use_input_norm: true
-  #   range_norm: false
-  #   perceptual_weight: 1.0
-  #   style_weight: 0
-  #   criterion: l1
-  #   space: pixel
-
 # validation settings
 val:
   val_freq: 1000
@@ -156,7 +132,7 @@ val:
 # logging settings
 logger:
   print_freq: 100
-  save_checkpoint_freq: 5000 #!!float 5e3
+  save_checkpoint_freq: 2000 #!!float 5e3
   use_tb_logger: true
   wandb:
     project: SwinIR-Latent-SR
