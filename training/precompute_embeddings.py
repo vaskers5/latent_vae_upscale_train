@@ -5,9 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import random
-import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, TYPE_CHECKING
@@ -308,20 +306,22 @@ class EmbeddingCache:
 
         main_process = accelerator is None or accelerator.is_main_process
 
+        if accelerator is not None:
+            accelerator.wait_for_everyone()
+
         if not missing:
             if main_process:
                 (log or print)("[Embeddings] Cache already populated")
             return
 
-        if not main_process:
-            return
-
         display_desc = progress_desc or "Precomputing latents"
         logger = log or print
-        logger(f"[Embeddings] Populating cache for {len(missing)} images ...")
+        if main_process:
+            logger(f"[Embeddings] Populating cache for {len(missing)} images ...")
 
         vae_prev_mode = vae.training
-        vae = vae.to(device)
+        if accelerator is None:
+            vae = vae.to(device)
         vae.eval()
 
         dataset_loader = _EmbeddingGenerationDataset(dataset=dataset, pending=missing, cache=self, seed=seed)
@@ -333,6 +333,10 @@ class EmbeddingCache:
             pin_memory=device.type == "cuda",
             collate_fn=_collate_embedding_batches,
         )
+
+        if accelerator is not None:
+            vae, loader = accelerator.prepare(vae, loader)
+            device = accelerator.device
 
         progress = None
         if main_process:
@@ -382,7 +386,15 @@ class EmbeddingCache:
                         self._register_cached_path(image_path)
 
                     if progress is not None:
-                        progress.update(len(batch["paths"]))
+                        if accelerator is not None:
+                            completed = torch.tensor(
+                                len(batch["paths"]), device=device, dtype=torch.long
+                            )
+                            total_completed = accelerator.reduce(completed, reduction="sum")
+                            if main_process:
+                                progress.update(int(total_completed.item()))
+                        else:
+                            progress.update(len(batch["paths"]))
                     if batch_counter % _LOG_BATCH_FLUSH_INTERVAL == 0:
                         self._flush_log_buffer()
         finally:
@@ -391,7 +403,11 @@ class EmbeddingCache:
         if progress is not None:
             progress.close()
 
-        print("[Embeddings] Cache population complete")
+        if accelerator is not None:
+            accelerator.wait_for_everyone()
+
+        if main_process:
+            logger("[Embeddings] Cache population complete")
         vae.train(vae_prev_mode)
 
     @staticmethod
@@ -1013,7 +1029,8 @@ def _ensure_cuda_context(device: torch.device) -> None:
 def _execute_task(
     task: MultiPrecomputeTask,
     *,
-    device: torch.device,
+    device: torch.device | None,
+    accelerator: "Accelerator" | None,
     overwrite: bool,
     skip_existing: bool,
     index: int,
@@ -1024,11 +1041,26 @@ def _execute_task(
 ) -> None:
     from .image_folder_dataset import ImageFolderDataset  # Local import to avoid circular dependency.
 
-    logger = log or print
+    if accelerator is not None:
+        is_main_process = accelerator.is_main_process
+
+        def logger(message: str) -> None:
+            if is_main_process:
+                (log or print)(message)
+
+        active_device = accelerator.device
+    else:
+        if device is None:
+            raise RuntimeError("Device must be provided when accelerator is not in use")
+
+        def logger(message: str) -> None:
+            (log or print)(message)
+
+        active_device = device
 
     logger(
         f"[Embeddings] Task {index}/{total} :: {task.vae_name} at {task.display_resolution}"
-        f" [device={device}]"
+        f" [device={active_device}]"
     )
 
     if not task.dataset_path.exists() or not task.dataset_path.is_dir():
@@ -1088,28 +1120,40 @@ def _execute_task(
     start = time.perf_counter()
     logger(f"[Embeddings] Starting VAE encoding for task '{task.vae_name}'...")
 
-    _ensure_cuda_context(device)
+    _ensure_cuda_context(active_device)
     vae = _load_vae(task)
-    to_kwargs = {"device": device}
     if task.weights_dtype is not None:
-        to_kwargs["dtype"] = task.weights_dtype
-    vae = vae.to(**to_kwargs)
+        vae = vae.to(dtype=task.weights_dtype)
+    if accelerator is None:
+        to_kwargs = {"device": active_device}
+        if task.weights_dtype is not None:
+            to_kwargs["dtype"] = task.weights_dtype
+        vae = vae.to(**to_kwargs)
     vae.eval()
-    logger(f"[Embeddings] VAE moved to device {device} with dtype {to_kwargs.get('dtype', 'default')}")
+    logger(
+        f"[Embeddings] VAE ready on device {active_device} with dtype "
+        f"{next(vae.parameters()).dtype}"
+    )
 
     cache.ensure_populated(
         dataset,
         vae,
-        device=device,
+        device=active_device,
         encode_dtype=next(vae.parameters()).dtype,
         seed=0,
-        accelerator=None,
+        accelerator=accelerator,
         progress_position=progress_position,
         progress_desc=progress_desc,
         log=logger,
     )
 
-    cache.validate_dataset(dataset)
+    if accelerator is not None:
+        accelerator.wait_for_everyone()
+        if accelerator.is_main_process:
+            cache._cache_index = cache._load_cache_log()
+            cache.validate_dataset(dataset)
+    else:
+        cache.validate_dataset(dataset)
     elapsed = time.perf_counter() - start
 
     logger(
@@ -1117,77 +1161,11 @@ def _execute_task(
     )
 
     del vae
-    if device.type == "cuda":
-        _ensure_cuda_context(device)
+    if active_device.type == "cuda":
+        _ensure_cuda_context(active_device)
         torch.cuda.empty_cache()
-    logger(f"[Embeddings] CUDA cache cleared for device {device}")
-
-
-def _run_parallel_tasks(
-    tasks: List[MultiPrecomputeTask],
-    devices: Sequence[torch.device],
-    *,
-    overwrite: bool,
-    skip_existing: bool,
-) -> None:
-    lock = threading.Lock()
-    enumerator = iter(enumerate(tasks, start=1))
-    total = len(tasks)
-
-    tqdm.set_lock(threading.RLock())
-    overall_progress = tqdm(
-        total=total,
-        desc="VAE tasks",
-        position=len(devices),
-        leave=True,
-        dynamic_ncols=True,
-        unit="task",
-    )
-    log = tqdm.write
-    device_positions = {str(device): idx for idx, device in enumerate(devices)}
-
-    def worker(device: torch.device) -> None:
-        _ensure_cuda_context(device)
-        position = device_positions[str(device)]
-        while True:
-            with lock:
-                try:
-                    index, task = next(enumerator)
-                except StopIteration:
-                    return
-            desc = f"{task.vae_name} ({task.display_resolution})"
-            log(
-                f"[Embeddings] Device {device} starting task {task.vae_name}"
-                f" at {task.display_resolution}"
-            )
-            try:
-                _execute_task(
-                    task,
-                    device=device,
-                    overwrite=overwrite,
-                    skip_existing=skip_existing,
-                    index=index,
-                    total=total,
-                    progress_position=position,
-                    progress_desc=desc,
-                    log=log,
-                )
-            except Exception:
-                raise
-            else:
-                overall_progress.update(1)
-                log(
-                    f"[Embeddings] Device {device} finished task {task.vae_name}"
-                    f" at {task.display_resolution}"
-                )
-
-    try:
-        with ThreadPoolExecutor(max_workers=len(devices)) as executor:
-            futures = [executor.submit(worker, device) for device in devices]
-            for future in futures:
-                future.result()
-    finally:
-        overall_progress.close()
+    if accelerator is None or accelerator.is_main_process:
+        logger(f"[Embeddings] CUDA cache cleared for device {active_device}")
 
 
 def _run_from_config(args: argparse.Namespace) -> None:
@@ -1223,39 +1201,71 @@ def _run_from_config(args: argparse.Namespace) -> None:
         device_list=args.devices if args.devices is not None else default_device_list,
         default_device=multi_cfg.defaults.device,
     )
-    _log(f"Resolved {len(devices)} device(s): {[str(d) for d in devices]}")
-    _log(
+
+    accelerator: "Accelerator" | None = None
+    active_device: torch.device | None = None
+
+    if len(devices) > 1:
+        try:
+            from accelerate import Accelerator
+        except ImportError as exc:  # pragma: no cover - runtime dependency
+            raise RuntimeError(
+                "Multiple devices requested but 'accelerate' is not installed. "
+                "Install accelerate or request a single device."
+            ) from exc
+
+        accelerator = Accelerator()
+        world_size = accelerator.num_processes
+        if world_size != len(devices) and accelerator.is_main_process:
+            _log(
+                f"[Embeddings] Warning: configuration specifies {len(devices)} device(s) but "
+                f"accelerate initialized with {world_size} process(es)."
+            )
+        index = min(accelerator.process_index, len(devices) - 1)
+        active_device = devices[index]
+        log_fn: Callable[[str], None] = accelerator.print
+    else:
+        accelerator = None
+        active_device = devices[0]
+        log_fn = _log
+
+    log_fn(f"Resolved {len(devices)} device(s): {[str(d) for d in devices]}")
+    log_fn(
         f"Prepared {len(tasks)} task(s) for multi-VAE precomputation using {len(devices)} device(s)"
     )
 
     overall_start = time.perf_counter()
 
-    if len(devices) == 1:
-        device = devices[0]
-        _log(f"Running tasks sequentially on single device {device}")
-        for index, task in enumerate(tasks, start=1):
-            desc = f"{task.vae_name} ({task.display_resolution})"
-            _log(f"Queueing task {index}/{len(tasks)}: {task.vae_name} at {task.display_resolution}")
-            _execute_task(
-                task,
-                device=device,
-                overwrite=args.overwrite,
-                skip_existing=args.skip_existing,
-                index=index,
-                total=len(tasks),
-                progress_desc=desc,
-            )
+    if accelerator is None:
+        log_fn(f"Running tasks sequentially on single device {active_device}")
     else:
-        _log(f"Running tasks in parallel on {len(devices)} devices")
-        _run_parallel_tasks(
-            tasks,
-            devices,
-            overwrite=args.overwrite,
-            skip_existing=args.skip_existing,
+        log_fn(
+            f"Running tasks with accelerate across {accelerator.num_processes} process(es)"
         )
 
+    for index, task in enumerate(tasks, start=1):
+        desc = f"{task.vae_name} ({task.display_resolution})"
+        if accelerator is None or accelerator.is_main_process:
+            log_fn(
+                f"Queueing task {index}/{len(tasks)}: {task.vae_name} at {task.display_resolution}"
+            )
+        _execute_task(
+            task,
+            device=active_device if accelerator is None else None,
+            accelerator=accelerator,
+            overwrite=args.overwrite,
+            skip_existing=args.skip_existing,
+            index=index,
+            total=len(tasks),
+            progress_desc=desc,
+        )
+
+    if accelerator is not None:
+        accelerator.wait_for_everyone()
+
     total_elapsed = time.perf_counter() - overall_start
-    _log(f"Multi-VAE precomputation finished in {total_elapsed:.1f}s total")
+    if accelerator is None or accelerator.is_main_process:
+        log_fn(f"Multi-VAE precomputation finished in {total_elapsed:.1f}s total")
 
 
 def main() -> None:
