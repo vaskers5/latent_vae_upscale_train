@@ -2,6 +2,7 @@ import cv2
 import inspect
 import numpy as np
 import os
+import time
 import torch
 import warnings
 from collections import OrderedDict
@@ -58,6 +59,11 @@ class SwinIRLatentModel(SwinIRModel):
         self.vae = None
         if VAE_AVAILABLE:
             self._load_vae()
+        self.sr_comparison_model = None
+        self.sr_comparison_scale = 1
+        self.sr_comparison_window_size = 1
+        self.sr_comparison_enabled = False
+        self._load_comparison_swinir_model()
 
     def init_training_settings(self):
         """Override to handle space-aware loss initialization"""
@@ -232,6 +238,101 @@ class SwinIRLatentModel(SwinIRModel):
         except Exception as e:
             print(f"Warning: Could not load Flux VAE: {e}")
             self.vae = None
+
+    def _load_comparison_swinir_model(self):
+        """Optionally load a pretrained image-space SwinIR model for validation comparison."""
+
+        val_opt = self.opt.get("val", {}) if isinstance(self.opt.get("val"), dict) else {}
+        comparison_opt = val_opt.get("sr_comparison")
+        if not comparison_opt:
+            return
+
+        network_opt = comparison_opt.get("network_g")
+        if not isinstance(network_opt, dict):
+            logger = get_root_logger()
+            logger.warning(
+                "sr_comparison configuration is missing 'network_g'; skipping comparison model load."
+            )
+            return
+
+        try:
+            self.sr_comparison_model = build_network(network_opt)
+            self.sr_comparison_model = self.sr_comparison_model.to(self.device)
+            self.sr_comparison_model.eval()
+
+            load_path = comparison_opt.get("pretrain_network_g")
+            param_key = comparison_opt.get("param_key", "params")
+            strict = comparison_opt.get("strict_load", True)
+            if load_path:
+                self.load_network(
+                    self.sr_comparison_model,
+                    load_path,
+                    strict=strict,
+                    param_key=param_key,
+                )
+
+            self.sr_comparison_scale = comparison_opt.get(
+                "scale",
+                network_opt.get("scale")
+                if isinstance(network_opt, dict)
+                else comparison_opt.get("scale", 1),
+            ) or 1
+            self.sr_comparison_window_size = network_opt.get("window_size", 1)
+            self.sr_comparison_enabled = True
+            logger = get_root_logger()
+            logger.info(
+                "Loaded pretrained SwinIR comparison model for validation checks."
+            )
+        except Exception as exc:
+            logger = get_root_logger()
+            logger.warning(
+                f"Failed to initialize sr_comparison model: {exc}. Comparison will be skipped."
+            )
+            self.sr_comparison_model = None
+            self.sr_comparison_enabled = False
+
+    def _run_swinir_sr_comparison(self, decoded_lq):
+        """Run the pretrained SwinIR comparison model on decoded low-quality images."""
+
+        if not self.sr_comparison_enabled or self.sr_comparison_model is None:
+            return None
+
+        if decoded_lq is None:
+            return None
+
+        window_size = max(int(self.sr_comparison_window_size or 1), 1)
+        scale = max(int(self.sr_comparison_scale or 1), 1)
+
+        with torch.no_grad():
+            # Convert to [0, 1] range expected by image-space SR models
+            sr_input = torch.clamp((decoded_lq + 1.0) / 2.0, 0.0, 1.0)
+
+            mod_pad_h, mod_pad_w = 0, 0
+            if window_size > 1:
+                _, _, h, w = sr_input.size()
+                if h % window_size != 0:
+                    mod_pad_h = window_size - h % window_size
+                if w % window_size != 0:
+                    mod_pad_w = window_size - w % window_size
+                if mod_pad_h > 0 or mod_pad_w > 0:
+                    sr_input = F.pad(sr_input, (0, mod_pad_w, 0, mod_pad_h), mode="reflect")
+
+            sr_output = self.sr_comparison_model(sr_input)
+
+            if mod_pad_h > 0 or mod_pad_w > 0:
+                _, _, h, w = sr_output.size()
+                sr_output = sr_output[
+                    :,
+                    :,
+                    0 : h - mod_pad_h * scale,
+                    0 : w - mod_pad_w * scale,
+                ]
+
+            # Clamp to valid range and convert back to [-1, 1] to match VAE decoded tensors
+            sr_output = torch.clamp(sr_output, 0.0, 1.0)
+            sr_output = sr_output * 2.0 - 1.0
+
+        return sr_output
 
     def decode_latents(self, latents):
         """Decode latents to RGB images using VAE"""
@@ -517,18 +618,76 @@ class SwinIRLatentModel(SwinIRModel):
         )
         wandb_image_count = 0
 
+        comparison_possible = self.vae is not None and self.sr_comparison_enabled
+        comparison_logger = get_root_logger() if comparison_possible else None
+        method1_times, method2_times = [], []
+        l1_diffs, mse_diffs = [], []
+        comparison_details = []
+
         for idx, val_data in enumerate(dataloader):
             img_name = osp.splitext(osp.basename(val_data["lq_path"][0]))[0]
             self.feed_data(val_data)
-            self.test()
 
             lq_latent = self.lq.detach()
-            pred_latent = self.output.detach()
             gt_latent = self.gt.detach() if hasattr(self, "gt") else None
+
+            # --- Method 1: latent -> model -> VAE decode ---
+            method1_start = time.perf_counter()
+            self.test()
+            pred_latent = self.output.detach()
+            decoded_pred = None
+            if self.vae is not None:
+                decoded_pred = self.decode_latents(pred_latent)
+            method1_time = time.perf_counter() - method1_start
+            if decoded_pred is not None:
+                method1_times.append(method1_time)
+
+            # --- Method 2: latent -> VAE decode -> pretrained SwinIR SR ---
+            decoded_lq = None
+            sr_output = None
+            method2_time = None
+            if self.vae is not None:
+                if comparison_possible:
+                    method2_start = time.perf_counter()
+                    decoded_lq = self.decode_latents(lq_latent)
+                    sr_output = self._run_swinir_sr_comparison(decoded_lq)
+                    method2_time = time.perf_counter() - method2_start
+                    if sr_output is not None:
+                        method2_times.append(method2_time)
+                else:
+                    decoded_lq = self.decode_latents(lq_latent)
+
+            decoded_gt = None
+            if self.vae is not None and gt_latent is not None:
+                decoded_gt = self.decode_latents(gt_latent)
+
+            # --- Comparison metrics between both methods ---
+            if decoded_pred is not None and sr_output is not None:
+                l1_diff = F.l1_loss(decoded_pred, sr_output).item()
+                mse_diff = F.mse_loss(decoded_pred, sr_output).item()
+                l1_diffs.append(l1_diff)
+                mse_diffs.append(mse_diff)
+                comparison_details.append(
+                    {
+                        "image": img_name,
+                        "method1_time": method1_time,
+                        "method2_time": method2_time,
+                        "l1": l1_diff,
+                        "mse": mse_diff,
+                    }
+                )
+                if comparison_logger is not None:
+                    comparison_logger.info(
+                        "Validation comparison - %s: method1 %.4fs, method2 %.4fs, L1 %.6f, MSE %.6f",
+                        img_name,
+                        method1_time,
+                        method2_time,
+                        l1_diff,
+                        mse_diff,
+                    )
 
             # --- Visualization ---
             if save_img and gt_latent is not None:
-                # Determine save path
                 if self.opt["is_train"]:
                     save_path = osp.join(
                         self.opt["path"]["visualization"],
@@ -544,28 +703,30 @@ class SwinIRLatentModel(SwinIRModel):
                     )
                 os.makedirs(osp.dirname(save_path), exist_ok=True)
 
-                # Decode all latents to images if VAE is available
-                decoded_lq, decoded_pred, decoded_gt = None, None, None
-                if self.vae:
-                    decoded_lq = self.decode_latents(lq_latent)
-                    decoded_pred = self.decode_latents(pred_latent)
-                    decoded_gt = self.decode_latents(gt_latent)
+                decoded_lq_plot = decoded_lq
+                decoded_pred_plot = decoded_pred
+                decoded_gt_plot = decoded_gt
+                if self.vae is not None:
+                    if decoded_lq_plot is None:
+                        decoded_lq_plot = self.decode_latents(lq_latent)
+                    if decoded_pred_plot is None:
+                        decoded_pred_plot = self.decode_latents(pred_latent)
+                    if decoded_gt_plot is None and gt_latent is not None:
+                        decoded_gt_plot = self.decode_latents(gt_latent)
 
-                # Decide whether to log this image to wandb
                 should_log_wandb = log_to_wandb and wandb_image_count < max_wandb_images
                 if should_log_wandb:
                     wandb_image_count += 1
 
-                # Generate and save the plot
                 self._save_comparison_plot(
                     save_path,
                     img_name,
                     lq_latent.cpu(),
                     pred_latent.cpu(),
                     gt_latent.cpu(),
-                    decoded_lq.cpu() if decoded_lq is not None else None,
-                    decoded_pred.cpu() if decoded_pred is not None else None,
-                    decoded_gt.cpu() if decoded_gt is not None else None,
+                    decoded_lq_plot.cpu() if decoded_lq_plot is not None else None,
+                    decoded_pred_plot.cpu() if decoded_pred_plot is not None else None,
+                    decoded_gt_plot.cpu() if decoded_gt_plot is not None else None,
                     log_to_wandb=should_log_wandb,
                     current_iter=current_iter,
                 )
@@ -584,6 +745,48 @@ class SwinIRLatentModel(SwinIRModel):
 
         if pbar:
             pbar.close()
+
+        self.validation_comparison_details = comparison_details
+
+        avg_method1 = float(np.mean(method1_times)) if method1_times else None
+        avg_method2 = float(np.mean(method2_times)) if method2_times else None
+        avg_l1 = float(np.mean(l1_diffs)) if l1_diffs else None
+        avg_mse = float(np.mean(mse_diffs)) if mse_diffs else None
+
+        self.validation_comparison_summary = {
+            "method1_time": avg_method1,
+            "method2_time": avg_method2,
+            "l1": avg_l1,
+            "mse": avg_mse,
+        }
+
+        if comparison_possible and (avg_method1 is not None or avg_method2 is not None):
+            summary_logger = comparison_logger or get_root_logger()
+            summary_logger.info(
+                "Validation comparison summary: method1 %s, method2 %s, L1 %s, MSE %s",
+                f"{avg_method1:.4f}s" if avg_method1 is not None else "N/A",
+                f"{avg_method2:.4f}s" if avg_method2 is not None else "N/A",
+                f"{avg_l1:.6f}" if avg_l1 is not None else "N/A",
+                f"{avg_mse:.6f}" if avg_mse is not None else "N/A",
+            )
+
+            if tb_logger is not None and hasattr(tb_logger, "add_scalar"):
+                if avg_method1 is not None:
+                    tb_logger.add_scalar(
+                        "val/comparison_method1_time", avg_method1, current_iter
+                    )
+                if avg_method2 is not None:
+                    tb_logger.add_scalar(
+                        "val/comparison_method2_time", avg_method2, current_iter
+                    )
+                if avg_l1 is not None:
+                    tb_logger.add_scalar(
+                        "val/comparison_l1", avg_l1, current_iter
+                    )
+                if avg_mse is not None:
+                    tb_logger.add_scalar(
+                        "val/comparison_mse", avg_mse, current_iter
+                    )
 
         if with_metrics:
             # Loop through the metrics that were calculated
