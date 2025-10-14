@@ -117,22 +117,10 @@ def _build_dataloader(
     pin_memory: bool,
     collate_fn: Callable[[Sequence[Dict[str, Any]]], Dict[str, Any]],
 ) -> DataLoader:
-    sampler: Optional[DistributedSampler]
-    if accelerator.num_processes > 1:
-        sampler = DistributedSampler(
-            dataset,
-            num_replicas=accelerator.num_processes,
-            rank=accelerator.process_index,
-            shuffle=False,
-            drop_last=False,
-        )
-    else:
-        sampler = None
-
+    # Let Accelerate handle sharding. Do NOT attach a DistributedSampler here.
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
-        sampler=sampler,
         shuffle=False,
         num_workers=num_workers,
         pin_memory=pin_memory,
@@ -140,7 +128,6 @@ def _build_dataloader(
         persistent_workers=num_workers > 0,
     )
     return dataloader
-
 
 def _load_vae(model_cfg: ModelConfig) -> torch.nn.Module:
     source: Optional[str]
