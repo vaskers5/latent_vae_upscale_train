@@ -14,7 +14,7 @@ import torchvision.transforms.functional as TF
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
-from .precompute_embeddings import EmbeddingCache, TransformParams
+from .embedding_io import TransformParams
 
 __all__ = ["ImageFolderDataset", "UpscaleDataset"]
 
@@ -28,7 +28,7 @@ class ImageFolderDataset(Dataset):
         high_resolution: int,
         resize_long_side: int = 0,
         limit: int = 0,
-        embedding_cache: Optional[EmbeddingCache] = None,
+        embedding_cache: Optional[Any] = None,
         model_resolution: int = 0,
     ) -> None:
         print(
@@ -65,7 +65,7 @@ class ImageFolderDataset(Dataset):
                         return all_images
         return all_images[:limit] if limit > 0 else all_images
 
-    def set_embedding_cache(self, cache: Optional[EmbeddingCache]) -> None:
+    def set_embedding_cache(self, cache: Optional[Any]) -> None:
         self.embedding_cache = cache
 
     def __len__(self) -> int:

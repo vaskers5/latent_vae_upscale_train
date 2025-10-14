@@ -2,6 +2,6 @@
 
 from __future__ import annotations
 
-from .precompute_embeddings import EmbeddingCache, TransformParams
+from .embedding_io import CACHE_VERSION, TransformParams, save_record
 
-__all__ = ["EmbeddingCache", "TransformParams"]
+__all__ = ["TransformParams", "save_record", "CACHE_VERSION"]

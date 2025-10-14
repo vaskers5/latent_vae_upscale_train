@@ -1,8 +1,7 @@
-"""Image folder dataset helpers used by the VAE trainer."""
+"""Dataset helpers for iterating over image folders."""
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
@@ -11,7 +10,7 @@ import torch
 import torchvision.transforms.functional as TF
 from torch.utils.data import Dataset
 
-from .precompute_embeddings import EmbeddingCache, TransformParams
+from .embedding_io import TransformParams
 
 __all__ = ["ImageFolderDataset"]
 
@@ -25,44 +24,35 @@ class ImageFolderDataset(Dataset):
         high_resolution: int,
         resize_long_side: int = 0,
         limit: int = 0,
-        embedding_cache: Optional[EmbeddingCache] = None,
+        embedding_cache: Optional[Any] = None,
         model_resolution: int = 0,
     ) -> None:
-        print(
-            f"[Dataset] Initializing ImageFolderDataset with root={root}, high_resolution={high_resolution}, "
-            f"resize_long_side={resize_long_side}, limit={limit}"
-        )
         self.root = Path(root).expanduser().resolve()
         self.high_resolution = high_resolution
-        self.paths: List[Path] = []
+        self.resize_long_side = resize_long_side
         self.embedding_cache = embedding_cache
         self.model_resolution = model_resolution
         self._needs_model_downsample = (
             self.model_resolution > 0 and self.model_resolution != self.high_resolution
         )
-        self.paths = self._collect_valid_paths(limit=limit)
-        print(f"[Dataset] Collected {len(self.paths)} valid paths")
+        self.paths = self._collect_paths(limit)
         if not self.paths:
             raise RuntimeError(f"No valid images found under '{self.root}'")
-        print(f"[Dataset] Total dataset length: {len(self.paths)}")
 
-    def _collect_valid_paths(self, limit: int = 0) -> List[Path]:
-        print(f"[Dataset] Collecting valid image paths from {self.root}...")
-        return self._collect_from_disk(limit=limit)
-
-    def _collect_from_disk(self, limit: int = 0) -> List[Path]:
-        all_images: List[Path] = []
+    def _collect_paths(self, limit: int) -> List[Path]:
         exts = {".png", ".jpg", ".jpeg", ".webp"}
-        for root, _dirs, files in os.walk(self.root):
-            for file in files:
-                if os.path.splitext(file)[1].lower() in exts:
-                    full_path = Path(os.path.abspath(os.path.join(root, file)))
-                    all_images.append(full_path)
-                    if limit > 0 and len(all_images) >= limit:
-                        return all_images
-        return all_images[:limit] if limit > 0 else all_images
+        collected: List[Path] = []
+        for path in sorted(self.root.rglob("*")):
+            if not path.is_file():
+                continue
+            if path.suffix.lower() not in exts:
+                continue
+            collected.append(path)
+            if limit > 0 and len(collected) >= limit:
+                break
+        return collected if limit == 0 else collected[:limit]
 
-    def set_embedding_cache(self, cache: Optional[EmbeddingCache]) -> None:
+    def set_embedding_cache(self, cache: Optional[Any]) -> None:
         self.embedding_cache = cache
 
     def __len__(self) -> int:
@@ -70,27 +60,25 @@ class ImageFolderDataset(Dataset):
 
     def __getitem__(self, index: int):
         path = self.paths[index]
-        print(f"[Dataset] Loading sample {index} from path: {path}")
-        if self.embedding_cache is None or not self.embedding_cache.cfg.enabled:
-            tensor, _params = self.build_tensor_sample(path)
-            return {
-                "image": tensor,
-                "model_input": self.prepare_model_input(tensor),
-            }
-
-        record = self.embedding_cache.choose_record(path)
-        tensor, params = self.build_tensor_sample(path, params=record.params)
+        tensor, params = self.build_tensor_sample(path)
         sample = {
             "image": tensor,
             "model_input": self.prepare_model_input(tensor),
-            "latents": record.latents,
-            "path": str(path),
-            "variant_index": record.variant_index,
+            "params": params,
+            "path": path,
         }
-        if record.mean is not None:
-            sample["latent_mean"] = record.mean
-        if record.logvar is not None:
-            sample["latent_logvar"] = record.logvar
+        if self.embedding_cache is not None:
+            record = self.embedding_cache.choose_record(path)
+            sample.update(
+                {
+                    "latents": record.latents,
+                    "variant_index": record.variant_index,
+                }
+            )
+            if record.mean is not None:
+                sample["latent_mean"] = record.mean
+            if record.logvar is not None:
+                sample["latent_logvar"] = record.logvar
         return sample
 
     def build_tensor_sample(
