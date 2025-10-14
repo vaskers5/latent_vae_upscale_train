@@ -1,0 +1,155 @@
+# general settings
+# CUDA_VISIBLE_DEVICES=0,1,2,3 python -m torch.distributed.launch --nproc_per_node=4 --master_port=4321 basicsr/train.py -opt options/train/SwinIR/train_SwinIR_latent_sr_kaggle.yml --launcher pytorch
+name: swinirdefauilt_midjorneycrops_1stage_l1latent_full_dataset
+model_type: SwinIRLatentModel
+scale: 2
+num_gpu: 6
+manual_seed: 0
+
+# dataset and data loader settings
+datasets:
+  train:
+    name: MidjourneyCropsFluxVAE_train_1_2M
+    type: LatentCacheDataset
+
+    high_res: 256
+    low_res: 128
+    cache_dirs:
+      - /data/kazanplova/datasets/midjourney_full_ds_crops/embeddings/flux_vae
+    vae_names: flux_vae
+    phase: train
+
+    filename_tmpl: "{}"
+    io_backend:
+      type: disk
+    scale: 2
+    phase: train
+    # No normalization for latent data
+    mean: null
+    std: null
+    # data loader
+    num_worker_per_gpu: 24
+    batch_size_per_gpu: 672
+    prefetch_mode: cuda
+    pin_memory: true
+
+
+  val:
+    name: WallpapersFlux
+    type: LatentCacheDataset
+    high_res: 512
+    low_res: 256
+    cache_dirs:
+      - /data/kazanplova/latent_vae_upscale_train/flux_val/256_512/embeddings
+    vae_names: flux_vae
+    phase: val
+
+    io_backend:
+      type: disk
+    scale: 2
+    mean: null
+    std: null
+    batch_size_per_gpu: 128
+    pin_memory: true
+
+# network structures
+network_g:
+  type: SwinIR
+  upscale: 2
+  in_chans: 16 # 16 channels for latent representations
+  img_size: 16 # Input latent size (16x16)
+  window_size: 8
+  img_range: 1.
+  depths: [6, 6, 6, 6, 6, 6]
+  embed_dim: 180
+  num_heads: [6, 6, 6, 6, 6, 6]
+  mlp_ratio: 2
+  upsampler: "pixelshuffle"
+  resi_connection: "1conv"
+
+# path
+path:
+  # pretrain_network_g: ./runs/2025_10_13_234001_train_SwinIR_latent_SRx2_default_l1/train_SwinIR_latent_SRx2_default_l1/models/net_g_latest.pth
+  strict_load_g: true
+  resume_state: ~
+
+# training settings
+train:
+  ema_decay: 0.999
+  optim_g:
+    type: Adam
+    lr: !!float 2e-4
+    weight_decay: 0
+    betas: [0.9, 0.99]
+
+  scheduler:
+    type: MultiStepLR
+    milestones: [250000, 400000, 450000, 475000]
+    gamma: 0.5
+
+  total_steps: 30000
+  warmup_iter: -1 # no warm up
+
+  # losses
+  # Losses can be calculated in two spaces:
+  # - "latent": Direct calculation on latent representations (faster, no VAE needed)
+  # - "pixel": After VAE decoding to images (slower, requires VAE, more interpretable)
+
+  # --- Latent Space Losses ---
+  # pixel_opt_latent:
+  l1_latent_opt:
+    type: L1Loss
+    loss_weight: 1.0
+    reduction: mean
+    space: latent
+
+# validation settings
+val:
+  val_freq: 1000
+  save_img: true
+  metrics:
+    # --- Latent Space Metrics ---
+    l1_latent:
+      type: L1Loss
+      space: latent # Explicitly state the space
+    l2_latent:
+      type: MSELoss
+      space: latent
+
+    # --- Pixel Space Metrics (requires VAE) ---
+    pixel_psnr_pt:
+      type: calculate_psnr_pt # Use the PyTorch version for efficiency
+      space: pixel
+      crop_border: 2
+      test_y_channel: false
+
+    pixel_ssim_pt:
+      type: calculate_ssim_pt
+      space: pixel
+      crop_border: 2
+      test_y_channel: false
+
+# logging settings
+logger:
+  print_freq: 100
+  save_checkpoint_freq: 2000 #!!float 5e3
+  use_tb_logger: true
+  wandb:
+    project: SwinIR-Latent-SR
+    entity: kazanplova-it-more
+    resume_id: null
+    # Maximum number of validation images to log to wandb per validation run
+    # This prevents cluttering your wandb dashboard with too many images
+    max_val_images: 8
+
+# dist training settings
+dist_params:
+  backend: nccl
+  port: 29500
+  dist: true
+
+# resume state
+resume_state: ~
+
+# load network only
+load_networks_only: false
