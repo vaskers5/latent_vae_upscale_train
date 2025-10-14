@@ -15,22 +15,15 @@ from tqdm import tqdm
 __all__ = ["ImageFolderDataset"]
 
 
-class ImageFolderDataset(Dataset):
-    """Recursively reads images and returns centred crops normalised to [-1, 1]."""
 
+class ImageFolderDataset(Dataset):
     def __init__(
         self,
-        root: Path,
+        paths: List[Path],
     ) -> None:
-        self.root = os.path.abspath(root)
-        self.paths = self._collect_paths()
+        self.paths = paths
         if not self.paths:
             raise RuntimeError(f"No valid images found under '{self.root}'")
-
-    def _collect_paths(self) -> List[Path]:
-        exts = {"png", "jpg", "jpeg", "webp"}
-        all_images = [os.path.join(self.root, p) for p in os.listdir(self.root) if p.split(".")[-1] in exts]
-        return all_images
 
     def __len__(self) -> int:
         return len(self.paths)

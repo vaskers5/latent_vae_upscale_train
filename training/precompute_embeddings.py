@@ -32,6 +32,28 @@ class ResolutionTask:
     batch_size: int
 
 
+class SimpleEmbeddingsDataset(torch.utils.data.Dataset):
+    def __init__(self, embeddings_dir: Path, img_dir: Path) -> None:
+        self.embeddings_dir = embeddings_dir
+        self.images = [os.path.join(img_dir, p) for p in os.listdir(img_dir) if p.split(".")[-1] in {"png", "jpg", "jpeg", "webp"}]
+        self.embeddings_paths = [embeddings_dir / (Path(p).name.rsplit(".", 1)[0] + ".pt") for p in self.images]
+        if not self.embeddings_paths:
+            raise RuntimeError(f"No embedding files found under '{self.embeddings_dir}'")
+
+    def __len__(self) -> int:
+        return len(self.embeddings_paths)
+
+    def __getitem__(self, index: int) -> Dict[str, Any]:
+        embed_path = self.embeddings_paths[index]
+        img_path = self.images[index]
+        try:
+            torch.load(embed_path)
+            return ""
+        except Exception:
+            return img_path
+            
+    
+
 @dataclass(frozen=True)
 class ModelConfig:
     name: str
@@ -300,9 +322,9 @@ def _encode_resolution(
                     logvar=logvar_tensor,
                 )
 
+            local_count = torch.tensor(len(batch["paths"]), device=device, dtype=torch.long)
+            completed = accelerator.reduce(local_count, reduction="sum")
             if progress is not None and accelerator.is_main_process:
-                local_count = torch.tensor(len(batch["paths"]), device=device, dtype=torch.long)
-                completed = accelerator.reduce(local_count, reduction="sum")
                 progress.update(int(completed.item()))
 
     if progress is not None:
@@ -353,8 +375,15 @@ def run_precompute(args: argparse.Namespace) -> None:
             embeddings_dir = cache_root / model_cfg.cache_subdir / f"{task.resolution}px"
             embeddings_dir.mkdir(parents=True, exist_ok=True)
 
+            images_to_process = []
+            for img_batch in tqdm(torch.utils.data.DataLoader(SimpleEmbeddingsDataset(embeddings_dir, resolution_dir),
+                                                              batch_size=task.batch_size, num_workers=num_workers)):
+                for img in img_batch:
+                    if img != "":
+                        images_to_process.append(img)
+
             dataset = ImageFolderDataset(
-                resolution_dir,
+                paths=images_to_process,
             )
             per_device_batch_size = task.batch_size
             dataloader = _build_dataloader(

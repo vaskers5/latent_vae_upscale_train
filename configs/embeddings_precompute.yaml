@@ -23,8 +23,8 @@ models:
     vae_kind: kl
     cache_subdir: flux_vae
     resolutions_with_batchsize:
-      - [128, 128]
-      - [256, 224]
+      - [128, 1024]
+      - [256, 256]
   #     - [512, 64]
   # sd3_vae_anime_ft:
   #   hf_repo: Disty0/sd3_vae_anime_ft
