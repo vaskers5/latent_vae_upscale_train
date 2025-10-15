@@ -56,7 +56,7 @@ class SimpleEmbeddingsDataset(torch.utils.data.Dataset):
                 img = img.convert("RGB")
                 img.close()
                 return img_path
-            except Exception:
+            except Exception as e:
                 return ""
 
 

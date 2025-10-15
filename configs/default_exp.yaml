@@ -1,9 +1,9 @@
 # general settings
 # CUDA_VISIBLE_DEVICES=0,1,2,3 python -m torch.distributed.launch --nproc_per_node=4 --master_port=4321 basicsr/train.py -opt options/train/SwinIR/train_SwinIR_latent_sr_kaggle.yml --launcher pytorch
-name: swinirdefauilt_midjorneycrops_1stage_l1latent_full_dataset
+name: swinirdefauilt_midjourney_feat_openim_5M_1stage_sdxl_l1latent_full_dataset
 model_type: SwinIRLatentModel
 scale: 2
-num_gpu: 6
+num_gpu: 1
 manual_seed: 0
 
 vae_sources:
@@ -17,14 +17,17 @@ vae_sources:
 # dataset and data loader settings
 datasets:
   train:
+    scan_workers: 32
     name: MidjourneyCropsFluxVAE_train_1_2M
     type: LatentCacheDataset
 
     high_res: 256
     low_res: 128
     cache_dirs:
-      - /data/kazanplova/datasets/midjourney_full_ds_crops/embeddings/flux_vae
-    vae_names: [flux_vae]
+    cache_dirs:
+      - /data/kazanplova/datasets/midjourney_full_ds_crops/embeddings/sdxl_vae
+      - /data/kazanplova/datasets/openim_cropped/train_latents/sdxl_vae
+    vae_names: [sdxl_vae]
     phase: train
 
     filename_tmpl: "{}"
@@ -43,13 +46,14 @@ datasets:
 
 
   val:
+    scan_workers: 1
     name: WallpapersFlux
     type: LatentCacheDataset
     high_res: 512
     low_res: 256
     cache_dirs:
-      - /data/kazanplova/latent_vae_upscale_train/flux_val/256_512/embeddings
-    vae_names: [flux_vae]
+      - /data/kazanplova/latent_vae_upscale_train/flux_val/256_512/embeddings/sdxl_vae
+    vae_names: [sdxl_vae]
     phase: val
 
     io_backend:
@@ -64,7 +68,7 @@ datasets:
 network_g:
   type: SwinIR
   upscale: 2
-  in_chans: 16 # 16 channels for latent representations
+  in_chans: 4 # 16 channels for latent representations
   img_size: 16 # Input latent size (16x16)
   window_size: 8
   img_range: 1.
@@ -113,7 +117,7 @@ train:
 
 # validation settings
 val:
-  val_freq: 1000
+  val_freq: 25
   save_img: true
   metrics:
     # --- Latent Space Metrics ---
@@ -139,7 +143,7 @@ val:
 
 # logging settings
 logger:
-  print_freq: 100
+  print_freq: 25
   save_checkpoint_freq: 2000 #!!float 5e3
   use_tb_logger: true
   wandb:

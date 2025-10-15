@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Sequence, Tuple
+import random
 
 import torch
 from torch.utils import data as data
@@ -53,6 +54,7 @@ class LatentCacheDataset(data.Dataset):
 
         self._samples: List[_CacheSample] = []
         self._gather_samples(cache_dirs)
+        self._samples = random.sample(self._samples, len(self._samples))
         if not self._samples:
             raise RuntimeError("No latent pairs found in the provided cache directories.")
 
