@@ -31,10 +31,10 @@ from .swinir_model import SwinIRModel
 # Try to import VAE for decoding (optional)
 try:
     from diffusers import (
-        AsymmetricAutoencoderKL,
-        AutoencoderKL,
-        AutoencoderKLQwenImage,
-        AutoencoderKLWan,
+    AsymmetricAutoencoderKL,
+    AutoencoderKL,
+    AutoencoderKLQwenImage,
+    AutoencoderKLWan,
     )
 
     VAE_AVAILABLE = True
@@ -59,10 +59,12 @@ _DEFAULT_VAE_SOURCES: Dict[str, Dict[str, Any]] = {
     "flux_vae": {
         "hf_repo": "wolfgangblack/flux_vae",
         "vae_kind": "kl",
+        "latents_scaled": False,
     },
     "sdxl_vae": {
         "hf_repo": "stabilityai/sdxl-vae",
         "vae_kind": "kl",
+        "latents_scaled": False,
     },
 }
 
@@ -79,6 +81,7 @@ class _VaeSpec:
     hf_auth_token: Optional[str]
     vae_kind: str
     weights_dtype: Optional[torch.dtype]
+    latents_scaled: bool
 
     @property
     def cache_key(self) -> str:
@@ -141,6 +144,17 @@ def _build_spec_from_mapping(name: str, mapping: Any) -> _VaeSpec:
     vae_kind = str(mapping.get("vae_kind", "kl")).strip().lower() or "kl"
     weights_dtype = _resolve_dtype(mapping.get("weights_dtype"))
 
+    raw_scaled = mapping.get("latents_scaled")
+    if raw_scaled is None:
+        raw_scaled = mapping.get("latents_are_scaled")
+    if isinstance(raw_scaled, str):
+        norm = raw_scaled.strip().lower()
+        latents_scaled = norm in {"1", "true", "yes", "y", "on"}
+    elif raw_scaled is None:
+        latents_scaled = False
+    else:
+        latents_scaled = bool(raw_scaled)
+
     return _VaeSpec(
         name=name,
         load_from=load_from,
@@ -150,6 +164,7 @@ def _build_spec_from_mapping(name: str, mapping: Any) -> _VaeSpec:
         hf_auth_token=hf_auth_token,
         vae_kind=vae_kind,
         weights_dtype=weights_dtype,
+        latents_scaled=latents_scaled,
     )
 
 
@@ -294,7 +309,7 @@ class SwinIRLatentModel(SwinIRModel):
         logger.info("Auto-configured VAE '%s' from %s '%s'.", spec.name, origin, key)
         return spec
 
-    def _ensure_vae(self, name: Optional[str]) -> Optional[torch.nn.Module]:
+    def _ensure_vae(self, name: Optional[str]) -> Optional[Tuple[torch.nn.Module, _VaeSpec]]:
         if not VAE_AVAILABLE:
             return None
 
@@ -324,7 +339,7 @@ class SwinIRLatentModel(SwinIRModel):
             vae = vae.to(self.device)
             self._vae_cache[cache_key] = vae
 
-        return vae
+        return vae, spec
 
     def _instantiate_vae(self, spec: _VaeSpec) -> torch.nn.Module:
         kwargs: Dict[str, Any] = {}
@@ -630,9 +645,10 @@ class SwinIRLatentModel(SwinIRModel):
         decoded_outputs: List[Optional[torch.Tensor]] = [None] * batch_size
 
         for name, indices in grouped_indices.items():
-            vae = self._ensure_vae(name)
-            if vae is None:
+            ensured = self._ensure_vae(name)
+            if ensured is None:
                 return None
+            vae, spec = ensured
 
             params = next(vae.parameters())
             vae_device = params.device
@@ -642,7 +658,8 @@ class SwinIRLatentModel(SwinIRModel):
 
             with torch.no_grad():
                 scaling = getattr(getattr(vae, "config", None), "scaling_factor", 1.0) or 1.0
-                latent_chunk = latent_chunk / scaling
+                if spec.latents_scaled:
+                    latent_chunk = latent_chunk / scaling
                 decoded = vae.decode(latent_chunk).sample
                 decoded = torch.clamp(decoded, -1.0, 1.0)
 
