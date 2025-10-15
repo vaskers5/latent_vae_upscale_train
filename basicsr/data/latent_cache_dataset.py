@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 import torch
 from torch.utils import data as data
@@ -64,13 +66,38 @@ class LatentCacheDataset(data.Dataset):
         return normalized
 
     def _gather_samples(self, cache_dirs: Sequence[Path]) -> None:
-        for idx, cache_dir in enumerate(tqdm(cache_dirs, desc="Loading latent caches", unit="cache")):
-            vae_name = self._vae_names[idx] if idx < len(self._vae_names) else str(cache_dir)
-            cache_dir = cache_dir.expanduser().resolve()
-            pairs = self._collect_pairs(cache_dir, vae_name)
-            self._samples.extend(_CacheSample(lq_path=low, gt_path=high, vae_name=vae_name) for low, high in pairs)
+        tasks: List[Tuple[Path, str]] = []
+        for idx, cache_dir in enumerate(cache_dirs):
+            resolved_dir = cache_dir.expanduser().resolve()
+            vae_name = self._vae_names[idx] if idx < len(self._vae_names) else str(resolved_dir)
+            tasks.append((resolved_dir, vae_name))
 
-    def _collect_pairs(self, cache_dir: Path, vae_name: str) -> List[Tuple[Path, Path]]:
+        if not tasks:
+            return
+
+        if len(tasks) == 1:
+            cache_dir, vae_name = tasks[0]
+            self._samples.extend(self._collect_pairs(cache_dir, vae_name))
+            return
+
+        worker_opt = self.opt.get("scan_workers")
+        if worker_opt is not None:
+            max_workers = max(1, int(worker_opt))
+        else:
+            max_workers = min(len(tasks), os.cpu_count() or 1)
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_task = {
+                executor.submit(self._collect_pairs, cache_dir, vae_name): (cache_dir, vae_name)
+                for cache_dir, vae_name in tasks
+            }
+            with tqdm(total=len(future_to_task), desc="Loading latent caches", unit="cache") as progress:
+                for future in as_completed(future_to_task):
+                    samples = future.result()
+                    self._samples.extend(samples)
+                    progress.update(1)
+
+    def _collect_pairs(self, cache_dir: Path, vae_name: str) -> List[_CacheSample]:
         low_dir = cache_dir / f"{self._low_res}px"
         high_dir = cache_dir / f"{self._high_res}px"
 
@@ -79,19 +106,19 @@ class LatentCacheDataset(data.Dataset):
         if not high_dir.is_dir():
             raise FileNotFoundError(f"High-resolution cache directory missing: {high_dir}")
 
-        low_files = list(
-            tqdm(
-                self._iter_pt_files(low_dir),
-                desc=f"Scanning low-res files ({vae_name})",
-                unit="file",
-                leave=False,
-            )
-        )
-        high_filenames = {path.name for path in self._iter_pt_files(high_dir)}
+        low_filenames = self._scan_pt_filenames(low_dir)
+        high_filenames = self._scan_pt_filenames(high_dir)
+
+        if len(low_filenames) <= len(high_filenames):
+            high_lookup = set(high_filenames)
+            matched_names = [name for name in low_filenames if name in high_lookup]
+        else:
+            low_lookup = set(low_filenames)
+            matched_names = [name for name in high_filenames if name in low_lookup]
+
         matched_pairs = [
-            (low_path, high_dir / low_path.name)
-            for low_path in low_files
-            if low_path.name in high_filenames
+            _CacheSample(lq_path=low_dir / name, gt_path=high_dir / name, vae_name=vae_name)
+            for name in matched_names
         ]
         print(
             f"LatentCacheDataset matched {len(matched_pairs)} pairs in '{cache_dir}' "
@@ -100,8 +127,16 @@ class LatentCacheDataset(data.Dataset):
         return matched_pairs
 
     @staticmethod
-    def _iter_pt_files(directory: Path) -> Iterable[Path]:
-        return sorted(path for path in directory.glob("*.pt"))
+    def _scan_pt_filenames(directory: Path) -> List[str]:
+        entries = os.scandir(directory)
+        try:
+            filenames: List[str] = []
+            for entry in entries:
+                if entry.is_file() and entry.name.endswith(".pt"):
+                    filenames.append(entry.name)
+            return filenames
+        finally:
+            entries.close()
 
     def __len__(self) -> int:
         return len(self._samples)
