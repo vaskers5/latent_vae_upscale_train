@@ -6,6 +6,14 @@ scale: 2
 num_gpu: 4
 manual_seed: 0
 
+vae_sources:
+  flux_vae:
+    hf_repo: wolfgangblack/flux_vae
+    vae_kind: kl
+  sdxl_vae:
+    hf_repo: stabilityai/sdxl-vae
+    vae_kind: kl
+
 # dataset and data loader settings
 datasets:
   train:
@@ -16,7 +24,7 @@ datasets:
     low_res: 128
     cache_dirs:
       - /data/kazanplova/datasets/midjourney_crops_flux_vae/cache_vae_embeddings/flux_vae/
-    vae_names: flux_vae
+    vae_names: [flux_vae]
     phase: train
 
     filename_tmpl: "{}"
@@ -41,7 +49,7 @@ datasets:
     low_res: 256
     cache_dirs:
       - /data/kazanplova/latent_vae_upscale_train/flux_val/256_512/embeddings
-    vae_names: flux_vae
+    vae_names: [flux_vae]
     phase: val
 
     io_backend:
