@@ -18,6 +18,7 @@ from diffusers import (
 )
 from torch.utils.data import DataLoader, DistributedSampler
 from tqdm.auto import tqdm
+from PIL import Image
 
 from .config_loader import load_config
 from .embedding_io import save_record
@@ -50,9 +51,14 @@ class SimpleEmbeddingsDataset(torch.utils.data.Dataset):
             torch.load(embed_path)
             return ""
         except Exception:
-            return img_path
-            
-    
+            try: 
+                img = Image.open(img_path)
+                img = img.convert("RGB")
+                img.close()
+                return img_path
+            except Exception:
+                return ""
+
 
 @dataclass(frozen=True)
 class ModelConfig:
