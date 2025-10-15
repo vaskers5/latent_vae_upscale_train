@@ -4,7 +4,10 @@ import numpy as np
 import os
 import torch
 import warnings
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from os import path as osp
 from torch.nn import functional as F
 from tqdm import tqdm
@@ -27,10 +30,18 @@ from .swinir_model import SwinIRModel
 
 # Try to import VAE for decoding (optional)
 try:
-    from diffusers import AutoencoderKL
+    from diffusers import (
+        AsymmetricAutoencoderKL,
+        AutoencoderKL,
+        AutoencoderKLQwenImage,
+        AutoencoderKLWan,
+    )
 
     VAE_AVAILABLE = True
 except ImportError:
+    AsymmetricAutoencoderKL = None  # type: ignore[assignment]
+    AutoencoderKLQwenImage = None  # type: ignore[assignment]
+    AutoencoderKLWan = None  # type: ignore[assignment]
     VAE_AVAILABLE = False
     print("Warning: diffusers not available. VAE decoding will be skipped.")
 
@@ -44,6 +55,105 @@ except ImportError:
     print("Warning: wandb not available. Wandb logging will be skipped.")
 
 
+_DEFAULT_VAE_SOURCES: Dict[str, Dict[str, Any]] = {
+    "flux_vae": {
+        "hf_repo": "wolfgangblack/flux_vae",
+        "vae_kind": "kl",
+    },
+    "sdxl_vae": {
+        "hf_repo": "stabilityai/sdxl-vae",
+        "vae_kind": "kl",
+    },
+}
+
+
+@dataclass(frozen=True)
+class _VaeSpec:
+    """Configuration required to instantiate a VAE."""
+
+    name: str
+    load_from: Optional[Path]
+    hf_repo: Optional[str]
+    hf_subfolder: Optional[str]
+    hf_revision: Optional[str]
+    hf_auth_token: Optional[str]
+    vae_kind: str
+    weights_dtype: Optional[torch.dtype]
+
+    @property
+    def cache_key(self) -> str:
+        return _slugify_name(self.name)
+
+
+def _slugify_name(name: str) -> str:
+    slug = name.replace("\\", "_").replace("/", "_").replace(" ", "_")
+    return slug or "vae"
+
+
+def _resolve_dtype(value: Any) -> Optional[torch.dtype]:
+    if value is None:
+        return None
+    if isinstance(value, torch.dtype):
+        return value
+    if isinstance(value, str):
+        norm = value.strip().lower().replace(" ", "")
+        if not norm:
+            return None
+        if not norm.startswith("torch."):
+            norm = f"torch.{norm}"
+        attr = norm.split(".")[-1]
+        if not hasattr(torch, attr):
+            raise ValueError(f"Unsupported torch dtype specification: {value}")
+        dtype = getattr(torch, attr)
+        if not isinstance(dtype, torch.dtype):
+            raise ValueError(f"Resolved value is not a torch.dtype: {value}")
+        return dtype
+    raise TypeError(f"Expected dtype string or torch.dtype, received: {value!r}")
+
+
+def _candidate_keys(name: str) -> Sequence[str]:
+    slug = _slugify_name(name)
+    return (name, name.lower(), slug, slug.lower())
+
+
+def _build_spec_from_mapping(name: str, mapping: Any) -> _VaeSpec:
+    if isinstance(mapping, _VaeSpec):
+        return mapping
+    if mapping is None:
+        mapping = {}
+    if isinstance(mapping, str):
+        mapping = {"hf_repo": mapping}
+    if not isinstance(mapping, Mapping):
+        raise TypeError(
+            f"VAE specification for '{name}' must be provided as a mapping or string; received {type(mapping)}."
+        )
+
+    load_from_value = mapping.get("load_from")
+    load_from = Path(str(load_from_value)).expanduser() if load_from_value else None
+    hf_repo = mapping.get("hf_repo")
+    hf_repo = str(hf_repo) if hf_repo else None
+    hf_subfolder = mapping.get("hf_subfolder")
+    hf_subfolder = str(hf_subfolder) if hf_subfolder else None
+    hf_revision = mapping.get("hf_revision")
+    hf_revision = str(hf_revision) if hf_revision else None
+    hf_auth_token = mapping.get("hf_auth_token")
+    hf_auth_token = str(hf_auth_token) if hf_auth_token else None
+    vae_kind = str(mapping.get("vae_kind", "kl")).strip().lower() or "kl"
+    weights_dtype = _resolve_dtype(mapping.get("weights_dtype"))
+
+    return _VaeSpec(
+        name=name,
+        load_from=load_from,
+        hf_repo=hf_repo,
+        hf_subfolder=hf_subfolder,
+        hf_revision=hf_revision,
+        hf_auth_token=hf_auth_token,
+        vae_kind=vae_kind,
+        weights_dtype=weights_dtype,
+    )
+
+
+
 @MODEL_REGISTRY.register()
 class SwinIRLatentModel(SwinIRModel):
     """SwinIR model for latent space super resolution with custom visualization.
@@ -54,10 +164,279 @@ class SwinIRLatentModel(SwinIRModel):
     def __init__(self, opt):
         # Initialize loss_configs before calling super().__init__()
         self.loss_configs = {}
+        self._vae_specs_primary: Dict[str, _VaeSpec] = {}
+        self._vae_aliases: Dict[str, _VaeSpec] = {}
+        self._ordered_vae_keys: List[str] = []
+        self._vae_cache: Dict[str, torch.nn.Module] = {}
+        self._current_vae_names: Optional[List[str]] = None
+        self._default_train_vae_name: Optional[str] = None
+        self._default_val_vae_name: Optional[str] = None
         super().__init__(opt)
-        self.vae = None
         if VAE_AVAILABLE:
-            self._load_vae()
+            self._setup_vae_registry()
+        else:
+            logger = get_root_logger()
+            logger.warning(
+                "diffusers is not available; pixel-space decoding for validation will be skipped."
+            )
+
+    # ------------------------------------------------------------------ VAE helpers
+    def _setup_vae_registry(self) -> None:
+        """Populate VAE specifications from defaults and user configuration."""
+
+        self._vae_specs_primary.clear()
+        self._vae_aliases.clear()
+        self._ordered_vae_keys.clear()
+        self._vae_cache.clear()
+
+        raw_sources = self.opt.get("vae_sources") or {}
+        if raw_sources and not isinstance(raw_sources, Mapping):
+            raise TypeError(
+                "Option 'vae_sources' must be a mapping from names to configuration dictionaries."
+            )
+
+        logger = get_root_logger()
+
+        for name, mapping in _DEFAULT_VAE_SOURCES.items():
+            try:
+                spec = _build_spec_from_mapping(name, mapping)
+            except Exception as exc:
+                logger.warning(f"Skipping default VAE '{name}': {exc}")
+                continue
+            self._register_vae_spec(spec, allow_override=False)
+
+        if raw_sources:
+            for name, mapping in raw_sources.items():
+                try:
+                    spec = _build_spec_from_mapping(name, mapping)
+                except Exception as exc:
+                    logger.warning(f"Skipping configured VAE '{name}': {exc}")
+                    continue
+                self._register_vae_spec(spec, allow_override=True)
+
+        self._default_train_vae_name = self._resolve_dataset_default_name("train")
+        self._default_val_vae_name = self._resolve_dataset_default_name("val")
+
+        if self._ordered_vae_keys:
+            resolved = [self._vae_specs_primary[key].name for key in self._ordered_vae_keys]
+            logger.info("Configured VAE decoders: %s", ", ".join(resolved))
+        else:
+            logger.warning("No VAE configurations found. Pixel-space decoding will be skipped.")
+
+    def _register_vae_spec(self, spec: _VaeSpec, *, allow_override: bool) -> None:
+        primary_key = spec.cache_key
+        if allow_override or primary_key not in self._vae_specs_primary:
+            self._vae_specs_primary[primary_key] = spec
+            if primary_key not in self._ordered_vae_keys:
+                self._ordered_vae_keys.append(primary_key)
+
+        def _register_alias(key: str) -> None:
+            if allow_override or key not in self._vae_aliases:
+                self._vae_aliases[key] = spec
+
+        for key in _candidate_keys(spec.name):
+            _register_alias(key)
+        if spec.hf_repo:
+            for key in _candidate_keys(spec.hf_repo):
+                _register_alias(key)
+        if spec.load_from:
+            for key in _candidate_keys(str(spec.load_from)):
+                _register_alias(key)
+
+    def _resolve_dataset_default_name(self, phase: str) -> Optional[str]:
+        datasets_cfg = self.opt.get("datasets") or {}
+        if not isinstance(datasets_cfg, Mapping):
+            return None
+
+        for key, cfg in datasets_cfg.items():
+            if key.split("_")[0] != phase:
+                continue
+            names = cfg.get("vae_names")
+            if isinstance(names, str) and names.strip():
+                return names.strip()
+            if isinstance(names, Sequence) and not isinstance(names, str):
+                for entry in names:
+                    if isinstance(entry, str) and entry.strip():
+                        return entry.strip()
+        return None
+
+    def _resolve_vae_spec(self, name: Optional[str]) -> Optional[_VaeSpec]:
+        if not name:
+            return None
+        key = str(name).strip()
+        if not key:
+            return None
+
+        spec = self._vae_aliases.get(key)
+        if spec is None:
+            slug = _slugify_name(key)
+            spec = self._vae_aliases.get(slug)
+
+        if spec is not None:
+            return spec
+
+        # Attempt to auto-configure unknown names.
+        candidate_path = Path(key).expanduser()
+        mapping: Dict[str, Any]
+        if candidate_path.exists():
+            mapping = {"load_from": str(candidate_path)}
+        else:
+            mapping = {"hf_repo": key}
+
+        try:
+            spec = _build_spec_from_mapping(key, mapping)
+        except Exception:
+            return None
+
+        self._register_vae_spec(spec, allow_override=False)
+        logger = get_root_logger()
+        origin = "local path" if candidate_path.exists() else "Hugging Face repo"
+        logger.info("Auto-configured VAE '%s' from %s '%s'.", spec.name, origin, key)
+        return spec
+
+    def _ensure_vae(self, name: Optional[str]) -> Optional[torch.nn.Module]:
+        if not VAE_AVAILABLE:
+            return None
+
+        spec = self._resolve_vae_spec(name)
+        if spec is None:
+            fallback_names = [
+                self._default_train_vae_name,
+                self._default_val_vae_name,
+            ]
+            for fallback in fallback_names:
+                spec = self._resolve_vae_spec(fallback)
+                if spec is not None:
+                    break
+        if spec is None and self._ordered_vae_keys:
+            spec = self._vae_specs_primary[self._ordered_vae_keys[0]]
+        if spec is None:
+            return None
+
+        cache_key = spec.cache_key
+        vae = self._vae_cache.get(cache_key)
+        if vae is None:
+            vae = self._instantiate_vae(spec)
+            self._vae_cache[cache_key] = vae
+
+        params = next(vae.parameters(), None)
+        if params is not None and params.device != self.device:
+            vae = vae.to(self.device)
+            self._vae_cache[cache_key] = vae
+
+        return vae
+
+    def _instantiate_vae(self, spec: _VaeSpec) -> torch.nn.Module:
+        kwargs: Dict[str, Any] = {}
+        source: Optional[str]
+
+        if spec.load_from is not None and spec.load_from.exists():
+            source = str(spec.load_from)
+        else:
+            source = spec.hf_repo
+            if source is None:
+                raise RuntimeError(
+                    f"VAE '{spec.name}' must define 'hf_repo' or a valid 'load_from' path."
+                )
+            if spec.hf_subfolder:
+                kwargs["subfolder"] = spec.hf_subfolder
+            if spec.hf_revision:
+                kwargs["revision"] = spec.hf_revision
+            if spec.hf_auth_token:
+                kwargs["use_auth_token"] = spec.hf_auth_token
+
+        if spec.weights_dtype is not None:
+            kwargs["torch_dtype"] = spec.weights_dtype
+
+        kind = spec.vae_kind
+        logger = get_root_logger()
+        logger.info("Loading VAE '%s' (kind=%s) from %s", spec.name, kind, source)
+
+        if kind == "qwen":
+            if AutoencoderKLQwenImage is None:
+                raise RuntimeError("AutoencoderKLQwenImage is not available in this diffusers version.")
+            vae = AutoencoderKLQwenImage.from_pretrained(source, **kwargs)
+        elif kind == "wan":
+            if AutoencoderKLWan is None:
+                raise RuntimeError("AutoencoderKLWan is not available in this diffusers version.")
+            vae = AutoencoderKLWan.from_pretrained(source, **kwargs)
+        elif kind in {"kl", "autoencoderkl", "autoencoder_kl"}:
+            vae = AutoencoderKL.from_pretrained(source, **kwargs)
+        elif kind in {"asymmetric_kl", "kl_asymmetric", "kl_asym", "asym_kl"}:
+            if AsymmetricAutoencoderKL is None:
+                raise RuntimeError("AsymmetricAutoencoderKL is not available in this diffusers version.")
+            vae = AsymmetricAutoencoderKL.from_pretrained(source, **kwargs)
+        else:
+            try:
+                vae = AutoencoderKL.from_pretrained(source, **kwargs)
+                logger.warning(
+                    "VAE kind '%s' is unrecognised. Loaded AutoencoderKL for '%s'.", kind, spec.name
+                )
+            except Exception:
+                if AsymmetricAutoencoderKL is None:
+                    raise
+                vae = AsymmetricAutoencoderKL.from_pretrained(source, **kwargs)
+                logger.warning(
+                    "VAE kind '%s' is unrecognised. Loaded AsymmetricAutoencoderKL for '%s'.",
+                    kind,
+                    spec.name,
+                )
+
+        if spec.weights_dtype is not None:
+            vae = vae.to(dtype=spec.weights_dtype)
+        vae = vae.to(self.device).eval()
+        return vae
+
+    def _has_any_vae(self) -> bool:
+        return VAE_AVAILABLE and bool(self._vae_specs_primary or self._vae_cache)
+
+    def _prepare_batch_vae_names(
+        self,
+        provided: Optional[Sequence[str]],
+        batch_size: int,
+    ) -> List[Optional[str]]:
+        def _expand(candidate) -> Optional[List[str]]:
+            if candidate is None:
+                return None
+            if isinstance(candidate, str):
+                return [candidate] * batch_size
+            if isinstance(candidate, Sequence) and not isinstance(candidate, str):
+                entries = [str(item) for item in candidate]
+                if len(entries) == batch_size:
+                    return entries
+                if len(entries) == 1:
+                    return entries * batch_size
+            return None
+
+        for candidate in (provided, self._current_vae_names):
+            expanded = _expand(candidate)
+            if expanded is not None:
+                return expanded
+
+        for default_name in (self._default_val_vae_name, self._default_train_vae_name):
+            if default_name:
+                return [default_name] * batch_size
+
+        if self._ordered_vae_keys:
+            spec = self._vae_specs_primary[self._ordered_vae_keys[0]]
+            return [spec.name] * batch_size
+
+        return [None] * batch_size
+
+    # ------------------------------------------------------------------ overrides
+    def feed_data(self, data):
+        super().feed_data(data)
+        names = data.get("vae_name")
+        if names is None:
+            self._current_vae_names = None
+        elif isinstance(names, (list, tuple)):
+            self._current_vae_names = [str(entry) for entry in names]
+        else:
+            self._current_vae_names = [str(names)]
+
+        if VAE_AVAILABLE and self._current_vae_names:
+            for entry in set(self._current_vae_names):
+                self._resolve_vae_spec(entry)
 
     def init_training_settings(self):
         """Override to handle space-aware loss initialization"""
@@ -185,31 +564,29 @@ class SwinIRLatentModel(SwinIRModel):
 
             elif loss_space == "pixel":
                 # Calculate loss in pixel space after VAE decoding
-                if self.vae is not None:
-                    # Decode latents to images
-                    decoded_pred = self.decode_latents(self.output)
-                    decoded_gt = self.decode_latents(self.gt)
-
-                    loss_value = self._evaluate_loss(loss_criterion, decoded_pred, decoded_gt)
-
-                    # Handle losses that return multiple values (like perceptual loss)
-                    if isinstance(loss_value, (tuple, list)):
-                        # For perceptual loss: (l_percep, l_style)
-                        for i, val in enumerate(loss_value):
-                            if val is not None:
-                                weighted_val = val * loss_weight
-                                l_total += weighted_val
-                                loss_dict[f"{loss_name}_{i}"] = val
-                    else:
-                        # Single loss value
-                        loss_dict[loss_name] = loss_value
-                        weighted_loss = loss_value * loss_weight
-                        l_total += weighted_loss
-                else:
+                decoded_pred = self.decode_latents(self.output, vae_names=self._current_vae_names)
+                decoded_gt = self.decode_latents(self.gt, vae_names=self._current_vae_names)
+                if decoded_pred is None or decoded_gt is None:
                     print(
-                        f"Warning: VAE not available, skipping pixel space loss: {loss_name}"
+                        f"Warning: Unable to decode latents, skipping pixel space loss: {loss_name}"
                     )
                     continue
+
+                loss_value = self._evaluate_loss(loss_criterion, decoded_pred, decoded_gt)
+
+                # Handle losses that return multiple values (like perceptual loss)
+                if isinstance(loss_value, (tuple, list)):
+                    # For perceptual loss: (l_percep, l_style)
+                    for i, val in enumerate(loss_value):
+                        if val is not None:
+                            weighted_val = val * loss_weight
+                            l_total += weighted_val
+                            loss_dict[f"{loss_name}_{i}"] = val
+                else:
+                    # Single loss value
+                    loss_dict[loss_name] = loss_value
+                    weighted_loss = loss_value * loss_weight
+                    l_total += weighted_loss
 
         l_total.backward()
         self.optimizer_g.step()
@@ -219,34 +596,68 @@ class SwinIRLatentModel(SwinIRModel):
         if self.ema_decay > 0:
             self.model_ema(decay=self.ema_decay)
 
-    def _load_vae(self):
-        """Load Flux VAE for decoding latents to images"""
-        try:
-            print("Loading Flux VAE for latent decoding...")
-            self.vae = (
-                AutoencoderKL.from_pretrained("wolfgangblack/flux_vae")
-                .to(self.device)
-                .eval()
-            )
-            print("✓ Flux VAE loaded successfully")
-        except Exception as e:
-            print(f"Warning: Could not load Flux VAE: {e}")
-            self.vae = None
+    def decode_latents(
+        self,
+        latents: Optional[torch.Tensor],
+        *,
+        vae_names: Optional[Sequence[str]] = None,
+    ) -> Optional[torch.Tensor]:
+        """Decode latents to RGB images using a configured VAE."""
 
-    def decode_latents(self, latents):
-        """Decode latents to RGB images using VAE"""
-        if self.vae is None:
+        if latents is None or not VAE_AVAILABLE:
             return None
 
-        with torch.no_grad():
-            # Unscale latents (Flux VAE scaling factor)
-            latents = latents / self.vae.config.scaling_factor
-            # Decode to images
-            images = self.vae.decode(latents).sample
-            # Clamp to [-1, 1] range
-            images = torch.clamp(images, -1.0, 1.0)
+        if latents.dim() == 3:
+            latents = latents.unsqueeze(0)
+            squeeze_result = True
+        else:
+            squeeze_result = False
 
-        return images
+        if latents.dim() != 4:
+            raise ValueError(
+                f"Expected latents to have shape [B, C, H, W]; received tensor with shape {tuple(latents.shape)}."
+            )
+
+        batch_size = latents.shape[0]
+        name_list = self._prepare_batch_vae_names(vae_names, batch_size)
+        if all(name is None for name in name_list):
+            return None
+
+        grouped_indices: Dict[Optional[str], List[int]] = defaultdict(list)
+        for idx, name in enumerate(name_list):
+            grouped_indices[name].append(idx)
+
+        decoded_outputs: List[Optional[torch.Tensor]] = [None] * batch_size
+
+        for name, indices in grouped_indices.items():
+            vae = self._ensure_vae(name)
+            if vae is None:
+                return None
+
+            params = next(vae.parameters())
+            vae_device = params.device
+            vae_dtype = params.dtype
+
+            latent_chunk = latents[indices].to(device=vae_device, dtype=vae_dtype)
+
+            with torch.no_grad():
+                scaling = getattr(getattr(vae, "config", None), "scaling_factor", 1.0) or 1.0
+                latent_chunk = latent_chunk / scaling
+                decoded = vae.decode(latent_chunk).sample
+                decoded = torch.clamp(decoded, -1.0, 1.0)
+
+            decoded = decoded.to(device=self.device, dtype=torch.float32)
+
+            for idx, tensor in zip(indices, decoded):
+                decoded_outputs[idx] = tensor
+
+        if any(entry is None for entry in decoded_outputs):
+            return None
+
+        stacked = torch.stack(decoded_outputs, dim=0)
+        if squeeze_result:
+            stacked = stacked[0]
+        return stacked
 
     def calculate_metric_in_space(
         self, pred_latent, gt_latent, metric_name, metric_opt
@@ -264,15 +675,14 @@ class SwinIRLatentModel(SwinIRModel):
                 return 0.0
 
         elif metric_space == "pixel":
-            if not self.vae:
+            # Decode latents to images once for all pixel-space metrics
+            decoded_pred = self.decode_latents(pred_latent, vae_names=self._current_vae_names)
+            decoded_gt = self.decode_latents(gt_latent, vae_names=self._current_vae_names)
+            if decoded_pred is None or decoded_gt is None:
                 print(
-                    f"Warning: VAE not available, skipping pixel space metric: {metric_name}"
+                    f"Warning: Unable to decode latents, skipping pixel space metric: {metric_name}"
                 )
                 return 0.0
-
-            # Decode latents to images once for all pixel-space metrics
-            decoded_pred = self.decode_latents(pred_latent)
-            decoded_gt = self.decode_latents(gt_latent)
 
             # Handle L1Loss directly on tensors
             if metric_opt["type"] == "L1Loss":
@@ -544,12 +954,10 @@ class SwinIRLatentModel(SwinIRModel):
                     )
                 os.makedirs(osp.dirname(save_path), exist_ok=True)
 
-                # Decode all latents to images if VAE is available
-                decoded_lq, decoded_pred, decoded_gt = None, None, None
-                if self.vae:
-                    decoded_lq = self.decode_latents(lq_latent)
-                    decoded_pred = self.decode_latents(pred_latent)
-                    decoded_gt = self.decode_latents(gt_latent)
+                # Decode all latents to images if a VAE is available
+                decoded_lq = self.decode_latents(lq_latent, vae_names=self._current_vae_names)
+                decoded_pred = self.decode_latents(pred_latent, vae_names=self._current_vae_names)
+                decoded_gt = self.decode_latents(gt_latent, vae_names=self._current_vae_names)
 
                 # Decide whether to log this image to wandb
                 should_log_wandb = log_to_wandb and wandb_image_count < max_wandb_images

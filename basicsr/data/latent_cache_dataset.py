@@ -146,5 +146,10 @@ class LatentCacheDataset(data.Dataset):
                 img_lq[c] = (img_lq[c] - self.mean[c]) / self.std[c]
             for c in range(img_gt.shape[0]):
                 img_gt[c] = (img_gt[c] - self.mean[c]) / self.std[c]
-        return {"lq": img_lq, "gt": img_gt, "lq_path": str(sample.lq_path), "gt_path": str(sample.gt_path)}
-
+        return {
+            "lq": img_lq,
+            "gt": img_gt,
+            "lq_path": str(sample.lq_path),
+            "gt_path": str(sample.gt_path),
+            "vae_name": sample.vae_name,
+        }
