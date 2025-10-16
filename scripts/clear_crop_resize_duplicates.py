@@ -12,14 +12,15 @@ resolution folders so that the dataset stays consistent.
 from __future__ import annotations
 
 import argparse
+import atexit
 import math
+import tempfile
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
 
 import faiss  # type: ignore
-import numpy as np
 import torch
 from PIL import Image
 from tqdm.auto import tqdm
@@ -156,16 +157,13 @@ def resolve_processor_image_size(processor: SiglipProcessor) -> Tuple[int, int]:
     raise ValueError(f"Cannot resolve image size from processor config: {size}")
 
 
-def compute_embeddings(
-    image_paths: Sequence[Path],
-    processor: SiglipProcessor,
-    model: SiglipModel,
+def create_dataloader(
+    dataset: SiglipImageDataset,
     device: torch.device,
     batch_size: int,
     num_workers: int,
-) -> np.ndarray:
-    dataset = SiglipImageDataset(image_paths, processor)
-    dataloader = DataLoader(
+) -> DataLoader:
+    return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=False,
@@ -174,37 +172,57 @@ def compute_embeddings(
         collate_fn=collate_siglip_batch,
     )
 
-    embeddings: List[np.ndarray] = []
+
+def build_index_with_temp_storage(
+    dataset: SiglipImageDataset,
+    model: SiglipModel,
+    device: torch.device,
+    batch_size: int,
+    num_workers: int,
+) -> Tuple[faiss.Index, Path]:
+    dataloader = create_dataloader(dataset, device, batch_size, num_workers)
+    index: faiss.Index | None = None
     progress = tqdm(total=len(dataset), desc="Computing embeddings", unit="img")
     for batch in dataloader:
         pixel_values = batch["pixel_values"].to(device, non_blocking=True)
         with torch.no_grad():
             outputs = model(pixel_values=pixel_values)
-            image_embeds = outputs.image_embeds  # (batch, dim)
+            image_embeds = outputs.image_embeds
         image_embeds = torch.nn.functional.normalize(image_embeds, p=2, dim=-1)
-        embeddings.append(image_embeds.cpu().numpy().astype("float32"))
-        progress.update(pixel_values.shape[0])
+        embeddings_np = image_embeds.cpu().numpy().astype("float32")
+        if embeddings_np.size == 0:
+            continue
+        if index is None:
+            index = faiss.IndexFlatL2(embeddings_np.shape[1])
+        index.add(embeddings_np)
+        progress.update(embeddings_np.shape[0])
     progress.close()
-    if not embeddings:
-        return np.empty((0, 0), dtype="float32")
-    return np.concatenate(embeddings, axis=0)
-
-
-def build_faiss_index(embeddings: np.ndarray) -> faiss.Index:
-    dim = embeddings.shape[1]
-    index = faiss.IndexFlatL2(dim)
-    index.add(embeddings)
-    return index
+    if index is None:
+        raise RuntimeError("No embeddings were computed.")
+    temp_file = tempfile.NamedTemporaryFile(prefix="faiss_index_", suffix=".bin", delete=False)
+    temp_path = Path(temp_file.name)
+    temp_file.close()
+    faiss.write_index(index, str(temp_path))
+    atexit.register(lambda: temp_path.exists() and temp_path.unlink())
+    index = faiss.read_index(str(temp_path))
+    return index, temp_path
 
 
 def find_duplicate_components(
-    embeddings: np.ndarray, index: faiss.Index, threshold: float
+    index: faiss.Index,
+    dataset: SiglipImageDataset,
+    model: SiglipModel,
+    device: torch.device,
+    batch_size: int,
+    num_workers: int,
+    threshold: float,
 ) -> Dict[int, List[int]]:
-    if embeddings.size == 0:
-        return {}
-    distances_sq, neighbours = index.search(embeddings, k=2)
-    parent = list(range(len(embeddings)))
-    size = [1] * len(embeddings)
+    total = len(dataset)
+    parent = list(range(total))
+    size = [1] * total
+    dataloader = create_dataloader(dataset, device, batch_size, num_workers)
+    progress = tqdm(total=total, desc="Searching duplicates", unit="img")
+    offset = 0
 
     def find(x: int) -> int:
         while parent[x] != x:
@@ -221,16 +239,33 @@ def find_duplicate_components(
         parent[root_y] = root_x
         size[root_x] += size[root_y]
 
-    for idx in range(len(embeddings)):
-        neighbour_idx = neighbours[idx, 1]
-        if neighbour_idx < 0:
+    for batch in dataloader:
+        pixel_values = batch["pixel_values"].to(device, non_blocking=True)
+        with torch.no_grad():
+            outputs = model(pixel_values=pixel_values)
+            image_embeds = outputs.image_embeds
+        image_embeds = torch.nn.functional.normalize(image_embeds, p=2, dim=-1)
+        embeddings_np = image_embeds.cpu().numpy().astype("float32")
+        if embeddings_np.size == 0:
             continue
-        dist = math.sqrt(distances_sq[idx, 1])
-        if dist < threshold:
-            union(idx, neighbour_idx)
+        distances_sq, neighbours = index.search(embeddings_np, k=2)
+        batch_size_actual = embeddings_np.shape[0]
+        for local_idx in range(batch_size_actual):
+            global_idx = offset + local_idx
+            if global_idx >= total:
+                break
+            neighbour_idx = int(neighbours[local_idx, 1])
+            if neighbour_idx < 0:
+                continue
+            dist = math.sqrt(float(distances_sq[local_idx, 1]))
+            if dist < threshold:
+                union(global_idx, neighbour_idx)
+        offset += batch_size_actual
+        progress.update(batch_size_actual)
+    progress.close()
 
     components: Dict[int, List[int]] = defaultdict(list)
-    for idx in range(len(embeddings)):
+    for idx in range(total):
         root = find(idx)
         components[root].append(idx)
     components = {root: members for root, members in components.items() if len(members) > 1}
@@ -272,14 +307,21 @@ def run_cleanup(args: argparse.Namespace) -> DatasetStats:
     processor, model = load_siglip(args.model_name, device)
     target_height, target_width = resolve_processor_image_size(processor)
     print(f"[info] SigLIP input size: {target_height}x{target_width}")
-    embeddings = compute_embeddings(
-        image_paths, processor, model, device, args.batch_size, args.num_workers
+    dataset = SiglipImageDataset(image_paths, processor)
+    image_paths = dataset.image_paths
+    index, index_path = build_index_with_temp_storage(
+        dataset, model, device, args.batch_size, args.num_workers
     )
-    if embeddings.size == 0:
-        raise RuntimeError("No embeddings were computed.")
-
-    index = build_faiss_index(embeddings)
-    duplicate_components = find_duplicate_components(embeddings, index, args.distance_threshold)
+    print(f"[info] FAISS index stored at: {index_path}")
+    duplicate_components = find_duplicate_components(
+        index,
+        dataset,
+        model,
+        device,
+        args.batch_size,
+        args.num_workers,
+        args.distance_threshold,
+    )
     indices_to_remove = plan_deletions(duplicate_components, image_paths)
 
     removed_files = 0
@@ -287,7 +329,7 @@ def run_cleanup(args: argparse.Namespace) -> DatasetStats:
         removed_files = delete_images(indices_to_remove, image_paths, dataset_dir)
 
     stats = DatasetStats(
-        total_images=len(image_paths),
+        total_images=len(dataset),
         duplicate_groups=len(duplicate_components),
         removed_images=len(indices_to_remove),
         removed_files=removed_files,
