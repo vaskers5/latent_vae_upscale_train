@@ -1,0 +1,41 @@
+# Configuration for SDXL validation cache precomputation.
+#
+# Example usage:
+#   export PYTHONPATH="$PWD"
+#   accelerate launch --num_processes 1 scripts/precompute_validation_cache.py \
+#       --config configs/validation_precompute.yaml
+
+dataset:
+  path: ./sdxl_validation
+  # subset: realvisxl-v5-0
+  scale: 2
+  high_resolution: 1024
+  low_resolution: 512
+  batch_size: 8
+  num_workers: 4
+  resample: bicubic
+
+cache:
+  root: ./sdxl_validation/cache
+  lq_latents_subdir: lq_latents
+  gt_latents_subdir: gt_latents
+  decoded_lq_subdir: decoded_lq
+  decoded_gt_subdir: decoded_gt
+  extension: .pt
+  latents_dtype: float32
+  decoded_dtype: float16
+  store_distribution: true
+  skip_existing: true
+
+vae:
+  name: sdxl
+  hf_repo: stabilityai/sdxl-vae
+  vae_kind: kl
+  weights_dtype: float32
+
+runtime:
+  batch_size: 8
+  num_workers: 4
+  pin_memory: true
+  devices:
+    - auto
