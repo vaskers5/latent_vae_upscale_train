@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Sequence, Tuple
+import random
 
 import torch
 from torch.utils import data as data
@@ -39,7 +39,7 @@ class LatentCacheDataset(data.Dataset):
         # Normalization parameters
         self.mean = opt.get("mean", None)
         self.std = opt.get("std", None)
-
+        self.number_of_samples = opt.get("number_of_samples", None)
 
         cache_dirs = self._normalize_cache_dirs(self.opt.get("cache_dirs", []))
         print(f"LatentCacheDataset using cache_dirs: {[str(path) for path in cache_dirs]}")
@@ -80,22 +80,11 @@ class LatentCacheDataset(data.Dataset):
             self._samples.extend(self._collect_pairs(cache_dir, vae_name))
             return
 
-        worker_opt = self.opt.get("scan_workers")
-        if worker_opt is not None:
-            max_workers = max(1, int(worker_opt))
-        else:
-            max_workers = min(len(tasks), os.cpu_count() or 1)
-
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_task = {
-                executor.submit(self._collect_pairs, cache_dir, vae_name): (cache_dir, vae_name)
-                for cache_dir, vae_name in tasks
-            }
-            with tqdm(total=len(future_to_task), desc="Loading latent caches", unit="cache") as progress:
-                for future in as_completed(future_to_task):
-                    samples = future.result()
-                    self._samples.extend(samples)
-                    progress.update(1)
+        with tqdm(total=len(tasks), desc="Loading latent caches", unit="cache") as progress:
+            for cache_dir, vae_name in tasks:
+                samples = self._collect_pairs(cache_dir, vae_name)
+                self._samples.extend(samples)
+                progress.update(1)
 
     def _collect_pairs(self, cache_dir: Path, vae_name: str) -> List[_CacheSample]:
         low_dir = cache_dir / f"{self._low_res}px"
@@ -120,6 +109,7 @@ class LatentCacheDataset(data.Dataset):
             _CacheSample(lq_path=low_dir / name, gt_path=high_dir / name, vae_name=vae_name)
             for name in matched_names
         ]
+        matched_pairs = random.sample(matched_pairs, min(len(matched_pairs), self.number_of_samples)) if self.number_of_samples else matched_pairs
         print(
             f"LatentCacheDataset matched {len(matched_pairs)} pairs in '{cache_dir}' "
             f"(low_res={self._low_res}, high_res={self._high_res})"
@@ -162,25 +152,25 @@ class LatentCacheDataset(data.Dataset):
         img_lq = img_lq.float()
         img_gt = img_gt.float()
 
-        # For training, we can apply some basic augmentations
-        if self.phase == "train":
-            # Random horizontal flip (applied to both LQ and GT)
-            if torch.rand(1) < 0.5:
-                img_lq = torch.flip(img_lq, dims=[2])  # flip width dimension
-                img_gt = torch.flip(img_gt, dims=[2])
+        # # For training, we can apply some basic augmentations
+        # if self.phase == "train":
+        #     # Random horizontal flip (applied to both LQ and GT)
+        #     if torch.rand(1) < 0.5:
+        #         img_lq = torch.flip(img_lq, dims=[2])  # flip width dimension
+        #         img_gt = torch.flip(img_gt, dims=[2])
 
-            # Random vertical flip (applied to both LQ and GT)
-            if torch.rand(1) < 0.5:
-                img_lq = torch.flip(img_lq, dims=[1])  # flip height dimension
-                img_gt = torch.flip(img_gt, dims=[1])
+        #     # Random vertical flip (applied to both LQ and GT)
+        #     if torch.rand(1) < 0.5:
+        #         img_lq = torch.flip(img_lq, dims=[1])  # flip height dimension
+        #         img_gt = torch.flip(img_gt, dims=[1])
 
-        # Normalize if specified
-        if self.mean is not None and self.std is not None:
-            # Apply normalization channel-wise
-            for c in range(img_lq.shape[0]):
-                img_lq[c] = (img_lq[c] - self.mean[c]) / self.std[c]
-            for c in range(img_gt.shape[0]):
-                img_gt[c] = (img_gt[c] - self.mean[c]) / self.std[c]
+        # # Normalize if specified
+        # if self.mean is not None and self.std is not None:
+        #     # Apply normalization channel-wise
+        #     for c in range(img_lq.shape[0]):
+        #         img_lq[c] = (img_lq[c] - self.mean[c]) / self.std[c]
+        #     for c in range(img_gt.shape[0]):
+        #         img_gt[c] = (img_gt[c] - self.mean[c]) / self.std[c]
         return {
             "lq": img_lq,
             "gt": img_gt,
