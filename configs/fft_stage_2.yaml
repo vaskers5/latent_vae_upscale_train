@@ -6,9 +6,9 @@ num_gpu: 4
 manual_seed: 0
 
 vae_sources:
-  flux_vae:
-    hf_repo: wolfgangblack/flux_vae
-    vae_kind: kl
+  # flux_vae:
+  #   hf_repo: wolfgangblack/flux_vae
+  #   vae_kind: kl
   sdxl_vae:
     hf_repo: stabilityai/sdxl-vae
     vae_kind: kl
@@ -22,8 +22,10 @@ datasets:
     high_res: 256
     low_res: 128
     cache_dirs:
-      - /data/kazanplova/datasets/midjourney_full_ds_crops/embeddings/flux_vae
-    vae_names: [flux_vae]
+
+      - /data/kazanplova/datasets/midjourney_full_ds_crops/embeddings/sdxl_vae
+      - /data/kazanplova/datasets/openim_cropped/train_latents/sdxl_vae
+    vae_names: [sdxl_vae]
     phase: train
 
     filename_tmpl: "{}"
@@ -34,8 +36,8 @@ datasets:
     mean: null
     std: null
 
-    num_worker_per_gpu: 24
-    batch_size_per_gpu: 320
+    num_worker_per_gpu: 32
+    batch_size_per_gpu: 512
     prefetch_mode: cuda
     pin_memory: true
 
@@ -45,8 +47,8 @@ datasets:
     high_res: 512
     low_res: 256
     cache_dirs:
-      - /data/kazanplova/latent_vae_upscale_train/flux_val/256_512/embeddings
-    vae_names: [flux_vae]
+      - /data/kazanplova/latent_vae_upscale_train/flux_val/256_512/embeddings/sdxl_vae
+    vae_names: [sdxl_vae]
     phase: val
 
     io_backend:
@@ -61,7 +63,7 @@ datasets:
 network_g:
   type: SwinIR
   upscale: 2
-  in_chans: 16
+  in_chans: 4
   img_size: 16
   window_size: 8
   img_range: 1.
@@ -100,26 +102,26 @@ train:
     reduction: mean
     space: latent
 
-  l1_pixel_opt:
-    type: L1Loss
-    loss_weight: 0.25
-    reduction: mean
-    space: pixel
+  # l1_pixel_opt:
+  #   type: L1Loss
+  #   loss_weight: 0.25
+  #   reduction: mean
+  #   space: pixel
 
   fft_frequency_opt:
     type: FFTFrequencyLoss
-    loss_weight: 0.25
+    loss_weight: 1.0
     reduction: mean
-    space: pixel
+    space: latent
     norm: ortho
     use_log_amplitude: true
     alpha: 1.0
     normalize_weight: true
-    eps: !!float 1e-8
+    eps: 1e-8
 
 # validation settings
 val:
-  val_freq: 1000
+  val_freq: 100
   save_img: true
   metrics:
     l1_latent:
@@ -156,5 +158,5 @@ dist_params:
   port: 29500
   dist: true
 
-resume_state: ~
-load_networks_only: false
+resume_state: /data/kazanplova/latent_vae_upscale_train/runs/2025_10_15_233640_swinirdefauilt_midjourney_feat_openim_5M_1stage_sdxl_l1latent_full_dataset/swinirdefauilt_midjourney_feat_openim_5M_1stage_sdxl_l1latent_full_dataset/models/net_g_9000.pth
+load_networks_only: true
