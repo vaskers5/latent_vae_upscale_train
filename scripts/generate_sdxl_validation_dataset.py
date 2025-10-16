@@ -60,27 +60,27 @@ class ModelConfig:
 
 
 MODEL_CONFIGS: List[ModelConfig] = [
-    ModelConfig(
-        name="RealVisXL V5.0",
-        model_id="SG161222/RealVisXL_V5.0",
-        scheduler="dpmpp-sde-karras",
-        num_inference_steps=40,
-        guidance_scale=5.5,
-        negative_prompt=(
-            "bad hands, bad anatomy, ugly, deformed, (face asymmetry, eyes asymmetry, "
-            "deformed eyes, deformed mouth, open mouth)"
-        ),
-        scheduler_kwargs={"use_karras_sigmas": True},
-    ),
-    ModelConfig(
-        name="Juggernaut XL v9",
-        model_id="RunDiffusion/Juggernaut-XL-v9",
-        scheduler="dpmpp-2m-karras",
-        num_inference_steps=35,
-        guidance_scale=4.0,
-        negative_prompt=None,
-        scheduler_kwargs={"use_karras_sigmas": True, "algorithm_type": "dpmsolver++"},
-    ),
+    # ModelConfig(
+    #     name="RealVisXL V5.0",
+    #     model_id="SG161222/RealVisXL_V5.0",
+    #     scheduler="dpmpp-sde-karras",
+    #     num_inference_steps=40,
+    #     guidance_scale=5.5,
+    #     negative_prompt=(
+    #         "bad hands, bad anatomy, ugly, deformed, (face asymmetry, eyes asymmetry, "
+    #         "deformed eyes, deformed mouth, open mouth)"
+    #     ),
+    #     scheduler_kwargs={"use_karras_sigmas": True},
+    # ),
+    # ModelConfig(
+    #     name="Juggernaut XL v9",
+    #     model_id="RunDiffusion/Juggernaut-XL-v9",
+    #     scheduler="dpmpp-2m-karras",
+    #     num_inference_steps=35,
+    #     guidance_scale=4.0,
+    #     negative_prompt=None,
+    #     scheduler_kwargs={"use_karras_sigmas": True, "algorithm_type": "dpmsolver++"},
+    # ),
     ModelConfig(
         name="Obsession IllustriousXL v10",
         model_id="John6666/obsession-illustriousxl-v10-sdxl",
@@ -159,7 +159,7 @@ def _prepare_pipeline(
     pipe = DiffusionPipeline.from_pretrained(
         config.model_id,
         torch_dtype=dtype,
-        variant="fp16" if dtype == torch.float16 else None,
+        # variant="fp16" if dtype == torch.float16 else None,
     )
     pipe.scheduler = _create_scheduler(pipe, config.scheduler, config.scheduler_kwargs)
     pipe.to(device)

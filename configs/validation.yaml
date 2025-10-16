@@ -1,0 +1,45 @@
+dataset:
+  path: /data/kazanplova/latent_vae_upscale_train/sdxl_validation
+  subset: realvisxl-v5-0
+  #[obsession-illustriousxl-v10, juggernaut-xl-v9, realvisxl-v5-0]
+  scale: 2
+  batch_size: 8
+  num_workers: 4
+  high_resolution: 1024
+  low_resolution: 512
+model:
+  arch:
+    target: basicsr.archs.swinir_arch.SwinIR
+    params:
+      upscale: 2
+      in_chans: 4
+      img_size: 16
+      window_size: 8
+      img_range: 1.0
+      depths: [6,6,6,6,6,6]
+      embed_dim: 180
+      num_heads: [6,6,6,6,6,6]
+      mlp_ratio: 2
+      upsampler: pixelshuffle
+      resi_connection: 1conv
+  device: cuda
+  dtype: float32
+  vae:
+    target: AutoencoderKL
+    params:
+      pretrained_model_name_or_path: stabilityai/sdxl-vae
+    dtype: float32
+weights:
+  path: /data/kazanplova/latent_vae_upscale_train/net_g_8000.pth
+metrics:
+  latent_l1: true
+  latent_mse: true
+  pixel_psnr: true
+  pixel_l1: true
+output:
+  dir: ./validation_results
+  metrics_path: metrics.json
+  per_image_path: per_image_metrics.json
+  visualizations_dir: visualizations
+  visualizations_limit: 12
+  visualizations_channels: 4

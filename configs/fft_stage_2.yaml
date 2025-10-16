@@ -1,0 +1,160 @@
+# general settings
+name: swinir_stage2_fft_pixel_latent_mix
+model_type: SwinIRLatentModel
+scale: 2
+num_gpu: 4
+manual_seed: 0
+
+vae_sources:
+  flux_vae:
+    hf_repo: wolfgangblack/flux_vae
+    vae_kind: kl
+  sdxl_vae:
+    hf_repo: stabilityai/sdxl-vae
+    vae_kind: kl
+
+# dataset and data loader settings
+datasets:
+  train:
+    name: MidjourneyCropsFluxVAE_stage2_train
+    type: LatentCacheDataset
+
+    high_res: 256
+    low_res: 128
+    cache_dirs:
+      - /data/kazanplova/datasets/midjourney_full_ds_crops/embeddings/flux_vae
+    vae_names: [flux_vae]
+    phase: train
+
+    filename_tmpl: "{}"
+    io_backend:
+      type: disk
+    scale: 2
+    phase: train
+    mean: null
+    std: null
+
+    num_worker_per_gpu: 24
+    batch_size_per_gpu: 320
+    prefetch_mode: cuda
+    pin_memory: true
+
+  val:
+    name: WallpapersFlux
+    type: LatentCacheDataset
+    high_res: 512
+    low_res: 256
+    cache_dirs:
+      - /data/kazanplova/latent_vae_upscale_train/flux_val/256_512/embeddings
+    vae_names: [flux_vae]
+    phase: val
+
+    io_backend:
+      type: disk
+    scale: 2
+    mean: null
+    std: null
+    batch_size_per_gpu: 64
+    pin_memory: true
+
+# network structures
+network_g:
+  type: SwinIR
+  upscale: 2
+  in_chans: 16
+  img_size: 16
+  window_size: 8
+  img_range: 1.
+  depths: [6, 6, 6, 6, 6, 6]
+  embed_dim: 180
+  num_heads: [6, 6, 6, 6, 6, 6]
+  mlp_ratio: 2
+  upsampler: "pixelshuffle"
+  resi_connection: "1conv"
+
+# path
+path:
+  strict_load_g: true
+  resume_state: ~
+
+# training settings
+train:
+  ema_decay: 0.999
+  optim_g:
+    type: Adam
+    lr: !!float 1e-4
+    weight_decay: 0
+    betas: [0.9, 0.99]
+
+  scheduler:
+    type: MultiStepLR
+    milestones: [150000, 225000, 275000]
+    gamma: 0.5
+
+  total_steps: 300000
+  warmup_iter: -1
+
+  l1_latent_opt:
+    type: L1Loss
+    loss_weight: 0.5
+    reduction: mean
+    space: latent
+
+  l1_pixel_opt:
+    type: L1Loss
+    loss_weight: 0.25
+    reduction: mean
+    space: pixel
+
+  fft_frequency_opt:
+    type: FFTFrequencyLoss
+    loss_weight: 0.25
+    reduction: mean
+    space: pixel
+    norm: ortho
+    use_log_amplitude: true
+    alpha: 1.0
+    normalize_weight: true
+    eps: !!float 1e-8
+
+# validation settings
+val:
+  val_freq: 1000
+  save_img: true
+  metrics:
+    l1_latent:
+      type: L1Loss
+      space: latent
+    l2_latent:
+      type: MSELoss
+      space: latent
+    pixel_psnr_pt:
+      type: calculate_psnr_pt
+      space: pixel
+      crop_border: 2
+      test_y_channel: false
+    pixel_ssim_pt:
+      type: calculate_ssim_pt
+      space: pixel
+      crop_border: 2
+      test_y_channel: false
+
+# logging settings
+logger:
+  print_freq: 100
+  save_checkpoint_freq: 2000
+  use_tb_logger: true
+  wandb:
+    project: SwinIR-Latent-SR
+    entity: kazanplova-it-more
+    resume_id: null
+    max_val_images: 8
+
+# dist training settings
+dist_params:
+  backend: nccl
+  port: 29500
+  dist: true
+
+resume_state: ~
+load_networks_only: false
