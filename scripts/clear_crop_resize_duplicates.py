@@ -24,6 +24,7 @@ import torch
 from PIL import Image
 from tqdm.auto import tqdm
 from transformers import SiglipModel, SiglipProcessor
+from torch.utils.data import DataLoader, Dataset
 
 VALID_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 RESOLUTION_FOLDERS = ("512px", "256px", "128px")
@@ -52,6 +53,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=32,
         help="Number of images to encode per batch.",
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=0,
+        help="Number of worker processes for the DataLoader (default: 0).",
     )
     parser.add_argument(
         "--distance-threshold",
@@ -105,31 +112,78 @@ def load_siglip(model_name: str, device: torch.device) -> Tuple[SiglipProcessor,
     return processor, model
 
 
+class SiglipImageDataset(Dataset):
+    """Torch dataset that loads crops and prepares pixel values for SigLIP."""
+
+    def __init__(self, image_paths: Sequence[Path], processor: SiglipProcessor) -> None:
+        self.image_paths = list(image_paths)
+        self.processor = processor
+
+    def __len__(self) -> int:
+        return len(self.image_paths)
+
+    def __getitem__(self, index: int) -> Dict[str, torch.Tensor | Path]:
+        path = self.image_paths[index]
+        with Image.open(path) as img:
+            image = img.convert("RGB")
+        processed = self.processor(images=image, return_tensors="pt")
+        pixel_values = processed["pixel_values"].squeeze(0)
+        return {"pixel_values": pixel_values, "path": path}
+
+
+def collate_siglip_batch(batch: Sequence[Dict[str, torch.Tensor | Path]]) -> Dict[str, torch.Tensor | List[Path]]:
+    pixel_values = torch.stack([item["pixel_values"] for item in batch])
+    paths = [item["path"] for item in batch]
+    return {"pixel_values": pixel_values, "paths": paths}
+
+
+def resolve_processor_image_size(processor: SiglipProcessor) -> Tuple[int, int]:
+    size = processor.image_processor.size
+    if isinstance(size, dict):
+        if "height" in size and "width" in size:
+            return int(size["height"]), int(size["width"])
+        if "shortest_edge" in size:
+            edge = int(size["shortest_edge"])
+            return edge, edge
+    if isinstance(size, (list, tuple)):
+        if len(size) == 2:
+            return int(size[0]), int(size[1])
+        if len(size) == 1:
+            edge = int(size[0])
+            return edge, edge
+    if isinstance(size, int):
+        return size, size
+    raise ValueError(f"Cannot resolve image size from processor config: {size}")
+
+
 def compute_embeddings(
     image_paths: Sequence[Path],
     processor: SiglipProcessor,
     model: SiglipModel,
     device: torch.device,
     batch_size: int,
+    num_workers: int,
 ) -> np.ndarray:
+    dataset = SiglipImageDataset(image_paths, processor)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=device.type == "cuda",
+        collate_fn=collate_siglip_batch,
+    )
+
     embeddings: List[np.ndarray] = []
-    progress = tqdm(total=len(image_paths), desc="Computing embeddings", unit="img")
-    for offset in range(0, len(image_paths), batch_size):
-        batch_paths = image_paths[offset : offset + batch_size]
-        images = []
-        for path in batch_paths:
-            with Image.open(path) as img:
-                images.append(img.convert("RGB"))
-        if not images:
-            continue
-        inputs = processor(images=images, return_tensors="pt")
-        inputs = {key: tensor.to(device) for key, tensor in inputs.items()}
+    progress = tqdm(total=len(dataset), desc="Computing embeddings", unit="img")
+    for batch in dataloader:
+        pixel_values = batch["pixel_values"].to(device, non_blocking=True)
         with torch.no_grad():
-            outputs = model(**inputs)
+            outputs = model(pixel_values=pixel_values)
             image_embeds = outputs.image_embeds  # (batch, dim)
         image_embeds = torch.nn.functional.normalize(image_embeds, p=2, dim=-1)
         embeddings.append(image_embeds.cpu().numpy().astype("float32"))
-        progress.update(len(batch_paths))
+        progress.update(pixel_values.shape[0])
     progress.close()
     if not embeddings:
         return np.empty((0, 0), dtype="float32")
@@ -216,7 +270,11 @@ def run_cleanup(args: argparse.Namespace) -> DatasetStats:
 
     device = resolve_device(args.device)
     processor, model = load_siglip(args.model_name, device)
-    embeddings = compute_embeddings(image_paths, processor, model, device, args.batch_size)
+    target_height, target_width = resolve_processor_image_size(processor)
+    print(f"[info] SigLIP input size: {target_height}x{target_width}")
+    embeddings = compute_embeddings(
+        image_paths, processor, model, device, args.batch_size, args.num_workers
+    )
     if embeddings.size == 0:
         raise RuntimeError("No embeddings were computed.")
 
