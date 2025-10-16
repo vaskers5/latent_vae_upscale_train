@@ -2,7 +2,7 @@
 name: swinir_stage2_fft_pixel_latent_mix
 model_type: SwinIRLatentModel
 scale: 2
-num_gpu: 4
+num_gpu: 8
 manual_seed: 0
 
 vae_sources:
@@ -37,7 +37,7 @@ datasets:
     std: null
 
     num_worker_per_gpu: 32
-    batch_size_per_gpu: 512
+    batch_size_per_gpu: 672
     prefetch_mode: cuda
     pin_memory: true
 
@@ -77,14 +77,16 @@ network_g:
 # path
 path:
   strict_load_g: true
-  resume_state: ~
+  pretrain_network_g: /data/kazanplova/latent_vae_upscale_train/pretrained_weights/models/net_g_9000.pth
+  resume_state:  /data/kazanplova/latent_vae_upscale_train/pretrained_weights/swinir_stage2_fft_pixel_latent_mix/training_states/9000.state
+  experiments_root: /data/kazanplova/latent_vae_upscale_train/pretrained_weights
 
 # training settings
 train:
   ema_decay: 0.999
   optim_g:
     type: Adam
-    lr: !!float 1e-4
+    lr: 0.0001
     weight_decay: 0
     betas: [0.9, 0.99]
 
@@ -98,7 +100,7 @@ train:
 
   l1_latent_opt:
     type: L1Loss
-    loss_weight: 0.5
+    loss_weight: 1.0
     reduction: mean
     space: latent
 
@@ -110,18 +112,18 @@ train:
 
   fft_frequency_opt:
     type: FFTFrequencyLoss
-    loss_weight: 1.0
+    loss_weight: 0.5
     reduction: mean
     space: latent
     norm: ortho
-    use_log_amplitude: true
-    alpha: 1.0
+    use_log_amplitude: false
+    alpha: 0.0
     normalize_weight: true
     eps: 1e-8
 
 # validation settings
 val:
-  val_freq: 100
+  val_freq: 500
   save_img: true
   metrics:
     l1_latent:
@@ -157,6 +159,3 @@ dist_params:
   backend: nccl
   port: 29500
   dist: true
-
-resume_state: /data/kazanplova/latent_vae_upscale_train/runs/2025_10_15_233640_swinirdefauilt_midjourney_feat_openim_5M_1stage_sdxl_l1latent_full_dataset/swinirdefauilt_midjourney_feat_openim_5M_1stage_sdxl_l1latent_full_dataset/models/net_g_9000.pth
-load_networks_only: true

@@ -1,3 +1,4 @@
+from copy import deepcopy
 import cv2
 import inspect
 import numpy as np
@@ -453,6 +454,34 @@ class SwinIRLatentModel(SwinIRModel):
             for entry in set(self._current_vae_names):
                 self._resolve_vae_spec(entry)
 
+    def load_network(self, net, load_path, strict=True, param_key='params'):
+        """Load network.
+
+        Args:
+            load_path (str): The path of networks to be loaded.
+            net (nn.Module): Network.
+            strict (bool): Whether strictly loaded.
+            param_key (str): The parameter key of loaded network. If set to
+                None, use the root 'path'.
+                Default: 'params'.
+        """
+        logger = get_root_logger()
+        net = self.get_bare_model(net)
+        load_net = torch.load(load_path)
+        if param_key is not None:
+            if param_key not in load_net and 'params' in load_net:
+                param_key = 'params'
+                logger.info('Loading: params_ema does not exist, use params.')
+            load_net = load_net[param_key]
+        logger.info(f'Loading {net.__class__.__name__} model from {load_path}, with param key: [{param_key}].')
+        # remove unnecessary 'module.'
+        for k, v in deepcopy(load_net).items():
+            if k.startswith('module.'):
+                load_net[k[7:]] = v
+                load_net.pop(k)
+        self._print_different_keys_loading(net, load_net, strict)
+        net.load_state_dict(load_net, strict=strict)
+        
     def init_training_settings(self):
         """Override to handle space-aware loss initialization"""
         self.net_g.train()
