@@ -10,8 +10,8 @@ defaults:
   store_distribution: true
   # image_csv: ./clear_images.csv
   devices:
-    - cuda:0
-    - cuda:1
+    # - cuda:0
+    # - cuda:1
     - cuda:2
     - cuda:3
     - cuda:4
@@ -26,7 +26,7 @@ models:
     cache_subdir: sdxl_vae
     resolutions_with_batchsize:
       # - [128, 1024]
-      - [256, 256]
+      # - [256, 256]
       - [512, 64]
 
 

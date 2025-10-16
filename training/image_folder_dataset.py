@@ -22,8 +22,6 @@ class ImageFolderDataset(Dataset):
         paths: List[Path],
     ) -> None:
         self.paths = paths
-        if not self.paths:
-            raise RuntimeError(f"No valid images found under '{self.root}'")
 
     def __len__(self) -> int:
         return len(self.paths)

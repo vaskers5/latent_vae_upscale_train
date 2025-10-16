@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Sequence, Tuple
 import random
 
+random.seed(42)
+
 import torch
 from torch.utils import data as data
 from tqdm.auto import tqdm
