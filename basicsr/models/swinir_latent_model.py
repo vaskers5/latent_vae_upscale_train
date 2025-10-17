@@ -1,4 +1,5 @@
 from copy import deepcopy
+import hashlib
 import cv2
 import inspect
 import numpy as np
@@ -187,6 +188,8 @@ class SwinIRLatentModel(SwinIRModel):
         self._current_vae_names: Optional[List[str]] = None
         self._default_train_vae_name: Optional[str] = None
         self._default_val_vae_name: Optional[str] = None
+        self._val_decode_mem_cache: Dict[str, torch.Tensor] = {}
+        self._val_cache_dir: Optional[str] = None
         super().__init__(opt)
         if VAE_AVAILABLE:
             self._setup_vae_registry()
@@ -705,8 +708,125 @@ class SwinIRLatentModel(SwinIRModel):
             stacked = stacked[0]
         return stacked
 
+    # ------------------------------------------------------------------ Validation helpers & caching
+    def _get_validation_root_dir(self, dataset_name: str) -> str:
+        """Resolve and create the visualization root for a dataset."""
+        root = osp.join(self.opt["path"]["visualization"], dataset_name)
+        os.makedirs(root, exist_ok=True)
+        return root
+
+    def _get_cache_dir(self, dataset_name: str) -> str:
+        """Return the cache directory for decoded tensors."""
+        root = self._get_validation_root_dir(dataset_name)
+        cache_dir = osp.join(root, "cache_folder")
+        os.makedirs(cache_dir, exist_ok=True)
+        self._val_cache_dir = cache_dir
+        return cache_dir
+
+    @staticmethod
+    def _hash_str(text: str) -> str:
+        return hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
+
+    def _decoded_cache_key(
+        self,
+        *,
+        img_name: str,
+        role: str,
+        vae_key: str,
+        spatial_hw: Tuple[int, int],
+    ) -> str:
+        base = f"{img_name}__{role}__{vae_key}__{spatial_hw[0]}x{spatial_hw[1]}"
+        return f"{base}__{self._hash_str(base)}"
+
+    def _pixel_metrics_requested(self) -> bool:
+        metrics = (self.opt.get("val") or {}).get("metrics") or {}
+        for cfg in metrics.values():
+            if isinstance(cfg, Mapping) and str(cfg.get("space", "latent")).lower() == "pixel":
+                return True
+        return False
+
+    def _decode_with_cache(
+        self,
+        latents: Optional[torch.Tensor],
+        *,
+        img_name: str,
+        role: str,
+        dataset_name: str,
+    ) -> Optional[torch.Tensor]:
+        """Decode latents to RGB tensors, caching LQ/GT results on disk."""
+        if latents is None or not VAE_AVAILABLE:
+            return None
+
+        squeeze = False
+        if latents.dim() == 3:
+            latents = latents.unsqueeze(0)
+            squeeze = True
+
+        if latents.dim() != 4:
+            raise ValueError(
+                f"Expected latents with shape [B, C, H, W]; received {tuple(latents.shape)}."
+            )
+
+        batch_size = latents.shape[0]
+        name_list = self._prepare_batch_vae_names(self._current_vae_names, batch_size)
+        ensured = self._ensure_vae(name_list[0] if name_list else None)
+        if ensured is None:
+            return None
+        _, spec = ensured
+        vae_key = spec.cache_key
+        spatial_hw = (latents.shape[-2], latents.shape[-1])
+
+        cache_key = self._decoded_cache_key(
+            img_name=img_name,
+            role=role,
+            vae_key=vae_key,
+            spatial_hw=spatial_hw,
+        )
+
+        if cache_key in self._val_decode_mem_cache:
+            cached = self._val_decode_mem_cache[cache_key]
+            return cached if not squeeze else cached
+
+        disk_path = None
+        if role in {"lq", "gt"} and self._val_cache_dir:
+            disk_path = osp.join(self._val_cache_dir, f"{cache_key}.pt")
+            if osp.exists(disk_path):
+                try:
+                    tensor = torch.load(disk_path, map_location="cpu")
+                    if isinstance(tensor, torch.Tensor):
+                        self._val_decode_mem_cache[cache_key] = tensor
+                        return tensor if not squeeze else tensor
+                except Exception:
+                    pass  # fall back to re-decode on failure
+
+        decoded = self.decode_latents(latents, vae_names=self._current_vae_names)
+        if decoded is None:
+            return None
+
+        if decoded.dim() == 4 and decoded.size(0) == 1:
+            decoded = decoded.squeeze(0)
+
+        decoded_cpu = decoded.detach().to("cpu", dtype=torch.float16).contiguous()
+
+        self._val_decode_mem_cache[cache_key] = decoded_cpu
+
+        if disk_path is not None:
+            try:
+                torch.save(decoded_cpu, disk_path)
+            except Exception:
+                pass
+
+        return decoded_cpu if not squeeze else decoded_cpu
+
     def calculate_metric_in_space(
-        self, pred_latent, gt_latent, metric_name, metric_opt
+        self,
+        pred_latent,
+        gt_latent,
+        metric_name,
+        metric_opt,
+        *,
+        decoded_pred: Optional[torch.Tensor] = None,
+        decoded_gt: Optional[torch.Tensor] = None,
     ):
         """Calculate metric in specified space (latent or pixel)"""
         metric_space = metric_opt.get("space", "latent")
@@ -721,14 +841,24 @@ class SwinIRLatentModel(SwinIRModel):
                 return 0.0
 
         elif metric_space == "pixel":
-            # Decode latents to images once for all pixel-space metrics
-            decoded_pred = self.decode_latents(pred_latent, vae_names=self._current_vae_names)
-            decoded_gt = self.decode_latents(gt_latent, vae_names=self._current_vae_names)
             if decoded_pred is None or decoded_gt is None:
-                print(
-                    f"Warning: Unable to decode latents, skipping pixel space metric: {metric_name}"
-                )
-                return 0.0
+                # Decode latents to images once for all pixel-space metrics
+                decoded_pred = self.decode_latents(pred_latent, vae_names=self._current_vae_names)
+                decoded_gt = self.decode_latents(gt_latent, vae_names=self._current_vae_names)
+                if decoded_pred is None or decoded_gt is None:
+                    print(
+                        f"Warning: Unable to decode latents, skipping pixel space metric: {metric_name}"
+                    )
+                    return 0.0
+                if decoded_pred.dim() == 4 and decoded_pred.size(0) == 1:
+                    decoded_pred = decoded_pred.squeeze(0)
+                if decoded_gt.dim() == 4 and decoded_gt.size(0) == 1:
+                    decoded_gt = decoded_gt.squeeze(0)
+                decoded_pred = decoded_pred.detach().to("cpu", dtype=torch.float32)
+                decoded_gt = decoded_gt.detach().to("cpu", dtype=torch.float32)
+            else:
+                decoded_pred = decoded_pred.detach().to("cpu", dtype=torch.float32)
+                decoded_gt = decoded_gt.detach().to("cpu", dtype=torch.float32)
 
             # Handle L1Loss directly on tensors
             if metric_opt["type"] == "L1Loss":
@@ -946,16 +1076,27 @@ class SwinIRLatentModel(SwinIRModel):
         plt.close(fig)  # Close figure to free memory
 
     def nondist_validation(self, dataloader, current_iter, tb_logger, save_img):
-        """Custom validation for latent space with detailed Matplotlib visualization."""
+        """Validation with caching for decoded tensors and separated metric/plot flows."""
         dataset_name = dataloader.dataset.opt["name"]
         with_metrics = self.opt["val"]["metrics"] is not None
         use_pbar = self.opt["val"].get("pbar", False)
 
-        # Check if wandb logging is enabled
         log_to_wandb = (
             self.opt.get("logger", {}).get("wandb", {}).get("project") is not None
         )
+        max_wandb_images = (
+            self.opt.get("logger", {}).get("wandb", {}).get("max_val_images", 8)
+        )
+        wandb_image_count = 0
+        need_pixel_metrics = with_metrics and self._pixel_metrics_requested()
 
+        if (save_img or need_pixel_metrics) and VAE_AVAILABLE:
+            self._get_cache_dir(dataset_name)
+        else:
+            self._val_cache_dir = None
+        self._val_decode_mem_cache.clear()
+
+        evaluated_images = 0
         if with_metrics:
             if not hasattr(self, "metric_results"):
                 self.metric_results = {
@@ -981,6 +1122,31 @@ class SwinIRLatentModel(SwinIRModel):
             lq_latent = self.lq.detach()
             pred_latent = self.output.detach()
             gt_latent = self.gt.detach() if hasattr(self, "gt") else None
+
+            decoded_lq_cpu: Optional[torch.Tensor] = None
+            decoded_pred_cpu: Optional[torch.Tensor] = None
+            decoded_gt_cpu: Optional[torch.Tensor] = None
+
+            if VAE_AVAILABLE:
+                if save_img and gt_latent is not None:
+                    decoded_lq_cpu = self._decode_with_cache(
+                        lq_latent, img_name=img_name, role="lq", dataset_name=dataset_name
+                    )
+                    decoded_gt_cpu = self._decode_with_cache(
+                        gt_latent, img_name=img_name, role="gt", dataset_name=dataset_name
+                    )
+                    decoded_pred_cpu = self._decode_with_cache(
+                        pred_latent, img_name=img_name, role="pred", dataset_name=dataset_name
+                    )
+                if need_pixel_metrics and gt_latent is not None:
+                    if decoded_gt_cpu is None:
+                        decoded_gt_cpu = self._decode_with_cache(
+                            gt_latent, img_name=img_name, role="gt", dataset_name=dataset_name
+                        )
+                    if decoded_pred_cpu is None:
+                        decoded_pred_cpu = self._decode_with_cache(
+                            pred_latent, img_name=img_name, role="pred", dataset_name=dataset_name
+                        )
 
             # --- Visualization ---
             if save_img and gt_latent is not None:
@@ -1017,9 +1183,9 @@ class SwinIRLatentModel(SwinIRModel):
                     lq_latent.cpu(),
                     pred_latent.cpu(),
                     gt_latent.cpu(),
-                    decoded_lq.cpu() if decoded_lq is not None else None,
-                    decoded_pred.cpu() if decoded_pred is not None else None,
-                    decoded_gt.cpu() if decoded_gt is not None else None,
+                    decoded_lq_cpu.float() if decoded_lq_cpu is not None else None,
+                    decoded_pred_cpu.float() if decoded_pred_cpu is not None else None,
+                    decoded_gt_cpu.float() if decoded_gt_cpu is not None else None,
                     log_to_wandb=should_log_wandb,
                     current_iter=current_iter,
                 )
@@ -1028,22 +1194,34 @@ class SwinIRLatentModel(SwinIRModel):
             if with_metrics and gt_latent is not None:
                 for name, opt_ in self.opt["val"]["metrics"].items():
                     metric_value = self.calculate_metric_in_space(
-                        pred_latent, gt_latent, name, opt_
+                        pred_latent,
+                        gt_latent,
+                        name,
+                        opt_,
+                        decoded_pred=decoded_pred_cpu,
+                        decoded_gt=decoded_gt_cpu,
                     )
                     self.metric_results[name] += metric_value
+            evaluated_images += 1
 
             if use_pbar:
                 pbar.update(1)
                 pbar.set_description(f"Test {img_name}")
 
+            decoded_lq_cpu = None
+            decoded_pred_cpu = None
+            decoded_gt_cpu = None
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
         if pbar:
             pbar.close()
 
-        if with_metrics:
+        if with_metrics and evaluated_images > 0:
             # Loop through the metrics that were calculated
             for metric_name in self.metric_results.keys():
                 # Average the metric value over the validation set
-                self.metric_results[metric_name] /= idx + 1
+                self.metric_results[metric_name] /= evaluated_images
                 # Update the best result for THIS specific metric using its correct name
                 self._update_best_metric_result(
                     dataset_name,
