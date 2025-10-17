@@ -1,12 +1,14 @@
 # general settings
-# CUDA_VISIBLE_DEVICES=0,1,2,3 python -m torch.distributed.launch --nproc_per_node=4 --master_port=4321 basicsr/train.py -opt options/train/SwinIR/train_SwinIR_latent_sr_kaggle.yml --launcher pytorch
-name: swinirdefauilt_256_512_new_val_test
+name: swinir_stage1_l1_256_512
 model_type: SwinIRLatentModel
 scale: 2
 num_gpu: 4
 manual_seed: 0
 
 vae_sources:
+  # flux_vae:
+  #   hf_repo: wolfgangblack/flux_vae
+  #   vae_kind: kl
   sdxl_vae:
     hf_repo: stabilityai/sdxl-vae
     vae_kind: kl
@@ -16,6 +18,7 @@ datasets:
   train:
     name: MidjourneyCropsFluxVAE_stage2_train
     type: LatentCacheDataset
+    number_of_samples: 1500000
     high_res: 512
     low_res: 256
     cache_dirs:
@@ -24,42 +27,44 @@ datasets:
       - /data/kazanplova/datasets/openim_cropped/train_latents/sdxl_vae
     vae_names: [sdxl_vae]
     phase: train
+
     filename_tmpl: "{}"
     io_backend:
       type: disk
     scale: 2
+    phase: train
     mean: null
     std: null
-    # data loader
-    num_worker_per_gpu: 24
-    batch_size_per_gpu: 64
+
+    num_worker_per_gpu: 12
+    batch_size_per_gpu: 128
     prefetch_mode: cuda
     pin_memory: true
 
   val:
-    name: sdxk_120_1024x1024
+    name: WallpapersFlux
     type: LatentCacheDataset
-    high_res: 1024
-    low_res: 512
+    high_res: 512
+    low_res: 256
     cache_dirs:
-      - /data/kazanplova/datasets/latent_upscale_validation_120_samples/embeddings/sdxl_vae
+      - /data/kazanplova/latent_vae_upscale_train/flux_val/256_512/embeddings/sdxl_vae
     vae_names: [sdxl_vae]
     phase: val
+
     io_backend:
       type: disk
     scale: 2
     mean: null
     std: null
-    batch_size_per_gpu: 16
-    num_worker_per_gpu: 4
+    batch_size_per_gpu: 64
     pin_memory: true
 
 # network structures
 network_g:
   type: SwinIR
   upscale: 2
-  in_chans: 4 # 16 channels for latent representations
-  img_size: 16 # Input latent size (16x16)
+  in_chans: 4
+  img_size: 16
   window_size: 8
   img_range: 1.
   depths: [6, 6, 6, 6, 6, 6]
@@ -68,6 +73,13 @@ network_g:
   mlp_ratio: 2
   upsampler: "pixelshuffle"
   resi_connection: "1conv"
+
+# path
+# path:
+#   strict_load_g: true
+#   pretrain_network_g: /data/kazanplova/latent_vae_upscale_train/pretrained_weights/models/net_g_9000.pth
+#   resume_state:  /data/kazanplova/latent_vae_upscale_train/pretrained_weights/swinir_stage2_fft_pixel_latent_mix/training_states/9000.state
+#   experiments_root: /data/kazanplova/latent_vae_upscale_train/pretrained_weights
 
 # training settings
 train:
@@ -92,34 +104,27 @@ train:
     reduction: mean
     space: latent
 
-  fft_frequency_opt:
-    type: FFTFrequencyLoss
-    loss_weight: 0.5
-    reduction: mean
-    space: latent
-    norm: ortho
-  use_log_amplitude: false
-  alpha: 0.0
-  normalize_weight: true
-  eps: 1e-8
+  # l1_pixel_opt:
+  #   type: L1Loss
+  #   loss_weight: 0.25
+  #   reduction: mean
+  #   space: pixel
 
-# path settings
-path:
-  strict_load_g: true
-  param_key_g: params
-  pretrain_network_g: null
-  resume_state: null
-  experiments_root: ./experiments/swinir_stage2_fft_pixel_latent_mix_3m_256_512
+  # fft_frequency_opt:
+  #   type: FFTFrequencyLoss
+  #   loss_weight: 0.5
+  #   reduction: mean
+  #   space: latent
+  #   norm: ortho
+  #   use_log_amplitude: false
+  #   alpha: 0.0
+  #   normalize_weight: true
+  #   eps: 1e-8
 
 # validation settings
 val:
-  val_freq: 10
+  val_freq: 1000
   save_img: true
-  pbar: true
-  cache_decoded: true
-  cache_pred_decoded: false
-  cache_dir_name: cache_folder
-  cache_format: pt
   metrics:
     l1_latent:
       type: L1Loss
@@ -140,21 +145,17 @@ val:
 
 # logging settings
 logger:
-  print_freq: 5
-  save_checkpoint_freq: 2000 #!!float 5e3
+  print_freq: 100
+  save_checkpoint_freq: 1000
   use_tb_logger: true
   wandb:
     project: SwinIR-Latent-SR
     entity: kazanplova-it-more
     resume_id: null
-    # Maximum number of validation images to log to wandb per validation run
-    # This prevents cluttering your wandb dashboard with too many images
-    max_val_images: 10
+    max_val_images: 8
 
 # dist training settings
 dist_params:
   backend: nccl
   port: 29500
   dist: true
-
-resume_state: null

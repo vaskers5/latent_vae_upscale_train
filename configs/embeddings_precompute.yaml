@@ -1,6 +1,6 @@
 # Basic configuration for precomputing latent embeddings compatible with the test dataset.
-dataset_root: /data/kazanplova/latent_vae_upscale_train/midjourney_full_dataset_crops_new
-cache_root: /data/kazanplova/latent_vae_upscale_train/midjourney_full_dataset_crops_new/embeddings
+dataset_root: /data/kazanplova/datasets/latent_upscale_validation_120_samples
+cache_root: /data/kazanplova/datasets/latent_upscale_validation_120_samples/embeddings
 # dataset_root: /data/kazanplova/datasets/openim_cropped/train
 # cache_root: /data/kazanplova/datasets/openim_cropped/train_latents
 # CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 PYTHONPATH="$PWD" accelerate launch --num_processes 6 --main_process_port 29500 scripts/precompute_embeddings.py --config configs/embeddings_precompute.yaml 
@@ -10,14 +10,14 @@ defaults:
   store_distribution: true
   # image_csv: ./clear_images.csv
   devices:
-    # - cuda:0
+    - cuda:0
     # - cuda:1
-    - cuda:2
-    - cuda:3
-    - cuda:4
-    - cuda:5
-    - cuda:6
-    - cuda:7
+    # - cuda:2
+    # - cuda:3
+    # - cuda:4
+    # - cuda:5
+    # - cuda:6
+    # - cuda:7
 
 models:
   sdxl_vae:
@@ -28,6 +28,7 @@ models:
       # - [128, 1024]
       # - [256, 256]
       - [512, 64]
+      - [1024, 16]
 
 
 

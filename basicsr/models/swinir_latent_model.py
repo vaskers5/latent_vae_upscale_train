@@ -1108,7 +1108,13 @@ class SwinIRLatentModel(SwinIRModel):
 
         pbar = tqdm(total=len(dataloader), unit="image") if use_pbar else None
 
-        for idx, val_data in enumerate(dataloader):
+        # Limit number of images to log to wandb (to avoid clutter)
+        max_wandb_images = (
+            self.opt.get("logger", {}).get("wandb", {}).get("max_val_images", 8)
+        )
+        wandb_image_count = 0
+
+        for idx, val_data in enumerate(tqdm(dataloader)):
             img_name = osp.splitext(osp.basename(val_data["lq_path"][0]))[0]
             self.feed_data(val_data)
             self.test()
