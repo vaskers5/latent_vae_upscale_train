@@ -71,7 +71,11 @@ class LatentCacheDataset(data.Dataset):
         tasks: List[Tuple[Path, str]] = []
         for idx, cache_dir in enumerate(cache_dirs):
             resolved_dir = cache_dir.expanduser().resolve()
-            vae_name = self._vae_names[idx] if idx < len(self._vae_names) else str(resolved_dir)
+            if self._vae_names:
+                name_idx = idx if idx < len(self._vae_names) else len(self._vae_names) - 1
+                vae_name = self._vae_names[name_idx]
+            else:
+                vae_name = str(resolved_dir)
             tasks.append((resolved_dir, vae_name))
 
         if not tasks:
