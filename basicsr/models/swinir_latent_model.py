@@ -860,6 +860,11 @@ class SwinIRLatentModel(SwinIRModel):
                 decoded_pred = decoded_pred.detach().to("cpu", dtype=torch.float32)
                 decoded_gt = decoded_gt.detach().to("cpu", dtype=torch.float32)
 
+            if decoded_pred.dim() == 3:
+                decoded_pred = decoded_pred.unsqueeze(0)
+            if decoded_gt.dim() == 3:
+                decoded_gt = decoded_gt.unsqueeze(0)
+
             # Handle L1Loss directly on tensors
             if metric_opt["type"] == "L1Loss":
                 return F.l1_loss(decoded_pred, decoded_gt).item()
