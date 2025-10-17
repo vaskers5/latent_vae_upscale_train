@@ -14,10 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import sys
-import time
-from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -28,6 +25,8 @@ import yaml
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
+
+from basicsr.models.swinir_latent_model import SwinIRLatentModel
 
 try:
     import matplotlib
@@ -616,34 +615,6 @@ def _mean_reduce(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.mean(dim=dims)
 
 
-def compute_metrics(
-    *,
-    pred_latents: torch.Tensor,
-    gt_latents: torch.Tensor,
-    pred_pixels: Optional[torch.Tensor],
-    gt_pixels: Optional[torch.Tensor],
-    metrics_cfg: MetricsConfig,
-) -> Dict[str, torch.Tensor]:
-    results: Dict[str, torch.Tensor] = {}
-    if metrics_cfg.compute_latent_l1:
-        results["latent_l1"] = _mean_reduce(torch.abs(pred_latents - gt_latents))
-    if metrics_cfg.compute_latent_mse:
-        diff = pred_latents - gt_latents
-        results["latent_mse"] = _mean_reduce(diff * diff)
-    if metrics_cfg.compute_pixel_psnr and pred_pixels is not None and gt_pixels is not None:
-        mse = _mean_reduce((pred_pixels - gt_pixels) ** 2)
-        eps = torch.finfo(mse.dtype).eps
-        psnr = 10 * torch.log10(1.0 / torch.clamp(mse, min=eps))
-        results["pixel_psnr"] = psnr
-    if metrics_cfg.compute_pixel_l1 and pred_pixels is not None and gt_pixels is not None:
-        results["pixel_l1"] = _mean_reduce(torch.abs(pred_pixels - gt_pixels))
-    return results
-
-
-def _tensor_to_image_range(tensor: torch.Tensor) -> torch.Tensor:
-    return torch.clamp((tensor + 1.0) / 2.0, 0.0, 1.0)
-
-
 def _relative_output_path(image_path: str, dataset_root: Path) -> Path:
     path_obj = Path(image_path)
     try:
@@ -652,180 +623,136 @@ def _relative_output_path(image_path: str, dataset_root: Path) -> Path:
         return Path(path_obj.name)
 
 
-def _latent_preview(latent: torch.Tensor, max_channels: int) -> np.ndarray:
-    latent_np = latent.detach().cpu().numpy()
-    channels, height, width = latent_np.shape
-    preview_channels = max(1, min(max_channels, channels))
-    cols = 2 if preview_channels > 1 else 1
-    rows = int(math.ceil(preview_channels / cols))
-    canvas = np.zeros((rows * height, cols * width), dtype=latent_np.dtype)
-    for idx in range(preview_channels):
-        row, col = divmod(idx, cols)
-        canvas[row * height : (row + 1) * height, col * width : (col + 1) * width] = latent_np[idx]
-    return canvas
+def _infer_dataset_name(dataset_cfg: DatasetConfig) -> str:
+    if dataset_cfg.subsets:
+        return dataset_cfg.subsets[0]
+    return dataset_cfg.root.name
 
 
-def _tensor_to_numpy_rgb(tensor: torch.Tensor) -> np.ndarray:
-    data = tensor.detach().cpu()
-    if data.dim() == 4:
-        data = data.squeeze(0)
-    data = torch.clamp(data, -1.0, 1.0)
-    data = (data + 1.0) * 0.5
-    data = data.permute(1, 2, 0).contiguous()
-    return data.numpy()
+def build_val_metrics_config(metrics_cfg: MetricsConfig) -> Dict[str, Dict[str, object]]:
+    metrics: Dict[str, Dict[str, object]] = {}
+    if metrics_cfg.compute_latent_l1:
+        metrics["latent_l1"] = {"type": "L1Loss", "space": "latent", "better": "lower"}
+    if metrics_cfg.compute_latent_mse:
+        metrics["latent_mse"] = {"type": "MSELoss", "space": "latent", "better": "lower"}
+    if metrics_cfg.compute_pixel_psnr:
+        metrics["pixel_psnr"] = {"type": "calculate_psnr", "space": "pixel", "better": "higher"}
+    if metrics_cfg.compute_pixel_l1:
+        metrics["pixel_l1"] = {"type": "L1Loss", "space": "pixel", "better": "lower"}
+    return metrics
 
 
-def _pixel_psnr(pred: torch.Tensor, target: torch.Tensor) -> Optional[float]:
-    pred01 = _tensor_to_image_range(pred)
-    target01 = _tensor_to_image_range(target)
-    mse = torch.mean((pred01 - target01) ** 2).item()
-    if mse <= 0:
-        return None
-    return 10.0 * math.log10(1.0 / mse)
+def _vae_source_from_config(dataset_name: str, vae_cfg: VAEConfig) -> Tuple[str, Dict[str, object]]:
+    params = dict(vae_cfg.params)
+    mapping: Dict[str, object] = {}
 
+    load_from = params.get("load_from")
+    if load_from:
+        mapping["load_from"] = str(load_from)
 
-def _sync_if_cuda(device: torch.device) -> None:
-    if isinstance(device, torch.device) and device.type == "cuda":
-        torch.cuda.synchronize(device)
-
-
-def _reset_peak_memory(device: torch.device) -> None:
-    if isinstance(device, torch.device) and device.type == "cuda":
-        torch.cuda.reset_peak_memory_stats(device)
-
-
-def _max_memory_allocated(device: torch.device) -> int:
-    if isinstance(device, torch.device) and device.type == "cuda":
-        return torch.cuda.max_memory_allocated(device)
-    return 0
-
-
-def _timed_call(device: torch.device, fn, *args, **kwargs):
-    _sync_if_cuda(device)
-    start = time.perf_counter()
-    result = fn(*args, **kwargs)
-    _sync_if_cuda(device)
-    duration = time.perf_counter() - start
-    return result, duration
-
-
-def _save_visualization_figure(
-    *,
-    save_path: Path,
-    image_name: str,
-    lq_latent: torch.Tensor,
-    pred_latent: torch.Tensor,
-    gt_latent: torch.Tensor,
-    decoded_lq: Optional[torch.Tensor],
-    decoded_pred: Optional[torch.Tensor],
-    decoded_gt: Optional[torch.Tensor],
-    channels: int,
-) -> None:
-    if not MATPLOTLIB_AVAILABLE:
-        return
-
-    save_path.parent.mkdir(parents=True, exist_ok=True)
-
-    fig, axes = plt.subplots(2, 4, figsize=(24, 12))
-
-    # Latent panels
-    lq_panel = _latent_preview(lq_latent, channels)
-    im0 = axes[0, 0].imshow(lq_panel, cmap="viridis")
-    axes[0, 0].set_title(
-        f"Input Latents\n{lq_latent.shape[0]} ch @ {lq_latent.shape[1]}x{lq_latent.shape[2]}"
+    repo = (
+        params.get("pretrained_model_name_or_path")
+        or params.get("model_id")
+        or params.get("hf_repo")
     )
-    axes[0, 0].axis("off")
-    fig.colorbar(im0, ax=axes[0, 0], fraction=0.046, pad=0.04)
+    if repo:
+        mapping["hf_repo"] = str(repo)
 
-    pred_panel = _latent_preview(pred_latent, channels)
-    im1 = axes[0, 1].imshow(pred_panel, cmap="viridis")
-    axes[0, 1].set_title(
-        f"Predicted Latents\n{pred_latent.shape[0]} ch @ {pred_latent.shape[1]}x{pred_latent.shape[2]}"
-    )
-    axes[0, 1].axis("off")
-    fig.colorbar(im1, ax=axes[0, 1], fraction=0.046, pad=0.04)
+    if "hf_subfolder" in params:
+        mapping["hf_subfolder"] = params["hf_subfolder"]
+    if "subfolder" in params:
+        mapping["hf_subfolder"] = params["subfolder"]
 
-    gt_panel = _latent_preview(gt_latent, channels)
-    im2 = axes[0, 2].imshow(gt_panel, cmap="viridis")
-    axes[0, 2].set_title(
-        f"Ground Truth Latents\n{gt_latent.shape[0]} ch @ {gt_latent.shape[1]}x{gt_latent.shape[2]}"
-    )
-    axes[0, 2].axis("off")
-    fig.colorbar(im2, ax=axes[0, 2], fraction=0.046, pad=0.04)
+    if "hf_revision" in params:
+        mapping["hf_revision"] = params["hf_revision"]
+    if "revision" in params:
+        mapping["hf_revision"] = params["revision"]
 
-    latent_diff = torch.mean(torch.abs(gt_latent - pred_latent), dim=0).detach().cpu().numpy()
-    im3 = axes[0, 3].imshow(latent_diff, cmap="magma")
-    axes[0, 3].set_title("Latent Difference |GT - Pred| (mean over channels)")
-    axes[0, 3].axis("off")
-    fig.colorbar(im3, ax=axes[0, 3], fraction=0.046, pad=0.04)
+    if "hf_auth_token" in params:
+        mapping["hf_auth_token"] = params["hf_auth_token"]
+    if "use_auth_token" in params:
+        mapping["hf_auth_token"] = params["use_auth_token"]
 
-    pixel_metrics: Dict[str, float] = {}
-    decoded_available = decoded_lq is not None and decoded_pred is not None and decoded_gt is not None
+    if vae_cfg.dtype is not None:
+        mapping["weights_dtype"] = str(vae_cfg.dtype).split(".")[-1]
 
-    if decoded_available:
-        decoded_lq_np = _tensor_to_numpy_rgb(decoded_lq)  # already [-1, 1] -> 0, 1 conversions inside
-        decoded_pred_np = _tensor_to_numpy_rgb(decoded_pred)
-        decoded_gt_np = _tensor_to_numpy_rgb(decoded_gt)
-
-        axes[1, 0].imshow(decoded_lq_np)
-        axes[1, 0].set_title("Decoded Input\n(low-resolution reconstruction)")
-        axes[1, 0].axis("off")
-
-        axes[1, 1].imshow(decoded_pred_np)
-        axes[1, 1].set_title("Decoded Prediction")
-        axes[1, 1].axis("off")
-
-        axes[1, 2].imshow(decoded_gt_np)
-        axes[1, 2].set_title("Decoded Ground Truth")
-        axes[1, 2].axis("off")
-
-        pred_tensor = decoded_pred.detach()
-        gt_tensor = decoded_gt.detach()
-        psnr_value = _pixel_psnr(pred_tensor, gt_tensor)
-        if psnr_value is not None:
-            pixel_metrics["psnr"] = psnr_value
-        l1_value = torch.mean(torch.abs(_tensor_to_image_range(pred_tensor) - _tensor_to_image_range(gt_tensor))).item()
-        pixel_metrics["pixel_l1"] = l1_value
-
-        diff_map = torch.mean(
-            torch.abs(_tensor_to_image_range(gt_tensor) - _tensor_to_image_range(pred_tensor)), dim=0
-        ).cpu()
-        diff_np = diff_map.numpy()
-        if diff_np.max() > 0:
-            diff_np = diff_np / diff_np.max()
-        im_bottom = axes[1, 3].imshow(diff_np, cmap="magma")
-        axes[1, 3].set_title("Pixel Difference |GT - Pred|\n(mean absolute error)")
-        axes[1, 3].axis("off")
-        fig.colorbar(im_bottom, ax=axes[1, 3], fraction=0.046, pad=0.04)
+    target_lower = vae_cfg.target.lower()
+    if "qwen" in target_lower:
+        mapping["vae_kind"] = "qwen"
+    elif "wan" in target_lower:
+        mapping["vae_kind"] = "wan"
+    elif "asym" in target_lower:
+        mapping["vae_kind"] = "kl"
     else:
-        for col in range(4):
-            axes[1, col].text(
-                0.5,
-                0.5,
-                "No decoded images\n(VAE unavailable)",
-                ha="center",
-                va="center",
-                fontsize=12,
-            )
-            axes[1, col].axis("off")
+        mapping["vae_kind"] = "kl"
 
-    latent_l1 = torch.mean(torch.abs(pred_latent - gt_latent)).item()
-    latent_mse = torch.mean((pred_latent - gt_latent) ** 2).item()
-    title_parts = [
-        image_name,
-        f"Latent L1: {latent_l1:.6f}",
-        f"Latent MSE: {latent_mse:.6f}",
-    ]
-    if "psnr" in pixel_metrics:
-        title_parts.append(f"Pixel PSNR: {pixel_metrics['psnr']:.2f} dB")
-    if "pixel_l1" in pixel_metrics:
-        title_parts.append(f"Pixel L1: {pixel_metrics['pixel_l1']:.6f}")
-    fig.suptitle(" | ".join(title_parts), fontsize=16)
-    plt.tight_layout()
-    plt.subplots_adjust(top=0.88, hspace=0.35)
+    vae_name = f"{dataset_name}_vae"
+    return vae_name, mapping
 
-    plt.savefig(save_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
+
+def resolve_visualization_root(dataset_cfg: DatasetConfig, output_cfg: OutputConfig) -> Path:
+    if output_cfg.visualization_dir is not None:
+        return output_cfg.visualization_dir.resolve()
+    if output_cfg.directory is not None:
+        return (output_cfg.directory / "visualizations").resolve()
+    return (dataset_cfg.root / "visualizations").resolve()
+
+
+def build_model_options(
+    *,
+    dataset_cfg: DatasetConfig,
+    model_cfg: ModelConfig,
+    vae_cfg: VAEConfig,
+    weights_cfg: WeightsConfig,
+    metrics_cfg: MetricsConfig,
+    output_cfg: OutputConfig,
+    dataset_name: str,
+) -> Tuple[Dict[str, object], Path, str]:
+    visualization_root = resolve_visualization_root(dataset_cfg, output_cfg)
+    visualization_root.mkdir(parents=True, exist_ok=True)
+
+    metrics_opt = build_val_metrics_config(metrics_cfg)
+
+    network_g_opt = dict(model_cfg.params)
+    network_g_opt["type"] = model_cfg.target.rsplit(".", 1)[-1]
+
+    vae_name, vae_source = _vae_source_from_config(dataset_name, vae_cfg)
+
+    opt: Dict[str, object] = {
+        "name": dataset_name,
+        "is_train": False,
+        "dist": False,
+        "rank": 0,
+        "num_gpu": 1 if model_cfg.device.type == "cuda" and torch.cuda.is_available() else 0,
+        "scale": dataset_cfg.scale,
+        "network_g": network_g_opt,
+        "path": {
+            "pretrain_network_g": None,
+            "param_key_g": weights_cfg.key_preference or "params",
+            "strict_load_g": weights_cfg.strict,
+            "visualization": str(visualization_root),
+        },
+        "val": {
+            "metrics": metrics_opt,
+            "suffix": dataset_name,
+            "pbar": True,
+        },
+        "logger": {
+            "use_tb_logger": False,
+            "wandb": {},
+        },
+        "datasets": {
+            "val": {
+                "name": dataset_name,
+                "vae_names": vae_name,
+            }
+        },
+        "vae_sources": {
+            vae_name: vae_source,
+        },
+    }
+
+    return opt, visualization_root, vae_name
 
 
 def run_validation(
@@ -856,198 +783,147 @@ def run_validation(
         **dataloader_kwargs,
     )
 
+    dataset_name = _infer_dataset_name(dataset_cfg)
+    opt, visualization_root, vae_name = build_model_options(
+        dataset_cfg=dataset_cfg,
+        model_cfg=model_cfg,
+        vae_cfg=vae_cfg,
+        weights_cfg=weights_cfg,
+        metrics_cfg=metrics_cfg,
+        output_cfg=output_cfg,
+        dataset_name=dataset_name,
+    )
+
     print(f"[info] Loaded {len(dataset)} validation images from {dataset_cfg.root}")
     print(f"[info] Using device: {model_cfg.device}")
+    print(f"[info] Visualization root: {visualization_root}")
 
-    model = instantiate_model(model_cfg)
-    load_checkpoint(model, weights_cfg, fallback_device=model_cfg.device)
-    vae = instantiate_vae(vae_cfg, model_cfg.device)
+    model = SwinIRLatentModel(opt)
+    load_checkpoint(model.net_g, weights_cfg, fallback_device=model.device)
+    vae = instantiate_vae(vae_cfg, model.device)
 
-    total_samples = 0
-    metric_sums: Dict[str, float] = defaultdict(float)
+    metrics_config: Dict[str, Dict[str, object]] = opt["val"]["metrics"]
+    metric_sums: Dict[str, float] = {name: 0.0 for name in metrics_config.keys()}
     per_image_records: List[Dict[str, object]] = []
-    using_cuda = isinstance(model_cfg.device, torch.device) and model_cfg.device.type == "cuda"
-    total_encode_time = 0.0
-    total_model_time = 0.0
-    total_decode_time = 0.0
-    total_batch_time = 0.0
-    max_peak_bytes = 0
-    memory_per_image_accum = 0.0
-    memory_samples = 0
-    visualization_enabled = (
-        output_cfg.visualization_dir is not None and output_cfg.visualization_limit > 0
-    )
-    if visualization_enabled and not MATPLOTLIB_AVAILABLE:
+
+    visualization_limit = max(0, output_cfg.visualization_limit)
+    visualization_enabled = visualization_limit > 0 and MATPLOTLIB_AVAILABLE
+    if visualization_limit > 0 and not MATPLOTLIB_AVAILABLE:
         print("[warn] Matplotlib is not available; skipping visualization exports.")
-        visualization_enabled = False
+    save_dir = Path(opt["path"]["visualization"]) / dataset_name
     if visualization_enabled:
-        output_cfg.visualization_dir.mkdir(parents=True, exist_ok=True)
-    visualizations_saved = 0
-    pixel_metric_warning_issued = False
+        save_dir.mkdir(parents=True, exist_ok=True)
 
-    progress = tqdm(dataloader, desc="Validating", unit="batch")
-    inference_context = torch.inference_mode if hasattr(torch, "inference_mode") else torch.no_grad
-    with inference_context():
+    if VAE_AVAILABLE:
+        model._get_cache_dir(dataset_name)
+    model._val_decode_mem_cache.clear()
+
+    total_images = 0
+    visualization_count = 0
+    progress = tqdm(dataloader, desc="Validating", unit="image")
+
+    with torch.no_grad():
         for batch in progress:
-            if using_cuda:
-                _sync_if_cuda(model_cfg.device)
-                _reset_peak_memory(model_cfg.device)
-            batch_start = time.perf_counter()
-            lq_pixels = batch["lq_pixels"].to(
-                model_cfg.device, dtype=model_cfg.dtype, non_blocking=using_cuda
-            )
-            gt_pixels = batch["gt_pixels"].to(
-                model_cfg.device, dtype=model_cfg.dtype, non_blocking=using_cuda
-            )
+            lq_pixels = batch["lq_pixels"].to(model_cfg.device, dtype=model_cfg.dtype)
+            gt_pixels = batch["gt_pixels"].to(model_cfg.device, dtype=model_cfg.dtype)
             paths = batch["path"]
-
-            lq_latents, encode_time_lq = _timed_call(model_cfg.device, encode_latents, vae, lq_pixels)
-            gt_latents, encode_time_gt = _timed_call(model_cfg.device, encode_latents, vae, gt_pixels)
-            total_encode_time += encode_time_lq + encode_time_gt
-
-            pred_latents, model_time = _timed_call(model_cfg.device, model, lq_latents)
-            total_model_time += model_time
-
-            pred_pixels = None
-            gt_pixels_range = None
-            need_pixel_metrics = metrics_cfg.compute_pixel_psnr or metrics_cfg.compute_pixel_l1
-
-            decoded_pred_batch: Optional[torch.Tensor] = None
-            decoded_gt_batch: Optional[torch.Tensor] = None
-            decoded_lq_batch: Optional[torch.Tensor] = None
-            decode_time_batch = 0.0
-
-            if need_pixel_metrics or visualization_enabled:
-                decoded_pred_batch, decode_time = _timed_call(
-                    model_cfg.device, decode_latents, vae, pred_latents
-                )
-                decode_time_batch += decode_time
-            if visualization_enabled:
-                decoded_lq_batch, decode_time = _timed_call(
-                    model_cfg.device, decode_latents, vae, lq_latents
-                )
-                decode_time_batch += decode_time
-                decoded_gt_batch, decode_time = _timed_call(
-                    model_cfg.device, decode_latents, vae, gt_latents
-                )
-                decode_time_batch += decode_time
-
-            total_decode_time += decode_time_batch
-
-            if need_pixel_metrics and decoded_pred_batch is not None:
-                pred_pixels = _tensor_to_image_range(decoded_pred_batch.to(dtype=torch.float32))
-                gt_pixels_range = _tensor_to_image_range(gt_pixels.to(dtype=torch.float32))
-            elif need_pixel_metrics and not pixel_metric_warning_issued:
-                print("[warn] Unable to compute pixel metrics because decoded predictions are unavailable.")
-                pixel_metric_warning_issued = True
-
-            batch_metrics = compute_metrics(
-                pred_latents=pred_latents.to(dtype=torch.float32),
-                gt_latents=gt_latents.to(dtype=torch.float32),
-                pred_pixels=pred_pixels,
-                gt_pixels=gt_pixels_range,
-                metrics_cfg=metrics_cfg,
-            )
-            batch_metrics_cpu = {name: values.detach().cpu() for name, values in batch_metrics.items()}
-
-            _sync_if_cuda(model_cfg.device)
-            batch_time = time.perf_counter() - batch_start
-            total_batch_time += batch_time
-
             batch_size = lq_pixels.shape[0]
-            total_samples += batch_size
-            batch_peak_bytes = 0
-            batch_memory_per_image_mb: Optional[float] = None
-            if using_cuda:
-                batch_peak_bytes = _max_memory_allocated(model_cfg.device)
-                if batch_peak_bytes > max_peak_bytes:
-                    max_peak_bytes = batch_peak_bytes
-                if batch_size > 0:
-                    memory_per_image_accum += batch_peak_bytes / batch_size
-                    memory_samples += 1
-                    batch_memory_per_image_mb = (batch_peak_bytes / batch_size) / (1024**2)
 
-            for name, values_cpu in batch_metrics_cpu.items():
-                metric_sums[name] += values_cpu.sum().item()
+            lq_latents = encode_latents(vae, lq_pixels).to(model.device, dtype=model_cfg.dtype)
+            gt_latents = encode_latents(vae, gt_pixels).to(model.device, dtype=model_cfg.dtype)
 
-            if output_cfg.per_image_path:
-                time_per_image = batch_time / batch_size if batch_size > 0 else 0.0
-                per_image_values = {name: values_cpu.tolist() for name, values_cpu in batch_metrics_cpu.items()}
-                for idx in range(batch_size):
-                    record = {"path": paths[idx]}
-                    for name, values_list in per_image_values.items():
-                        record[name] = float(values_list[idx])
-                    record["time_per_image_sec"] = time_per_image
-                    if batch_memory_per_image_mb is not None:
-                        record["cuda_memory_per_image_mb"] = batch_memory_per_image_mb
-                    per_image_records.append(record)
+            feed_dict: Dict[str, object] = {
+                "lq": lq_latents,
+                "gt": gt_latents,
+                "lq_path": paths,
+                "gt_path": paths,
+                "vae_name": [vae_name] * batch_size,
+            }
+            model.feed_data(feed_dict)
+            model.test()
 
-            if visualization_enabled and visualizations_saved < output_cfg.visualization_limit:
-                for sample_idx in range(batch_size):
-                    if visualizations_saved >= output_cfg.visualization_limit:
-                        break
-                    rel_path = _relative_output_path(paths[sample_idx], dataset_cfg.root)
-                    save_path = output_cfg.visualization_dir / rel_path.with_suffix(".png")
-                    decoded_lq_item = (
-                        decoded_lq_batch[sample_idx] if decoded_lq_batch is not None else None
-                    )
-                    decoded_pred_item = (
-                        decoded_pred_batch[sample_idx] if decoded_pred_batch is not None else None
-                    )
-                    decoded_gt_item = (
-                        decoded_gt_batch[sample_idx] if decoded_gt_batch is not None else None
-                    )
-                    _save_visualization_figure(
-                        save_path=save_path,
-                        image_name=str(rel_path),
-                        lq_latent=lq_latents[sample_idx],
-                        pred_latent=pred_latents[sample_idx],
-                        gt_latent=gt_latents[sample_idx],
-                        decoded_lq=decoded_lq_item,
-                        decoded_pred=decoded_pred_item,
-                        decoded_gt=decoded_gt_item,
-                        channels=output_cfg.visualization_channels,
-                    )
-                    visualizations_saved += 1
+            pred_latent = model.output.detach()
+            lq_latent = model.lq.detach()
+            gt_latent = model.gt.detach()
 
-            if batch_metrics_cpu:
-                running = {name: metric_sums[name] / total_samples for name in batch_metrics_cpu}
+            for idx in range(batch_size):
+                total_images += 1
+                img_path = paths[idx]
+                img_name = Path(img_path).stem
+                rel_path = _relative_output_path(img_path, dataset_cfg.root)
+
+                lq_single = lq_latent[idx : idx + 1]
+                pred_single = pred_latent[idx : idx + 1]
+                gt_single = gt_latent[idx : idx + 1]
+
+                decoded_lq = model._decode_with_cache(
+                    lq_single, img_name=img_name, role="lq", dataset_name=dataset_name
+                )
+                decoded_gt = model._decode_with_cache(
+                    gt_single, img_name=img_name, role="gt", dataset_name=dataset_name
+                )
+                decoded_pred = model._decode_with_cache(
+                    pred_single, img_name=img_name, role="pred", dataset_name=dataset_name
+                )
+
+                sample_metrics: Dict[str, float] = {}
+                for metric_name, metric_opt in metrics_config.items():
+                    value = model.calculate_metric_in_space(
+                        pred_single,
+                        gt_single,
+                        metric_name,
+                        metric_opt,
+                        decoded_pred=decoded_pred,
+                        decoded_gt=decoded_gt,
+                    )
+                    metric_sums[metric_name] += value
+                    sample_metrics[metric_name] = float(value)
+
+                per_image_records.append(
+                    {
+                        "path": str(img_path),
+                        "relative_path": str(rel_path),
+                        "metrics": sample_metrics,
+                    }
+                )
+
+                if visualization_enabled and visualization_count < visualization_limit:
+                    save_path = save_dir / f"{img_name}_{opt['name']}.png"
+                    model._save_comparison_plot(
+                        save_path,
+                        img_name,
+                        lq_single.cpu(),
+                        pred_single.cpu(),
+                        gt_single.cpu(),
+                        decoded_lq.float() if decoded_lq is not None else None,
+                        decoded_pred.float() if decoded_pred is not None else None,
+                        decoded_gt.float() if decoded_gt is not None else None,
+                        log_to_wandb=False,
+                        current_iter=0,
+                    )
+                    visualization_count += 1
+
+            if metrics_config:
+                running = {
+                    name: metric_sums[name] / total_images for name in metrics_config.keys()
+                }
                 progress.set_postfix({key: f"{value:.4f}" for key, value in running.items()})
 
-    averages = {name: value / total_samples for name, value in metric_sums.items()}
-    runtime_summary: Dict[str, float] = {}
-    if total_samples > 0:
-        runtime_summary = {
-            "total_runtime_sec": total_batch_time,
-            "avg_time_per_image_sec": total_batch_time / total_samples if total_samples else 0.0,
-            "avg_encode_time_per_image_sec": total_encode_time / total_samples if total_samples else 0.0,
-            "avg_model_time_per_image_sec": total_model_time / total_samples if total_samples else 0.0,
-            "avg_decode_time_per_image_sec": total_decode_time / total_samples if total_samples else 0.0,
-        }
-        if total_batch_time > 0:
-            runtime_summary["images_per_second"] = total_samples / total_batch_time
-        if using_cuda and memory_samples > 0:
-            avg_memory_per_image_bytes = memory_per_image_accum / memory_samples
-            runtime_summary["avg_cuda_memory_per_image_mb"] = avg_memory_per_image_bytes / (1024**2)
-            runtime_summary["max_cuda_memory_mb"] = max_peak_bytes / (1024**2)
+    if total_images == 0:
+        print("[warn] Validation dataset is empty; no metrics computed.")
+        return
+
+    averages = {name: metric_sums[name] / total_images for name in metrics_config.keys()}
+    averages_float = {name: float(value) for name, value in averages.items()}
 
     print("\nValidation complete.")
-    for name, value in averages.items():
+    print(f"num_samples: {total_images}")
+    for name, value in averages_float.items():
         print(f"{name}: {value:.6f}")
-    print(f"num_samples: {total_samples}")
-    if runtime_summary:
-        print("-- Inference metrics --")
-        for name, value in runtime_summary.items():
-            if "memory" in name:
-                print(f"{name}: {value:.2f}")
-            else:
-                print(f"{name}: {value:.6f}")
 
     if output_cfg.metrics_path:
         output_cfg.metrics_path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"num_samples": total_samples, "metrics": averages}
-        if runtime_summary:
-            payload["runtime"] = runtime_summary
+        payload = {"num_samples": total_images, "metrics": averages_float}
         with output_cfg.metrics_path.open("w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2)
         print(f"[info] Wrote aggregated metrics to {output_cfg.metrics_path}")
@@ -1057,10 +933,9 @@ def run_validation(
         with output_cfg.per_image_path.open("w", encoding="utf-8") as handle:
             json.dump(per_image_records, handle, indent=2)
         print(f"[info] Wrote per-image metrics to {output_cfg.per_image_path}")
+
     if visualization_enabled:
-        print(
-            f"[info] Saved {visualizations_saved} visualization figure(s) to {output_cfg.visualization_dir}"
-        )
+        print(f"[info] Saved {visualization_count} visualization figure(s) to {save_dir}")
 
 
 def main() -> None:
