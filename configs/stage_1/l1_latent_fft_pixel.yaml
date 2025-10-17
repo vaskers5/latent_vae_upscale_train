@@ -1,6 +1,6 @@
 # general settings
 # CUDA_VISIBLE_DEVICES=0,1,2,3 python -m torch.distributed.launch --nproc_per_node=4 --master_port=4321 basicsr/train.py -opt options/train/SwinIR/train_SwinIR_latent_sr_kaggle.yml --launcher pytorch
-name: swinir_stage1_l1_latent_l1_pixel_256_512
+name: swinir_stage1_l1_latent_fft_pixel_256_512
 model_type: SwinIRLatentModel
 scale: 2
 num_gpu: 1
@@ -37,7 +37,7 @@ datasets:
     std: null
     # data loader
     num_worker_per_gpu: 4
-    batch_size_per_gpu: 32
+    batch_size_per_gpu: 36
     prefetch_mode: cuda
     pin_memory: true
 
@@ -98,12 +98,16 @@ train:
   total_steps: 60000
   warmup_iter: -1 # no warm up
 
-  l1_pixel_opt:
-    type: L1Loss
-    loss_weight: 0.5
+  fft_frequency_opt:
+    type: FFTFrequencyLoss
+    loss_weight: 0.1
     reduction: mean
     space: pixel
-
+    norm: ortho
+    use_log_amplitude: false
+    alpha: 0.0
+    normalize_weight: true
+    eps: 1e-8
   l1_latent_opt:
     type: L1Loss
     loss_weight: 1.0
@@ -139,7 +143,7 @@ val:
 # logging settings
 logger:
   print_freq: 25
-  save_checkpoint_freq: 2000 #!!float 5e3
+  save_checkpoint_freq: 1000 #!!float 5e3
   use_tb_logger: true
   wandb:
     project: SwinIR-Latent-SR
