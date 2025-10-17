@@ -1106,113 +1106,187 @@ class SwinIRLatentModel(SwinIRModel):
             for metric in self.metric_results.keys():
                 self.metric_results[metric] = 0
 
-        pbar = tqdm(total=len(dataloader), unit="image") if use_pbar else None
+        pbar = None
+        pbar_unit = "image"
+        if use_pbar:
+            total_images: Optional[int] = None
+            try:
+                total_images = len(dataloader.dataset)  # type: ignore[arg-type]
+            except (TypeError, AttributeError):
+                total_images = None
 
-        # Limit number of images to log to wandb (to avoid clutter)
-        max_wandb_images = (
-            self.opt.get("logger", {}).get("wandb", {}).get("max_val_images", 8)
-        )
-        wandb_image_count = 0
+            if total_images is not None:
+                pbar = tqdm(total=total_images, unit="image")
+            else:
+                pbar_unit = "batch"
+                total_batches: Optional[int] = None
+                try:
+                    total_batches = len(dataloader)
+                except TypeError:
+                    total_batches = None
+                pbar = (
+                    tqdm(total=total_batches, unit=pbar_unit)
+                    if total_batches is not None
+                    else tqdm(unit=pbar_unit)
+                )
 
-        for idx, val_data in enumerate(tqdm(dataloader)):
-            img_name = osp.splitext(osp.basename(val_data["lq_path"][0]))[0]
+        for batch_idx, val_data in enumerate(dataloader):
             self.feed_data(val_data)
             self.test()
 
-            lq_latent = self.lq.detach()
-            pred_latent = self.output.detach()
-            gt_latent = self.gt.detach() if hasattr(self, "gt") else None
+            lq_latents = self.lq.detach()
+            pred_latents = self.output.detach()
+            gt_latents = self.gt.detach() if hasattr(self, "gt") else None
 
-            decoded_lq_cpu: Optional[torch.Tensor] = None
-            decoded_pred_cpu: Optional[torch.Tensor] = None
-            decoded_gt_cpu: Optional[torch.Tensor] = None
+            if torch.is_tensor(lq_latents) and lq_latents.dim() == 3:
+                lq_latents = lq_latents.unsqueeze(0)
+            if torch.is_tensor(pred_latents) and pred_latents.dim() == 3:
+                pred_latents = pred_latents.unsqueeze(0)
+            if torch.is_tensor(gt_latents) and gt_latents.dim() == 3:
+                gt_latents = gt_latents.unsqueeze(0)
 
-            if VAE_AVAILABLE:
-                if save_img and gt_latent is not None:
-                    decoded_lq_cpu = self._decode_with_cache(
-                        lq_latent, img_name=img_name, role="lq", dataset_name=dataset_name
-                    )
-                    decoded_gt_cpu = self._decode_with_cache(
-                        gt_latent, img_name=img_name, role="gt", dataset_name=dataset_name
-                    )
-                    decoded_pred_cpu = self._decode_with_cache(
-                        pred_latent, img_name=img_name, role="pred", dataset_name=dataset_name
-                    )
-                if need_pixel_metrics and gt_latent is not None:
-                    if decoded_gt_cpu is None:
-                        decoded_gt_cpu = self._decode_with_cache(
-                            gt_latent, img_name=img_name, role="gt", dataset_name=dataset_name
-                        )
-                    if decoded_pred_cpu is None:
-                        decoded_pred_cpu = self._decode_with_cache(
-                            pred_latent, img_name=img_name, role="pred", dataset_name=dataset_name
-                        )
+            batch_size = lq_latents.shape[0] if torch.is_tensor(lq_latents) else 1
 
-            # --- Visualization ---
-            if save_img and gt_latent is not None:
-                # Determine save path
-                if self.opt["is_train"]:
-                    save_path = osp.join(
-                        self.opt["path"]["visualization"],
-                        img_name,
-                        f"{img_name}_{current_iter}.png",
-                    )
-                else:
-                    suffix = self.opt["val"]["suffix"] or self.opt["name"]
-                    save_path = osp.join(
-                        self.opt["path"]["visualization"],
-                        dataset_name,
-                        f"{img_name}_{suffix}.png",
-                    )
-                os.makedirs(osp.dirname(save_path), exist_ok=True)
+            batch_lq_paths = val_data.get("lq_path")
+            if isinstance(batch_lq_paths, (list, tuple)):
+                lq_paths = list(batch_lq_paths)
+            else:
+                lq_paths = [batch_lq_paths]
 
-                # Decode all latents to images if a VAE is available
-                decoded_lq = self.decode_latents(lq_latent, vae_names=self._current_vae_names)
-                decoded_pred = self.decode_latents(pred_latent, vae_names=self._current_vae_names)
-                decoded_gt = self.decode_latents(gt_latent, vae_names=self._current_vae_names)
-
-                # Decide whether to log this image to wandb
-                should_log_wandb = log_to_wandb and wandb_image_count < max_wandb_images
-                if should_log_wandb:
-                    wandb_image_count += 1
-
-                # Generate and save the plot
-                self._save_comparison_plot(
-                    save_path,
-                    img_name,
-                    lq_latent.cpu(),
-                    pred_latent.cpu(),
-                    gt_latent.cpu(),
-                    decoded_lq_cpu.float() if decoded_lq_cpu is not None else None,
-                    decoded_pred_cpu.float() if decoded_pred_cpu is not None else None,
-                    decoded_gt_cpu.float() if decoded_gt_cpu is not None else None,
-                    log_to_wandb=should_log_wandb,
-                    current_iter=current_iter,
+            for sample_idx in range(batch_size):
+                img_path = lq_paths[sample_idx] if sample_idx < len(lq_paths) else None
+                img_name = (
+                    osp.splitext(osp.basename(img_path))[0]
+                    if isinstance(img_path, str)
+                    else f"sample_{batch_idx}_{sample_idx}"
                 )
 
-            # --- Metrics Calculation ---
-            if with_metrics and gt_latent is not None:
-                for name, opt_ in self.opt["val"]["metrics"].items():
-                    metric_value = self.calculate_metric_in_space(
-                        pred_latent,
-                        gt_latent,
-                        name,
-                        opt_,
-                        decoded_pred=decoded_pred_cpu,
-                        decoded_gt=decoded_gt_cpu,
+                lq_sample = (
+                    lq_latents[sample_idx : sample_idx + 1]
+                    if torch.is_tensor(lq_latents)
+                    else None
+                )
+                pred_sample = (
+                    pred_latents[sample_idx : sample_idx + 1]
+                    if torch.is_tensor(pred_latents)
+                    else None
+                )
+                gt_sample = (
+                    gt_latents[sample_idx : sample_idx + 1]
+                    if torch.is_tensor(gt_latents)
+                    else None
+                )
+
+                if lq_sample is None or pred_sample is None:
+                    continue
+
+                decoded_lq_cpu: Optional[torch.Tensor] = None
+                decoded_pred_cpu: Optional[torch.Tensor] = None
+                decoded_gt_cpu: Optional[torch.Tensor] = None
+
+                if VAE_AVAILABLE and pred_sample is not None:
+                    if save_img and gt_sample is not None:
+                        decoded_lq_cpu = self._decode_with_cache(
+                            lq_sample,
+                            img_name=img_name,
+                            role="lq",
+                            dataset_name=dataset_name,
+                        )
+                        decoded_gt_cpu = self._decode_with_cache(
+                            gt_sample,
+                            img_name=img_name,
+                            role="gt",
+                            dataset_name=dataset_name,
+                        )
+                        decoded_pred_cpu = self._decode_with_cache(
+                            pred_sample,
+                            img_name=img_name,
+                            role="pred",
+                            dataset_name=dataset_name,
+                        )
+                    if need_pixel_metrics and gt_sample is not None:
+                        if decoded_gt_cpu is None:
+                            decoded_gt_cpu = self._decode_with_cache(
+                                gt_sample,
+                                img_name=img_name,
+                                role="gt",
+                                dataset_name=dataset_name,
+                            )
+                        if decoded_pred_cpu is None:
+                            decoded_pred_cpu = self._decode_with_cache(
+                                pred_sample,
+                                img_name=img_name,
+                                role="pred",
+                                dataset_name=dataset_name,
+                            )
+
+                # --- Visualization ---
+                if (
+                    save_img
+                    and gt_sample is not None
+                    and lq_sample is not None
+                    and pred_sample is not None
+                ):
+                    if self.opt["is_train"]:
+                        save_path = osp.join(
+                            self.opt["path"]["visualization"],
+                            img_name,
+                            f"{img_name}_{current_iter}.png",
+                        )
+                    else:
+                        suffix = self.opt["val"]["suffix"] or self.opt["name"]
+                        save_path = osp.join(
+                            self.opt["path"]["visualization"],
+                            dataset_name,
+                            f"{img_name}_{suffix}.png",
+                        )
+                    os.makedirs(osp.dirname(save_path), exist_ok=True)
+
+                    should_log_wandb = log_to_wandb and wandb_image_count < max_wandb_images
+                    if should_log_wandb:
+                        wandb_image_count += 1
+
+                    self._save_comparison_plot(
+                        save_path,
+                        img_name,
+                        lq_sample.cpu(),
+                        pred_sample.cpu(),
+                        gt_sample.cpu(),
+                        decoded_lq_cpu.float() if decoded_lq_cpu is not None else None,
+                        decoded_pred_cpu.float() if decoded_pred_cpu is not None else None,
+                        decoded_gt_cpu.float() if decoded_gt_cpu is not None else None,
+                        log_to_wandb=should_log_wandb,
+                        current_iter=current_iter,
                     )
-                    self.metric_results[name] += metric_value
-            evaluated_images += 1
 
-            if use_pbar:
+                # --- Metrics Calculation ---
+                if (
+                    with_metrics
+                    and gt_sample is not None
+                    and pred_sample is not None
+                ):
+                    for name, opt_ in self.opt["val"]["metrics"].items():
+                        metric_value = self.calculate_metric_in_space(
+                            pred_sample,
+                            gt_sample,
+                            name,
+                            opt_,
+                            decoded_pred=decoded_pred_cpu,
+                            decoded_gt=decoded_gt_cpu,
+                        )
+                        self.metric_results[name] += metric_value
+                evaluated_images += 1
+
+                if pbar and pbar_unit == "image":
+                    pbar.update(1)
+                    pbar.set_description(f"Test {img_name}")
+
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+            if pbar and pbar_unit != "image":
                 pbar.update(1)
-                pbar.set_description(f"Test {img_name}")
-
-            decoded_lq_cpu = None
-            decoded_pred_cpu = None
-            decoded_gt_cpu = None
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+                pbar.set_description(f"Batch {batch_idx}")
 
         if pbar:
             pbar.close()
