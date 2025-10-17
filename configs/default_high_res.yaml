@@ -1,8 +1,8 @@
 # general settings
-name: swinir_stage2_fft_pixel_latent_mix_3m_256_512
+name: swinir_stage1_l1_256_512
 model_type: SwinIRLatentModel
 scale: 2
-num_gpu: 8
+num_gpu: 4
 manual_seed: 0
 
 vae_sources:
@@ -110,16 +110,16 @@ train:
   #   reduction: mean
   #   space: pixel
 
-  fft_frequency_opt:
-    type: FFTFrequencyLoss
-    loss_weight: 0.5
-    reduction: mean
-    space: latent
-    norm: ortho
-    use_log_amplitude: false
-    alpha: 0.0
-    normalize_weight: true
-    eps: 1e-8
+  # fft_frequency_opt:
+  #   type: FFTFrequencyLoss
+  #   loss_weight: 0.5
+  #   reduction: mean
+  #   space: latent
+  #   norm: ortho
+  #   use_log_amplitude: false
+  #   alpha: 0.0
+  #   normalize_weight: true
+  #   eps: 1e-8
 
 # validation settings
 val:
@@ -146,7 +146,7 @@ val:
 # logging settings
 logger:
   print_freq: 100
-  save_checkpoint_freq: 2000
+  save_checkpoint_freq: 1000
   use_tb_logger: true
   wandb:
     project: SwinIR-Latent-SR

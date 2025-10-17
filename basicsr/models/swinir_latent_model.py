@@ -973,7 +973,7 @@ class SwinIRLatentModel(SwinIRModel):
         )
         wandb_image_count = 0
 
-        for idx, val_data in enumerate(dataloader):
+        for idx, val_data in enumerate(tqdm(dataloader)):
             img_name = osp.splitext(osp.basename(val_data["lq_path"][0]))[0]
             self.feed_data(val_data)
             self.test()

@@ -1,9 +1,9 @@
 # general settings
 # CUDA_VISIBLE_DEVICES=0,1,2,3 python -m torch.distributed.launch --nproc_per_node=4 --master_port=4321 basicsr/train.py -opt options/train/SwinIR/train_SwinIR_latent_sr_kaggle.yml --launcher pytorch
-name: swinirdefauilt_midjorneycrops_1stage_l1latent_full_dataset
+name: swinirdefauilt_256_512_new_val_test
 model_type: SwinIRLatentModel
 scale: 2
-num_gpu: 6
+num_gpu: 4
 manual_seed: 0
 
 vae_sources:
@@ -19,12 +19,13 @@ datasets:
   train:
     name: MidjourneyCropsFluxVAE_train_1_2M
     type: LatentCacheDataset
-
-    high_res: 256
-    low_res: 128
+    high_res: 512
+    low_res: 256
     cache_dirs:
-      - /data/kazanplova/datasets/midjourney_full_ds_crops/embeddings/flux_vae
-    vae_names: [flux_vae]
+
+      - /data/kazanplova/latent_vae_upscale_train/midjourney_full_dataset_crops_new/embeddings/sdxl_vae
+      - /data/kazanplova/datasets/openim_cropped/train_latents/sdxl_vae
+    vae_names: [sdxl_vae]
     phase: train
 
     filename_tmpl: "{}"
@@ -37,19 +38,18 @@ datasets:
     std: null
     # data loader
     num_worker_per_gpu: 24
-    batch_size_per_gpu: 672
+    batch_size_per_gpu: 64
     prefetch_mode: cuda
     pin_memory: true
 
-
   val:
-    name: WallpapersFlux
+    name: sdxk_120_1024x1024
     type: LatentCacheDataset
-    high_res: 512
-    low_res: 256
+    high_res: 1024
+    low_res: 512
     cache_dirs:
-      - /data/kazanplova/latent_vae_upscale_train/flux_val/256_512/embeddings
-    vae_names: [flux_vae]
+      - /data/kazanplova/datasets/latent_upscale_validation_120_samples/embeddings/sdxl_vae
+    vae_names: [sdxl_vae]
     phase: val
 
     io_backend:
@@ -57,14 +57,15 @@ datasets:
     scale: 2
     mean: null
     std: null
-    batch_size_per_gpu: 128
+    batch_size_per_gpu: 16
+    num_worker_per_gpu: 4
     pin_memory: true
 
 # network structures
 network_g:
   type: SwinIR
   upscale: 2
-  in_chans: 16 # 16 channels for latent representations
+  in_chans: 4 # 16 channels for latent representations
   img_size: 16 # Input latent size (16x16)
   window_size: 8
   img_range: 1.
@@ -113,7 +114,7 @@ train:
 
 # validation settings
 val:
-  val_freq: 1000
+  val_freq: 10
   save_img: true
   metrics:
     # --- Latent Space Metrics ---
@@ -139,7 +140,7 @@ val:
 
 # logging settings
 logger:
-  print_freq: 100
+  print_freq: 5
   save_checkpoint_freq: 2000 #!!float 5e3
   use_tb_logger: true
   wandb:
@@ -148,7 +149,7 @@ logger:
     resume_id: null
     # Maximum number of validation images to log to wandb per validation run
     # This prevents cluttering your wandb dashboard with too many images
-    max_val_images: 8
+    max_val_images: 10
 
 # dist training settings
 dist_params:
