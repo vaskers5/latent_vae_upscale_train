@@ -1135,7 +1135,7 @@ class SwinIRLatentModel(SwinIRModel):
                     else tqdm(unit=pbar_unit)
                 )
 
-        for batch_idx, val_data in enumerate(dataloader):
+        for batch_idx, val_data in enumerate(tqdm(dataloader)):
             self.feed_data(val_data)
             self.test()
 
