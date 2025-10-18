@@ -1,9 +1,9 @@
 # general settings
 # CUDA_VISIBLE_DEVICES=0,1,2,3 python -m torch.distributed.launch --nproc_per_node=4 --master_port=4321 basicsr/train.py -opt options/train/SwinIR/train_SwinIR_latent_sr_kaggle.yml --launcher pytorch
-name: swinir_stage1_l1_fft_256_512
+name: swinirlarge_0.5midjourney_0.5openim_2.8M_1stage_sdxlvae_im256-512_0.5fftlatent_1.0l1latent
 model_type: SwinIRLatentModel
 scale: 2
-num_gpu: 3
+num_gpu: 2
 manual_seed: 0
 
 vae_sources:
@@ -23,7 +23,7 @@ datasets:
     low_res: 256
     cache_dirs:
       - /data/kazanplova/latent_vae_upscale_train/midjourney_full_dataset_crops_new/embeddings/sdxl_vae
-      - /data/kazanplova/datasets/openim_cropped/train_latents/sdxl_vae
+      # - /data/kazanplova/datasets/openim_cropped/train_latents/sdxl_vae
     vae_names: [sdxl_vae]
     phase: train
 
@@ -37,7 +37,7 @@ datasets:
     std: null
     # data loader
     num_worker_per_gpu: 20
-    batch_size_per_gpu: 200
+    batch_size_per_gpu: 128
     prefetch_mode: cuda
     pin_memory: true
 
@@ -64,35 +64,37 @@ datasets:
 network_g:
   type: SwinIR
   upscale: 2
-  in_chans: 4 # 16 channels for latent representations
-  img_size: 32 # Input latent size (16x16)
+  in_chans: 4
+  img_size: 32
   window_size: 8
-  img_range: 1.
-  depths: [6, 6, 6, 6, 6, 6]
-  embed_dim: 180
-  num_heads: [6, 6, 6, 6, 6, 6]
+  img_range: 1.0
+  # --- Key parameters for Swin-L ---
+  depths: [2, 2, 18, 2]      # Number of blocks in each Swin Transformer layer
+  embed_dim: 192             # Embedding dimension (larger than SwinIR-M's 180)
+  num_heads: [6, 12, 24, 48] # Number of attention heads in different layers
+  # ------------------------------------
   mlp_ratio: 2
-  upsampler: "pixelshuffle"
-  resi_connection: "1conv"
+  upsampler: 'pixelshuffle'
+  resi_connection: '1conv'
 
 # path
-path:
-  # pretrain_network_g: ./runs/2025_10_13_234001_train_SwinIR_latent_SRx2_default_l1/train_SwinIR_latent_SRx2_default_l1/models/net_g_latest.pth
-  strict_load_g: true
-  resume_state: ~
+# path:
+  # pretrain_network_g: ./pretrained_weights/2025_10_17_163115_swinir_stage1_l1_fft_256_512/swinir_stage1_l1_fft_256_512/models/net_g_10000.pth
+  # strict_load_g: true
+  # resume_state: ~
 
 # training settings
 train:
   ema_decay: 0.999
   optim_g:
     type: Adam
-    lr: !!float 2e-4
+    lr: 0.0002
     weight_decay: 0
     betas: [0.9, 0.99]
 
   scheduler:
     type: MultiStepLR
-    milestones: [250000, 400000, 450000, 475000]
+    milestones: [15000, 22500, 27000]
     gamma: 0.5
 
   total_steps: 30000
