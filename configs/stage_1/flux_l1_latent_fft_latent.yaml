@@ -1,6 +1,6 @@
 # general settings
 # CUDA_VISIBLE_DEVICES=0,1,2,3 python -m torch.distributed.launch --nproc_per_node=4 --master_port=4321 basicsr/train.py -opt options/train/SwinIR/train_SwinIR_latent_sr_kaggle.yml --launcher pytorch
-name: swinirlarge_0.5midjourney_0.5openim_2.8M_1stage_fluzvae_im256-512_0.5fftlatent_1.0l1latent
+name: swinirlarge_0.5midjoueny_with_1stage_fluzvae_im256-512_0.5fftlatent_1.0l1latent_
 model_type: SwinIRLatentModel
 scale: 2
 num_gpu: 2
@@ -13,12 +13,15 @@ vae_sources:
 # dataset and data loader settings
 datasets:
   train:
-    name: MidjourneyCropsFluxVAE_train_1_2M
+    name: gpt4_nanobana_midjourney_recraft_CropsFluxVAE
     type: LatentCacheDataset
     high_res: 512
     low_res: 256
     cache_dirs:
       - /data/kazanplova/latent_vae_upscale_train/midjourney_full_dataset_crops_new/embeddings/flux_vae
+      - /data/kazanplova/datasets/full_latent_upscale_dataset_train/gpt4_crops/embeddings/flux_vae
+      - /data/kazanplova/datasets/full_latent_upscale_dataset_train/recraft_data_crops/embeddings/flux_vae
+      - /data/kazanplova/datasets/full_latent_upscale_dataset_train/nano_banana_crops/embeddings/flux_vae
     vae_names: [flux_vae]
     phase: train
 
