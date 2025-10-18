@@ -1,38 +1,38 @@
 # general settings
 # CUDA_VISIBLE_DEVICES=0,1,2,3 python -m torch.distributed.launch --nproc_per_node=4 --master_port=4321 basicsr/train.py -opt options/train/SwinIR/train_SwinIR_latent_sr_kaggle.yml --launcher pytorch
-name: swinirdefauilt_256_512_new_val_test
+name: swinirlarge_0.5midjourney_0.5openim_2.8M_1stage_fluzvae_im256-512_0.5fftlatent_1.0l1latent
 model_type: SwinIRLatentModel
 scale: 2
-num_gpu: 4
+num_gpu: 2
 manual_seed: 0
 
 vae_sources:
-  sdxl_vae:
-    hf_repo: stabilityai/sdxl-vae
+  flux_vae:
+    hf_repo: wolfgangblack/flux_vae
     vae_kind: kl
-
 # dataset and data loader settings
 datasets:
   train:
-    name: MidjourneyCropsFluxVAE_stage2_train
+    name: MidjourneyCropsFluxVAE_train_1_2M
     type: LatentCacheDataset
     high_res: 512
     low_res: 256
     cache_dirs:
-
-      - /data/kazanplova/latent_vae_upscale_train/midjourney_full_dataset_crops_new/embeddings/sdxl_vae
-      - /data/kazanplova/datasets/openim_cropped/train_latents/sdxl_vae
-    vae_names: [sdxl_vae]
+      - /data/kazanplova/latent_vae_upscale_train/midjourney_full_dataset_crops_new/embeddings/flux_vae
+    vae_names: [flux_vae]
     phase: train
+
     filename_tmpl: "{}"
     io_backend:
       type: disk
     scale: 2
+    phase: train
+    # No normalization for latent data
     mean: null
     std: null
     # data loader
-    num_worker_per_gpu: 24
-    batch_size_per_gpu: 64
+    num_worker_per_gpu: 20
+    batch_size_per_gpu: 164
     prefetch_mode: cuda
     pin_memory: true
 
@@ -42,9 +42,10 @@ datasets:
     high_res: 1024
     low_res: 512
     cache_dirs:
-      - /data/kazanplova/datasets/latent_upscale_validation_120_samples/embeddings/sdxl_vae
-    vae_names: [sdxl_vae]
+      - /data/kazanplova/datasets/latent_upscale_validation_120_samples/embeddings/flux_vae
+    vae_names: [flux_vae]
     phase: val
+
     io_backend:
       type: disk
     scale: 2
@@ -58,19 +59,20 @@ datasets:
 network_g:
   type: SwinIR
   upscale: 2
-  in_chans: 4 # 16 channels for latent representations
-  img_size: 16 # Input latent size (16x16)
+  in_chans: 16
+  img_size: 32
   window_size: 8
-  img_range: 1.
-  depths: [6, 6, 6, 6, 6, 6]
-  embed_dim: 180
-  num_heads: [6, 6, 6, 6, 6, 6]
+  img_range: 1.0
+  # --- Key parameters for Swin-L ---
+  depths: [2, 2, 18, 2]      # Number of blocks in each Swin Transformer layer
+  embed_dim: 192             # Embedding dimension (larger than SwinIR-M's 180)
+  num_heads: [6, 12, 24, 48] # Number of attention heads in different layers
+  # ------------------------------------
   mlp_ratio: 2
-  upsampler: "pixelshuffle"
-  resi_connection: "1conv"
+  upsampler: 'pixelshuffle'
+  resi_connection: '1conv'
   use_sdpa: true
-
-# compilation options (optional)
+  # compilation options (optional)
 compile:
   enabled: true
   mode: max-autotune
@@ -78,69 +80,65 @@ compile:
   fullgraph: false
   backend: null
 
+# path
+# path:
+  # pretrain_network_g: ./pretrained_weights/2025_10_17_163115_swinir_stage1_l1_fft_256_512/swinir_stage1_l1_fft_256_512/models/net_g_10000.pth
+  # strict_load_g: true
+  # resume_state: ~
+
 # training settings
 train:
   ema_decay: 0.999
   optim_g:
     type: Adam
-    lr: 0.0001
+    lr: 0.0002
     weight_decay: 0
     betas: [0.9, 0.99]
 
   scheduler:
     type: MultiStepLR
-    milestones: [150000, 225000, 275000]
+    milestones: [25000, 37500, 45000]
     gamma: 0.5
 
-  total_steps: 16000
-  warmup_iter: -1
+  total_steps: 50000
+  warmup_iter: -1 # no warm up
 
+  fft_frequency_opt:
+    type: FFTFrequencyLoss
+    loss_weight: 0.1
+    reduction: mean
+    space: latent
+    norm: ortho
+    use_log_amplitude: false
+    alpha: 0.0
+    normalize_weight: true
+    eps: 1e-8
   l1_latent_opt:
     type: L1Loss
     loss_weight: 1.0
     reduction: mean
     space: latent
 
-  fft_frequency_opt:
-    type: FFTFrequencyLoss
-    loss_weight: 0.5
-    reduction: mean
-    space: latent
-    norm: ortho
-  use_log_amplitude: false
-  alpha: 0.0
-  normalize_weight: true
-  eps: 1e-8
-
-# path settings
-path:
-  strict_load_g: true
-  param_key_g: params
-  pretrain_network_g: null
-  resume_state: null
-  experiments_root: ./experiments/swinir_stage2_fft_pixel_latent_mix_3m_256_512
-
 # validation settings
 val:
-  val_freq: 10
+  val_freq: 2500
   save_img: true
-  pbar: true
-  cache_decoded: true
-  cache_pred_decoded: false
-  cache_dir_name: cache_folder
-  cache_format: pt
   metrics:
+    # --- Latent Space Metrics ---
     l1_latent:
       type: L1Loss
-      space: latent
+      space: latent # Explicitly state the space
     l2_latent:
       type: MSELoss
       space: latent
+
+    # --- Pixel Space Metrics (requires VAE) ---
     pixel_psnr_pt:
-      type: calculate_psnr_pt
+      type: calculate_psnr_pt # Use the PyTorch version for efficiency
       space: pixel
       crop_border: 2
       test_y_channel: false
+
     pixel_ssim_pt:
       type: calculate_ssim_pt
       space: pixel
@@ -149,8 +147,8 @@ val:
 
 # logging settings
 logger:
-  print_freq: 5
-  save_checkpoint_freq: 2000 #!!float 5e3
+  print_freq: 100
+  save_checkpoint_freq: 2500 #!!float 5e3
   use_tb_logger: true
   wandb:
     project: SwinIR-Latent-SR
@@ -166,4 +164,8 @@ dist_params:
   port: 29500
   dist: true
 
-resume_state: null
+# resume state
+# resume_state: ~
+
+# load network only
+load_networks_only: false

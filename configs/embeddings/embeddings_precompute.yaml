@@ -1,6 +1,12 @@
 # Basic configuration for precomputing latent embeddings compatible with the test dataset.
-dataset_root: /data/kazanplova/datasets/latent_upscale_validation_120_samples
-cache_root: /data/kazanplova/datasets/latent_upscale_validation_120_samples/embeddings
+# dataset_root: /data/kazanplova/datasets/latent_upscale_validation_120_samples
+# cache_root: /data/kazanplova/datasets/latent_upscale_validation_120_samples/embeddings
+# Example of processing multiple folders:
+# datasets:
+#   - [/data/path/to/images_a, /data/path/to/cache_a]
+#   - [/data/path/to/images_b, /data/path/to/cache_b]
+datasets:
+  - [/data/kazanplova/datasets/latent_upscale_validation_120_samples, /data/kazanplova/datasets/latent_upscale_validation_120_samples/embeddings]
 # dataset_root: /data/kazanplova/datasets/openim_cropped/train
 # cache_root: /data/kazanplova/datasets/openim_cropped/train_latents
 # CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 PYTHONPATH="$PWD" accelerate launch --num_processes 6 --main_process_port 29500 scripts/precompute_embeddings.py --config configs/embeddings_precompute.yaml 

@@ -3,8 +3,11 @@
 # Originally Written by Ze Liu, Modified by Jingyun Liang.
 
 import math
+from contextlib import nullcontext
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 
 from basicsr.utils.registry import ARCH_REGISTRY
@@ -104,9 +107,18 @@ class WindowAttention(nn.Module):
         qk_scale (float | None, optional): Override default qk scale of head_dim ** -0.5 if set
         attn_drop (float, optional): Dropout ratio of attention weight. Default: 0.0
         proj_drop (float, optional): Dropout ratio of output. Default: 0.0
+        use_sdpa (bool, optional): Use torch.nn.functional.scaled_dot_product_attention if available.
     """
 
-    def __init__(self, dim, window_size, num_heads, qkv_bias=True, qk_scale=None, attn_drop=0., proj_drop=0.):
+    def __init__(self,
+                 dim,
+                 window_size,
+                 num_heads,
+                 qkv_bias=True,
+                 qk_scale=None,
+                 attn_drop=0.,
+                 proj_drop=0.,
+                 use_sdpa=True):
 
         super().__init__()
         self.dim = dim
@@ -114,6 +126,7 @@ class WindowAttention(nn.Module):
         self.num_heads = num_heads
         head_dim = dim // num_heads
         self.scale = qk_scale or head_dim**-0.5
+        self.use_sdpa = bool(use_sdpa and hasattr(F, 'scaled_dot_product_attention'))
 
         # define a parameter table of relative position bias
         self.relative_position_bias_table = nn.Parameter(
@@ -141,6 +154,12 @@ class WindowAttention(nn.Module):
         trunc_normal_(self.relative_position_bias_table, std=.02)
         self.softmax = nn.Softmax(dim=-1)
 
+    def _rel_pos_bias(self):
+        num_tokens = self.window_size[0] * self.window_size[1]
+        bias = self.relative_position_bias_table[self.relative_position_index.view(-1)]
+        bias = bias.view(num_tokens, num_tokens, -1)  # n, n, H
+        return bias.permute(2, 0, 1).contiguous()  # H, n, n
+
     def forward(self, x, mask=None):
         """
         Args:
@@ -151,12 +170,45 @@ class WindowAttention(nn.Module):
         qkv = self.qkv(x).reshape(b_, n, 3, self.num_heads, c // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]  # make torchscript happy (cannot use tensor as tuple)
 
+        if self.use_sdpa:
+            rel_bias = self._rel_pos_bias()  # H, n, n
+            attn_bias = rel_bias.unsqueeze(0)  # 1, H, n, n
+            if mask is not None:
+                nw = mask.shape[0]
+                b_img = b_ // nw
+                add_mask = mask.to(rel_bias.dtype).to(q.device).view(1, nw, n, n).repeat(b_img, 1, 1, 1)
+                add_mask = add_mask.view(b_, 1, n, n)
+                attn_bias = attn_bias + add_mask
+            attn_bias = attn_bias.to(dtype=q.dtype, device=q.device)
+
+            head_dim = c // self.num_heads
+            default_scale = head_dim**-0.5
+            if abs(self.scale - default_scale) > 1e-8:
+                q = q * (self.scale / default_scale)
+
+            cuda_backend = getattr(torch.backends, 'cuda', None)
+            cuda_cm = nullcontext()
+            if torch.cuda.is_available() and cuda_backend is not None and hasattr(cuda_backend, 'sdp_kernel'):
+                cuda_cm = cuda_backend.sdp_kernel(
+                    enable_flash=False, enable_mem_efficient=True, enable_math=True)
+            with cuda_cm:
+                attn_out = F.scaled_dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    attn_mask=attn_bias,
+                    dropout_p=self.attn_drop.p if self.training else 0.0,
+                    is_causal=False)
+
+            x = attn_out.transpose(1, 2).reshape(b_, n, c)
+            x = self.proj(x)
+            x = self.proj_drop(x)
+            return x
+
         q = q * self.scale
         attn = (q @ k.transpose(-2, -1))
 
-        relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
-            self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1)  # Wh*Ww,Wh*Ww,nH
-        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww
+        relative_position_bias = self._rel_pos_bias()
         attn = attn + relative_position_bias.unsqueeze(0)
 
         if mask is not None:
@@ -223,7 +275,8 @@ class SwinTransformerBlock(nn.Module):
                  attn_drop=0.,
                  drop_path=0.,
                  act_layer=nn.GELU,
-                 norm_layer=nn.LayerNorm):
+                 norm_layer=nn.LayerNorm,
+                 use_sdpa=True):
         super().__init__()
         self.dim = dim
         self.input_resolution = input_resolution
@@ -245,7 +298,8 @@ class SwinTransformerBlock(nn.Module):
             qkv_bias=qkv_bias,
             qk_scale=qk_scale,
             attn_drop=attn_drop,
-            proj_drop=drop)
+            proj_drop=drop,
+            use_sdpa=use_sdpa)
 
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
@@ -424,13 +478,15 @@ class BasicLayer(nn.Module):
                  drop_path=0.,
                  norm_layer=nn.LayerNorm,
                  downsample=None,
-                 use_checkpoint=False):
+                 use_checkpoint=False,
+                 use_sdpa=True):
 
         super().__init__()
         self.dim = dim
         self.input_resolution = input_resolution
         self.depth = depth
         self.use_checkpoint = use_checkpoint
+        self.use_sdpa = use_sdpa
 
         # build blocks
         self.blocks = nn.ModuleList([
@@ -446,7 +502,8 @@ class BasicLayer(nn.Module):
                 drop=drop,
                 attn_drop=attn_drop,
                 drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
-                norm_layer=norm_layer) for i in range(depth)
+                norm_layer=norm_layer,
+                use_sdpa=use_sdpa) for i in range(depth)
         ])
 
         # patch merging layer
@@ -458,7 +515,7 @@ class BasicLayer(nn.Module):
     def forward(self, x, x_size):
         for blk in self.blocks:
             if self.use_checkpoint:
-                x = checkpoint.checkpoint(blk, x)
+                x = checkpoint.checkpoint(lambda inp: blk(inp, x_size), x, use_reentrant=False)
             else:
                 x = blk(x, x_size)
         if self.downsample is not None:
@@ -517,7 +574,8 @@ class RSTB(nn.Module):
                  use_checkpoint=False,
                  img_size=224,
                  patch_size=4,
-                 resi_connection='1conv'):
+                 resi_connection='1conv',
+                 use_sdpa=True):
         super(RSTB, self).__init__()
 
         self.dim = dim
@@ -537,7 +595,8 @@ class RSTB(nn.Module):
             drop_path=drop_path,
             norm_layer=norm_layer,
             downsample=downsample,
-            use_checkpoint=use_checkpoint)
+            use_checkpoint=use_checkpoint,
+            use_sdpa=use_sdpa)
 
         if resi_connection == '1conv':
             self.conv = nn.Conv2d(dim, dim, 3, 1, 1)
@@ -741,6 +800,7 @@ class SwinIR(nn.Module):
                  img_range=1.,
                  upsampler='',
                  resi_connection='1conv',
+                 use_sdpa=True,
                  **kwargs):
         super(SwinIR, self).__init__()
         num_in_ch = in_chans
@@ -765,6 +825,7 @@ class SwinIR(nn.Module):
         self.patch_norm = patch_norm
         self.num_features = embed_dim
         self.mlp_ratio = mlp_ratio
+        self.use_sdpa = use_sdpa
 
         # split image into non-overlapping patches
         self.patch_embed = PatchEmbed(
@@ -815,7 +876,8 @@ class SwinIR(nn.Module):
                 use_checkpoint=use_checkpoint,
                 img_size=img_size,
                 patch_size=patch_size,
-                resi_connection=resi_connection)
+                resi_connection=resi_connection,
+                use_sdpa=use_sdpa)
             self.layers.append(layer)
         self.norm = norm_layer(self.num_features)
 

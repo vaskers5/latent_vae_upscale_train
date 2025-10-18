@@ -1,98 +1,42 @@
-from copy import deepcopy
-import hashlib
-import cv2
-import inspect
-import numpy as np
-import os
-import torch
 import warnings
-from collections import OrderedDict, defaultdict
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
+
+import hashlib
+import os
 from os import path as osp
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+from collections import OrderedDict
+
+import torch
+from torch.nn.parallel import DataParallel, DistributedDataParallel
 from torch.nn import functional as F
 from tqdm import tqdm
 
-warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
-
-# --- Matplotlib Integration ---
-# Use the 'Agg' backend for non-interactive environments (servers, etc.)
+# --- Matplotlib (headless) ---
 import matplotlib
-
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from basicsr.archs import build_network
-
-# --- End Matplotlib Integration ---
-from basicsr.utils import get_root_logger, imwrite
+from basicsr.utils import get_root_logger
 from basicsr.utils.registry import MODEL_REGISTRY
 from .swinir_model import SwinIRModel
 
-# Try to import VAE for decoding (optional)
 try:
-    from diffusers import (
-    AsymmetricAutoencoderKL,
-    AutoencoderKL,
-    AutoencoderKLQwenImage,
-    AutoencoderKLWan,
-    )
-
+    from diffusers import AutoencoderKL, AsymmetricAutoencoderKL  # type: ignore
     VAE_AVAILABLE = True
 except ImportError:
-    AsymmetricAutoencoderKL = None  # type: ignore[assignment]
-    AutoencoderKLQwenImage = None  # type: ignore[assignment]
-    AutoencoderKLWan = None  # type: ignore[assignment]
+    AutoencoderKL = AsymmetricAutoencoderKL = None  # type: ignore
     VAE_AVAILABLE = False
-    print("Warning: diffusers not available. VAE decoding will be skipped.")
 
-# Try to import wandb
 try:
-    import wandb
-
+    import wandb  # type: ignore
     WANDB_AVAILABLE = True
 except ImportError:
+    wandb = None  # type: ignore
     WANDB_AVAILABLE = False
-    print("Warning: wandb not available. Wandb logging will be skipped.")
-
-
-_DEFAULT_VAE_SOURCES: Dict[str, Dict[str, Any]] = {
-    "flux_vae": {
-        "hf_repo": "wolfgangblack/flux_vae",
-        "vae_kind": "kl",
-        "latents_scaled": False,
-    },
-    "sdxl_vae": {
-        "hf_repo": "stabilityai/sdxl-vae",
-        "vae_kind": "kl",
-        "latents_scaled": False,
-    },
-}
-
-
-@dataclass(frozen=True)
-class _VaeSpec:
-    """Configuration required to instantiate a VAE."""
-
-    name: str
-    load_from: Optional[Path]
-    hf_repo: Optional[str]
-    hf_subfolder: Optional[str]
-    hf_revision: Optional[str]
-    hf_auth_token: Optional[str]
-    vae_kind: str
-    weights_dtype: Optional[torch.dtype]
-    latents_scaled: bool
-
-    @property
-    def cache_key(self) -> str:
-        return _slugify_name(self.name)
-
-
-def _slugify_name(name: str) -> str:
-    slug = name.replace("\\", "_").replace("/", "_").replace(" ", "_")
-    return slug or "vae"
 
 
 def _resolve_dtype(value: Any) -> Optional[torch.dtype]:
@@ -101,373 +45,204 @@ def _resolve_dtype(value: Any) -> Optional[torch.dtype]:
     if isinstance(value, torch.dtype):
         return value
     if isinstance(value, str):
-        norm = value.strip().lower().replace(" ", "")
-        if not norm:
+        s = value.strip().lower()
+        if not s:
             return None
-        if not norm.startswith("torch."):
-            norm = f"torch.{norm}"
-        attr = norm.split(".")[-1]
-        if not hasattr(torch, attr):
-            raise ValueError(f"Unsupported torch dtype specification: {value}")
-        dtype = getattr(torch, attr)
-        if not isinstance(dtype, torch.dtype):
-            raise ValueError(f"Resolved value is not a torch.dtype: {value}")
-        return dtype
-    raise TypeError(f"Expected dtype string or torch.dtype, received: {value!r}")
-
-
-def _candidate_keys(name: str) -> Sequence[str]:
-    slug = _slugify_name(name)
-    return (name, name.lower(), slug, slug.lower())
-
-
-def _build_spec_from_mapping(name: str, mapping: Any) -> _VaeSpec:
-    if isinstance(mapping, _VaeSpec):
-        return mapping
-    if mapping is None:
-        mapping = {}
-    if isinstance(mapping, str):
-        mapping = {"hf_repo": mapping}
-    if not isinstance(mapping, Mapping):
-        raise TypeError(
-            f"VAE specification for '{name}' must be provided as a mapping or string; received {type(mapping)}."
-        )
-
-    load_from_value = mapping.get("load_from")
-    load_from = Path(str(load_from_value)).expanduser() if load_from_value else None
-    hf_repo = mapping.get("hf_repo")
-    hf_repo = str(hf_repo) if hf_repo else None
-    hf_subfolder = mapping.get("hf_subfolder")
-    hf_subfolder = str(hf_subfolder) if hf_subfolder else None
-    hf_revision = mapping.get("hf_revision")
-    hf_revision = str(hf_revision) if hf_revision else None
-    hf_auth_token = mapping.get("hf_auth_token")
-    hf_auth_token = str(hf_auth_token) if hf_auth_token else None
-    vae_kind = str(mapping.get("vae_kind", "kl")).strip().lower() or "kl"
-    weights_dtype = _resolve_dtype(mapping.get("weights_dtype"))
-
-    raw_scaled = mapping.get("latents_scaled")
-    if raw_scaled is None:
-        raw_scaled = mapping.get("latents_are_scaled")
-    if isinstance(raw_scaled, str):
-        norm = raw_scaled.strip().lower()
-        latents_scaled = norm in {"1", "true", "yes", "y", "on"}
-    elif raw_scaled is None:
-        latents_scaled = False
-    else:
-        latents_scaled = bool(raw_scaled)
-
-    return _VaeSpec(
-        name=name,
-        load_from=load_from,
-        hf_repo=hf_repo,
-        hf_subfolder=hf_subfolder,
-        hf_revision=hf_revision,
-        hf_auth_token=hf_auth_token,
-        vae_kind=vae_kind,
-        weights_dtype=weights_dtype,
-        latents_scaled=latents_scaled,
-    )
-
+        if not s.startswith("torch."):
+            s = f"torch.{s}"
+        attr = s.split(".")[-1]
+        if hasattr(torch, attr) and isinstance(getattr(torch, attr), torch.dtype):
+            return getattr(torch, attr)
+    raise ValueError(f"Unsupported torch dtype spec: {value!r}")
 
 
 @MODEL_REGISTRY.register()
 class SwinIRLatentModel(SwinIRModel):
-    """SwinIR model for latent space super resolution with custom visualization.
-    This version uses Matplotlib to replicate the visualization style from the
-    provided reference script.
-    """
+    """Streamlined SwinIR model with optional pixel-space decode via a single VAE."""
 
     def __init__(self, opt):
-        # Initialize loss_configs before calling super().__init__()
-        self.loss_configs = {}
-        self._vae_specs_primary: Dict[str, _VaeSpec] = {}
-        self._vae_aliases: Dict[str, _VaeSpec] = {}
-        self._ordered_vae_keys: List[str] = []
-        self._vae_cache: Dict[str, torch.nn.Module] = {}
-        self._current_vae_names: Optional[List[str]] = None
-        self._default_train_vae_name: Optional[str] = None
-        self._default_val_vae_name: Optional[str] = None
+        # runtime state
+        self.loss_configs: Dict[str, Dict[str, Any]] = {}
+        self.loss_criteria: Dict[str, torch.nn.Module] = {}
+
+        # VAE (single, lazy-loaded)
+        self._vae = None
+        self._vae_scaling: float = 1.0
+        self._vae_latents_scaled: bool = False
+        self._vae_dtype: Optional[torch.dtype] = None
         self._val_decode_mem_cache: Dict[str, torch.Tensor] = {}
         self._val_cache_dir: Optional[str] = None
+
+        # read VAE opts once; defaults handled in _get_vae()
+        self._vae_opt: Dict[str, Any] = {}
+        self._vae_name: str = ""
+        self._vae_cache_namespace: str = "default"
+        self._initialize_vae_config(opt)
+
         super().__init__(opt)
-        if VAE_AVAILABLE:
-            self._setup_vae_registry()
-        else:
-            logger = get_root_logger()
-            logger.warning(
-                "diffusers is not available; pixel-space decoding for validation will be skipped."
-            )
 
-    # ------------------------------------------------------------------ VAE helpers
-    def _setup_vae_registry(self) -> None:
-        """Populate VAE specifications from defaults and user configuration."""
-
-        self._vae_specs_primary.clear()
-        self._vae_aliases.clear()
-        self._ordered_vae_keys.clear()
-        self._vae_cache.clear()
-
-        raw_sources = self.opt.get("vae_sources") or {}
-        if raw_sources and not isinstance(raw_sources, Mapping):
-            raise TypeError(
-                "Option 'vae_sources' must be a mapping from names to configuration dictionaries."
-            )
-
-        logger = get_root_logger()
-
-        for name, mapping in _DEFAULT_VAE_SOURCES.items():
-            try:
-                spec = _build_spec_from_mapping(name, mapping)
-            except Exception as exc:
-                logger.warning(f"Skipping default VAE '{name}': {exc}")
-                continue
-            self._register_vae_spec(spec, allow_override=False)
-
-        if raw_sources:
-            for name, mapping in raw_sources.items():
-                try:
-                    spec = _build_spec_from_mapping(name, mapping)
-                except Exception as exc:
-                    logger.warning(f"Skipping configured VAE '{name}': {exc}")
-                    continue
-                self._register_vae_spec(spec, allow_override=True)
-
-        self._default_train_vae_name = self._resolve_dataset_default_name("train")
-        self._default_val_vae_name = self._resolve_dataset_default_name("val")
-
-        if self._ordered_vae_keys:
-            resolved = [self._vae_specs_primary[key].name for key in self._ordered_vae_keys]
-            logger.info("Configured VAE decoders: %s", ", ".join(resolved))
-        else:
-            logger.warning("No VAE configurations found. Pixel-space decoding will be skipped.")
-
-    def _register_vae_spec(self, spec: _VaeSpec, *, allow_override: bool) -> None:
-        primary_key = spec.cache_key
-        if allow_override or primary_key not in self._vae_specs_primary:
-            self._vae_specs_primary[primary_key] = spec
-            if primary_key not in self._ordered_vae_keys:
-                self._ordered_vae_keys.append(primary_key)
-
-        def _register_alias(key: str) -> None:
-            if allow_override or key not in self._vae_aliases:
-                self._vae_aliases[key] = spec
-
-        for key in _candidate_keys(spec.name):
-            _register_alias(key)
-        if spec.hf_repo:
-            for key in _candidate_keys(spec.hf_repo):
-                _register_alias(key)
-        if spec.load_from:
-            for key in _candidate_keys(str(spec.load_from)):
-                _register_alias(key)
-
-    def _resolve_dataset_default_name(self, phase: str) -> Optional[str]:
-        datasets_cfg = self.opt.get("datasets") or {}
-        if not isinstance(datasets_cfg, Mapping):
-            return None
-
-        for key, cfg in datasets_cfg.items():
-            if key.split("_")[0] != phase:
-                continue
-            names = cfg.get("vae_names")
-            if isinstance(names, str) and names.strip():
-                return names.strip()
-            if isinstance(names, Sequence) and not isinstance(names, str):
-                for entry in names:
-                    if isinstance(entry, str) and entry.strip():
-                        return entry.strip()
-        return None
-
-    def _resolve_vae_spec(self, name: Optional[str]) -> Optional[_VaeSpec]:
-        if not name:
-            return None
-        key = str(name).strip()
-        if not key:
-            return None
-
-        spec = self._vae_aliases.get(key)
-        if spec is None:
-            slug = _slugify_name(key)
-            spec = self._vae_aliases.get(slug)
-
-        if spec is not None:
-            return spec
-
-        # Attempt to auto-configure unknown names.
-        candidate_path = Path(key).expanduser()
-        mapping: Dict[str, Any]
-        if candidate_path.exists():
-            mapping = {"load_from": str(candidate_path)}
-        else:
-            mapping = {"hf_repo": key}
-
-        try:
-            spec = _build_spec_from_mapping(key, mapping)
-        except Exception:
-            return None
-
-        self._register_vae_spec(spec, allow_override=False)
-        logger = get_root_logger()
-        origin = "local path" if candidate_path.exists() else "Hugging Face repo"
-        logger.info("Auto-configured VAE '%s' from %s '%s'.", spec.name, origin, key)
-        return spec
-
-    def _ensure_vae(self, name: Optional[str]) -> Optional[Tuple[torch.nn.Module, _VaeSpec]]:
         if not VAE_AVAILABLE:
-            return None
+            get_root_logger().warning(
+                "diffusers is not available; pixel-space decoding and pixel metrics will be skipped."
+            )
 
-        spec = self._resolve_vae_spec(name)
-        if spec is None:
-            fallback_names = [
-                self._default_train_vae_name,
-                self._default_val_vae_name,
-            ]
-            for fallback in fallback_names:
-                spec = self._resolve_vae_spec(fallback)
-                if spec is not None:
+    def _initialize_vae_config(self, opt: Dict[str, Any]) -> None:
+        """Resolve the VAE configuration from explicit opts or shared sources."""
+        explicit_cfg = opt.get("vae")
+        if isinstance(explicit_cfg, dict) and explicit_cfg:
+            self._vae_opt = dict(explicit_cfg)
+            self._vae_name = str(self._vae_opt.get("vae_name") or "")
+        else:
+            self._vae_opt = {}
+            self._vae_name = ""
+
+        sources = opt.get("vae_sources") or {}
+        if not self._vae_opt and isinstance(sources, dict) and sources:
+            dataset_vae_names: List[str] = []
+            for dataset_cfg in (opt.get("datasets") or {}).values():
+                names = dataset_cfg.get("vae_names")
+                if isinstance(names, str):
+                    dataset_vae_names.append(names)
+                elif isinstance(names, (list, tuple)):
+                    dataset_vae_names.extend([str(name) for name in names if name])
+
+            for candidate in dataset_vae_names:
+                cfg = sources.get(candidate)
+                if isinstance(cfg, dict) and cfg:
+                    self._vae_opt = dict(cfg)
+                    self._vae_opt.setdefault("vae_name", candidate)
+                    self._vae_name = candidate
                     break
-        if spec is None and self._ordered_vae_keys:
-            spec = self._vae_specs_primary[self._ordered_vae_keys[0]]
-        if spec is None:
+
+            if not self._vae_opt:
+                for candidate, cfg in sources.items():
+                    if isinstance(cfg, dict) and cfg:
+                        self._vae_opt = dict(cfg)
+                        self._vae_opt.setdefault("vae_name", candidate)
+                        self._vae_name = str(candidate)
+                        break
+
+        if not self._vae_opt:
+            self._vae_opt = {}
+        if not self._vae_name:
+            self._vae_name = str(self._vae_opt.get("vae_name") or "")
+        self._vae_cache_namespace = self._build_vae_cache_namespace(self._vae_opt)
+
+    @staticmethod
+    def _build_vae_cache_namespace(cfg: Dict[str, Any]) -> str:
+        """Create a stable cache namespace for the active VAE configuration."""
+        if not cfg:
+            return "default"
+
+        parts: List[str] = []
+        for key in ("vae_name", "load_from", "hf_repo", "hf_revision", "vae_kind", "weights_dtype", "latents_scaled"):
+            value = cfg.get(key)
+            if value is not None:
+                parts.append(str(value))
+
+        if not parts:
+            parts.append("default")
+
+        raw = "::".join(parts)
+        safe = "".join(ch if ch.isalnum() or ch in "-._" else "_" for ch in raw)
+        digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:8]
+        return f"{safe}__{digest}"
+
+    # ------------------------------ torch.compile helpers ------------------------------
+    def _parse_compile_settings(self) -> Optional[Dict[str, Any]]:
+        cfg = self.opt.get("compile", False)
+        if not cfg:
             return None
 
-        cache_key = spec.cache_key
-        vae = self._vae_cache.get(cache_key)
-        if vae is None:
-            vae = self._instantiate_vae(spec)
-            self._vae_cache[cache_key] = vae
-
-        params = next(vae.parameters(), None)
-        if params is not None and params.device != self.device:
-            vae = vae.to(self.device)
-            self._vae_cache[cache_key] = vae
-
-        return vae, spec
-
-    def _instantiate_vae(self, spec: _VaeSpec) -> torch.nn.Module:
-        kwargs: Dict[str, Any] = {}
-        source: Optional[str]
-
-        if spec.load_from is not None and spec.load_from.exists():
-            source = str(spec.load_from)
-        else:
-            source = spec.hf_repo
-            if source is None:
-                raise RuntimeError(
-                    f"VAE '{spec.name}' must define 'hf_repo' or a valid 'load_from' path."
-                )
-            if spec.hf_subfolder:
-                kwargs["subfolder"] = spec.hf_subfolder
-            if spec.hf_revision:
-                kwargs["revision"] = spec.hf_revision
-            if spec.hf_auth_token:
-                kwargs["use_auth_token"] = spec.hf_auth_token
-
-        if spec.weights_dtype is not None:
-            kwargs["torch_dtype"] = spec.weights_dtype
-
-        kind = spec.vae_kind
-        logger = get_root_logger()
-        logger.info("Loading VAE '%s' (kind=%s) from %s", spec.name, kind, source)
-
-        if kind == "qwen":
-            if AutoencoderKLQwenImage is None:
-                raise RuntimeError("AutoencoderKLQwenImage is not available in this diffusers version.")
-            vae = AutoencoderKLQwenImage.from_pretrained(source, **kwargs)
-        elif kind == "wan":
-            if AutoencoderKLWan is None:
-                raise RuntimeError("AutoencoderKLWan is not available in this diffusers version.")
-            vae = AutoencoderKLWan.from_pretrained(source, **kwargs)
-        elif kind in {"kl", "autoencoderkl", "autoencoder_kl"}:
-            vae = AutoencoderKL.from_pretrained(source, **kwargs)
-        elif kind in {"asymmetric_kl", "kl_asymmetric", "kl_asym", "asym_kl"}:
-            if AsymmetricAutoencoderKL is None:
-                raise RuntimeError("AsymmetricAutoencoderKL is not available in this diffusers version.")
-            vae = AsymmetricAutoencoderKL.from_pretrained(source, **kwargs)
-        else:
-            try:
-                vae = AutoencoderKL.from_pretrained(source, **kwargs)
-                logger.warning(
-                    "VAE kind '%s' is unrecognised. Loaded AutoencoderKL for '%s'.", kind, spec.name
-                )
-            except Exception:
-                if AsymmetricAutoencoderKL is None:
-                    raise
-                vae = AsymmetricAutoencoderKL.from_pretrained(source, **kwargs)
-                logger.warning(
-                    "VAE kind '%s' is unrecognised. Loaded AsymmetricAutoencoderKL for '%s'.",
-                    kind,
-                    spec.name,
-                )
-
-        if spec.weights_dtype is not None:
-            vae = vae.to(dtype=spec.weights_dtype)
-        vae = vae.to(self.device).eval()
-        return vae
-
-    def _has_any_vae(self) -> bool:
-        return VAE_AVAILABLE and bool(self._vae_specs_primary or self._vae_cache)
-
-    def _prepare_batch_vae_names(
-        self,
-        provided: Optional[Sequence[str]],
-        batch_size: int,
-    ) -> List[Optional[str]]:
-        def _expand(candidate) -> Optional[List[str]]:
-            if candidate is None:
+        if isinstance(cfg, dict):
+            enabled = cfg.get("enabled", True)
+            if not enabled:
                 return None
-            if isinstance(candidate, str):
-                return [candidate] * batch_size
-            if isinstance(candidate, Sequence) and not isinstance(candidate, str):
-                entries = [str(item) for item in candidate]
-                if len(entries) == batch_size:
-                    return entries
-                if len(entries) == 1:
-                    return entries * batch_size
+            mode = cfg.get("mode", "max-autotune")
+            fullgraph = bool(cfg.get("fullgraph", False))
+            dynamic = bool(cfg.get("dynamic", True))
+            backend = cfg.get("backend", None)
+            apply_raw = cfg.get("apply_to_validation", False)
+            if isinstance(apply_raw, str):
+                lowered = apply_raw.strip().lower()
+                if lowered in {"1", "true", "yes", "on"}:
+                    apply_to_validation = True
+                elif lowered in {"0", "false", "no", "off"}:
+                    apply_to_validation = False
+                else:
+                    apply_to_validation = bool(lowered)
+            else:
+                apply_to_validation = bool(apply_raw)
+        else:
+            if not bool(cfg):
+                return None
+            mode = "max-autotune"
+            fullgraph = False
+            dynamic = True
+            backend = None
+            apply_to_validation = False
+
+        if not hasattr(torch, "compile"):
+            get_root_logger().warning("torch.compile requested but this PyTorch build lacks torch.compile; running eager.")
             return None
 
-        for candidate in (provided, self._current_vae_names):
-            expanded = _expand(candidate)
-            if expanded is not None:
-                return expanded
+        return {
+            "mode": mode,
+            "fullgraph": fullgraph,
+            "dynamic": dynamic,
+            "backend": backend,
+            "apply_to_validation": apply_to_validation,
+        }
 
-        for default_name in (self._default_val_vae_name, self._default_train_vae_name):
-            if default_name:
-                return [default_name] * batch_size
+    def _compile_module_if_requested(self, module: torch.nn.Module, name: str,
+                                     settings: Optional[Dict[str, Any]]) -> torch.nn.Module:
+        if not settings:
+            return module
 
-        if self._ordered_vae_keys:
-            spec = self._vae_specs_primary[self._ordered_vae_keys[0]]
-            return [spec.name] * batch_size
+        logger = get_root_logger()
+        if isinstance(module, DistributedDataParallel):
+            logger.warning("Skip torch.compile for %s: DistributedDataParallel is not supported.", name)
+            return module
 
-        return [None] * batch_size
+        top_level = module
+        wrapper: Optional[DataParallel] = None
+        bare = module
+        if isinstance(module, DataParallel):
+            device_ids = getattr(module, "device_ids", None)
+            if device_ids and len(device_ids) > 1:
+                logger.warning(
+                    "Skip torch.compile for %s: DataParallel with multiple devices is not supported; running eager.",
+                    name)
+                return module
+            wrapper = module
+            bare = module.module
 
-    # ------------------------------------------------------------------ overrides
+        was_training = bare.training
+        try:
+            torch._dynamo.config.suppress_errors = True  # type: ignore[attr-defined]
+            compiled = torch.compile(
+                bare,
+                mode=settings["mode"],
+                fullgraph=settings["fullgraph"],
+                dynamic=settings["dynamic"],
+                backend=settings["backend"])
+        except Exception as exc:  # pragma: no cover - best effort logging only
+            logger.warning("torch.compile failed for %s; running in eager mode. %s", name, exc)
+            return top_level
+
+        compiled.train(was_training)
+        if wrapper is not None:
+            wrapper.module = compiled
+            return wrapper
+        return compiled
+
+    # ------------------------------ Basic lifecycle ------------------------------
     def feed_data(self, data):
+        # just use parent (no per-sample VAE names anymore)
         super().feed_data(data)
-        names = data.get("vae_name")
-        if names is None:
-            self._current_vae_names = None
-        elif isinstance(names, (list, tuple)):
-            self._current_vae_names = [str(entry) for entry in names]
-        else:
-            self._current_vae_names = [str(names)]
-
-        if VAE_AVAILABLE and self._current_vae_names:
-            for entry in set(self._current_vae_names):
-                self._resolve_vae_spec(entry)
 
     def load_network(self, net, load_path, strict=True, param_key='params'):
-        """Load network.
-
-        Args:
-            load_path (str): The path of networks to be loaded.
-            net (nn.Module): Network.
-            strict (bool): Whether strictly loaded.
-            param_key (str): The parameter key of loaded network. If set to
-                None, use the root 'path'.
-                Default: 'params'.
-        """
+        """Standardized loader; removes 'module.' prefixes and supports params_ema fallback."""
         logger = get_root_logger()
         net = self.get_bare_model(net)
         load_net = torch.load(load_path)
@@ -476,249 +251,221 @@ class SwinIRLatentModel(SwinIRModel):
                 param_key = 'params'
                 logger.info('Loading: params_ema does not exist, use params.')
             load_net = load_net[param_key]
-        logger.info(f'Loading {net.__class__.__name__} model from {load_path}, with param key: [{param_key}].')
-        # remove unnecessary 'module.'
-        for k, v in deepcopy(load_net).items():
+        logger.info(f'Loading {net.__class__.__name__} from {load_path} [key={param_key}].')
+        for k, v in list(load_net.items()):
             if k.startswith('module.'):
                 load_net[k[7:]] = v
                 load_net.pop(k)
         self._print_different_keys_loading(net, load_net, strict)
         net.load_state_dict(load_net, strict=strict)
-        
+
     def init_training_settings(self):
-        """Override to handle space-aware loss initialization"""
-        self.net_g.train()
+        """EMA, losses, optimizers, schedulers."""
         train_opt = self.opt["train"]
+        compile_settings = self._parse_compile_settings()
+        compile_args: Optional[Dict[str, Any]] = None
+        compile_for_validation = False
+        if compile_settings:
+            compile_args = {
+                "mode": compile_settings["mode"],
+                "fullgraph": compile_settings["fullgraph"],
+                "dynamic": compile_settings["dynamic"],
+                "backend": compile_settings["backend"],
+            }
+            compile_for_validation = bool(compile_settings.get("apply_to_validation", False))
+            try:
+                torch.backends.cudnn.benchmark = True
+            except AttributeError:
+                pass
+            cuda_backend = getattr(torch.backends, "cuda", None)
+            if cuda_backend is not None and torch.cuda.is_available():
+                matmul_backend = getattr(cuda_backend, "matmul", None)
+                if matmul_backend is not None and hasattr(matmul_backend, "allow_tf32"):
+                    matmul_backend.allow_tf32 = True
+            if hasattr(torch, "set_float32_matmul_precision"):
+                try:
+                    torch.set_float32_matmul_precision("high")
+                except (TypeError, AttributeError):
+                    pass
+
+        self.net_g = self._compile_module_if_requested(self.net_g, "net_g", compile_args)
+        self.net_g.train()
+
+        # EMA
         self.ema_decay = train_opt.get("ema_decay", 0)
         if self.ema_decay > 0:
             logger = get_root_logger()
-            logger.info(f"Use Exponential Moving Average with decay: {self.ema_decay}")
-            # define network net_g with Exponential Moving Average (EMA)
-            # net_g_ema is used only for testing on one GPU and saving
-            # There is no need to wrap with DistributedDataParallel
+            logger.info(f"Use EMA with decay: {self.ema_decay}")
             self.net_g_ema = build_network(self.opt["network_g"]).to(self.device)
-            # load pretrained model
-            load_path = self.opt["path"].get("pretrain_network_g", None)
+            load_path = self.opt["path"].get("pretrain_network_g")
             if load_path is not None:
-                self.load_network(
-                    self.net_g_ema,
-                    load_path,
-                    self.opt["path"].get("strict_load_g", True),
-                    "params_ema",
-                )
+                self.load_network(self.net_g_ema, load_path,
+                                  self.opt["path"].get("strict_load_g", True),
+                                  "params_ema")
             else:
-                self.model_ema(0)  # copy net_g weight
+                self.model_ema(0)
+            ema_compile_args = compile_args if compile_for_validation else None
+            self.net_g_ema = self._compile_module_if_requested(self.net_g_ema, "net_g_ema", ema_compile_args)
+            if compile_args and not compile_for_validation:
+                logger.info("Torch.compile disabled for EMA network; validation runs in eager mode.")
             self.net_g_ema.eval()
 
-        # Initialize space-aware losses
+        # Losses / optim / sched
         self._init_space_aware_losses(train_opt)
-
-        # set up optimizers and schedulers
         self.setup_optimizers()
         self.setup_schedulers()
 
-    def _init_space_aware_losses(self, train_opt):
-        """Initialize losses with space parameter support"""
+    def _init_space_aware_losses(self, train_opt: Dict[str, Any]):
+        """Build all losses; support 'space' (latent|pixel) and 'loss_weight'."""
         from basicsr.losses import build_loss
+        self.loss_configs.clear()
+        self.loss_criteria.clear()
 
-        # Initialize loss criteria
-        self.loss_criteria = {}
-
-        # Process all loss configurations
-        for loss_name, loss_opt in train_opt.items():
-            if "_opt" in loss_name and isinstance(loss_opt, dict):
-                loss_space = loss_opt.get("space", "latent")  # Default to latent space
-
-                # Store the loss configuration
-                self.loss_configs[loss_name] = {
-                    "config": loss_opt,
-                    "space": loss_space,
-                    "weight": float(loss_opt.get("loss_weight", 1.0)),
-                }
-
-                # Build the loss criterion (without space parameter)
-                loss_config_copy = loss_opt.copy()
-                loss_config_copy.pop("space", None)  # Remove space parameter
-                loss_config_copy.pop(
-                    "loss_weight", None
-                )  # Remove weight (handled separately)
-
-                self.loss_criteria[loss_name] = build_loss(loss_config_copy).to(
-                    self.device
-                )
-
-                logger = get_root_logger()
-                logger.info(
-                    f'Initialized {loss_name} in {loss_space} space with weight {loss_opt.get("loss_weight", 1.0)}'
-                )
+        for name, cfg in train_opt.items():
+            if not (isinstance(cfg, dict) and name.endswith("_opt")):
+                continue
+            space = str(cfg.get("space", "latent")).lower()
+            weight = float(cfg.get("loss_weight", 1.0))
+            build_cfg = cfg.copy()
+            build_cfg.pop("space", None)
+            build_cfg.pop("loss_weight", None)
+            self.loss_criteria[name] = build_loss(build_cfg).to(self.device)
+            self.loss_configs[name] = {"space": space, "weight": weight}
+            get_root_logger().info(f"Initialized {name} in {space} space (w={weight}).")
 
         if not self.loss_criteria:
-            raise ValueError(
-                "No losses configured. Please add at least one loss with _opt suffix."
-            )
+            raise ValueError("No losses configured. Add at least one '*_opt' entry in train options.")
 
+    # ------------------------------ Train step -----------------------------------
     @staticmethod
-    def _evaluate_loss(criterion, prediction, target=None):
-        """Call a loss criterion, handling single-input losses gracefully."""
-
-        forward = getattr(criterion, "forward", None)
-        if forward is None:
-            return criterion(prediction, target) if target is not None else criterion(prediction)
-
-        signature = inspect.signature(forward)
-        params = list(signature.parameters.values())
-        required = [
-            param
-            for param in params
-            if param.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-            and param.default is inspect._empty
-        ]
-        if target is not None and (len(required) >= 2 or any(param.name == "target" for param in params)):
-            return criterion(prediction, target)
-        return criterion(prediction)
+    def _call_loss(criterion, pred, tgt=None):
+        try:
+            return criterion(pred, tgt) if tgt is not None else criterion(pred)
+        except TypeError:
+            return criterion(pred)
 
     def optimize_parameters(self, current_iter):
-        """Override to handle space-aware loss calculation"""
         self.optimizer_g.zero_grad()
         self.output = self.net_g(self.lq)
 
-        l_total = 0
+        # decode once if any pixel-space loss exists
+        need_pixel = any(v["space"] == "pixel" for v in self.loss_configs.values())
+        decoded_pred = self.decode_latents(self.output) if need_pixel else None
+        decoded_gt = self.decode_latents(self.gt) if (need_pixel and hasattr(self, "gt")) else None
+
+        l_total = 0.0
         loss_dict = OrderedDict()
 
-        # Calculate losses in their respective spaces
-        for loss_name, loss_config in self.loss_configs.items():
-            loss_space = loss_config["space"]
-            loss_weight = loss_config["weight"]
-            loss_criterion = self.loss_criteria[loss_name]
-
-            if loss_space == "latent":
-                # Calculate loss directly on latent tensors
-                loss_value = self._evaluate_loss(loss_criterion, self.output, self.gt)
-
-                # Handle losses that return multiple values (like perceptual loss)
-                if isinstance(loss_value, (tuple, list)):
-                    # For perceptual loss: (l_percep, l_style)
-                    for i, val in enumerate(loss_value):
-                        if val is not None:
-                            weighted_val = val * loss_weight
-                            l_total += weighted_val
-                            loss_dict[f"{loss_name}_{i}"] = val
-                else:
-                    # Single loss value
-                    loss_dict[loss_name] = loss_value
-                    weighted_loss = loss_value * loss_weight
-                    l_total += weighted_loss
-
-            elif loss_space == "pixel":
-                # Calculate loss in pixel space after VAE decoding
-                decoded_pred = self.decode_latents(self.output, vae_names=self._current_vae_names)
-                decoded_gt = self.decode_latents(self.gt, vae_names=self._current_vae_names)
+        for loss_name, cfg in self.loss_configs.items():
+            crit = self.loss_criteria[loss_name]
+            w = cfg["weight"]
+            if cfg["space"] == "latent":
+                val = self._call_loss(crit, self.output, getattr(self, "gt", None))
+            else:  # pixel
                 if decoded_pred is None or decoded_gt is None:
-                    print(
-                        f"Warning: Unable to decode latents, skipping pixel space loss: {loss_name}"
-                    )
+                    get_root_logger().warning(f"Skip pixel loss {loss_name}: cannot decode.")
                     continue
+                val = self._call_loss(crit, decoded_pred, decoded_gt)
 
-                loss_value = self._evaluate_loss(loss_criterion, decoded_pred, decoded_gt)
-
-                # Handle losses that return multiple values (like perceptual loss)
-                if isinstance(loss_value, (tuple, list)):
-                    # For perceptual loss: (l_percep, l_style)
-                    for i, val in enumerate(loss_value):
-                        if val is not None:
-                            weighted_val = val * loss_weight
-                            l_total += weighted_val
-                            loss_dict[f"{loss_name}_{i}"] = val
-                else:
-                    # Single loss value
-                    loss_dict[loss_name] = loss_value
-                    weighted_loss = loss_value * loss_weight
-                    l_total += weighted_loss
+            if isinstance(val, (tuple, list)):
+                for i, v in enumerate(val):
+                    if v is not None:
+                        l_total = l_total + v * w
+                        loss_dict[f"{loss_name}_{i}"] = v
+            else:
+                loss_dict[loss_name] = val
+                l_total = l_total + val * w
 
         l_total.backward()
         self.optimizer_g.step()
-
         self.log_dict = self.reduce_loss_dict(loss_dict)
 
-        if self.ema_decay > 0:
+        if getattr(self, "ema_decay", 0) > 0:
             self.model_ema(decay=self.ema_decay)
 
-    def decode_latents(
-        self,
-        latents: Optional[torch.Tensor],
-        *,
-        vae_names: Optional[Sequence[str]] = None,
-    ) -> Optional[torch.Tensor]:
-        """Decode latents to RGB images using a configured VAE."""
+    # ------------------------------ VAE decode -----------------------------------
+    def _get_vae(self):
+        """Lazy-load a single VAE according to opt['vae'] (or sensible defaults)."""
+        if not VAE_AVAILABLE:
+            return None
+        if self._vae is not None:
+            return self._vae
 
+        cfg = dict(self._vae_opt or {})
+        if self._vae_name and "vae_name" not in cfg:
+            cfg["vae_name"] = self._vae_name
+        source = cfg.get("load_from") or cfg.get("hf_repo") or "stabilityai/sdxl-vae"
+        kind = str(cfg.get("vae_kind", "kl")).lower()
+        dtype = _resolve_dtype(cfg.get("weights_dtype")) if cfg.get("weights_dtype") else None
+
+        kwargs: Dict[str, Any] = {}
+        if isinstance(source, (str, Path)):
+            source = str(Path(source).expanduser())
+        if cfg.get("hf_subfolder"):
+            kwargs["subfolder"] = cfg["hf_subfolder"]
+        if cfg.get("hf_revision"):
+            kwargs["revision"] = cfg["hf_revision"]
+        if cfg.get("hf_auth_token"):
+            kwargs["use_auth_token"] = cfg["hf_auth_token"]
+        if dtype is not None:
+            kwargs["torch_dtype"] = dtype
+
+        logger = get_root_logger()
+        vae_name = self._vae_name or cfg.get("vae_name") or "unnamed"
+        logger.info(f"Loading VAE(name={vae_name}, kind={kind}) from {source}")
+
+        if kind in {"asymmetric_kl", "kl_asymmetric", "asym_kl"} and AsymmetricAutoencoderKL is not None:
+            vae = AsymmetricAutoencoderKL.from_pretrained(source, **kwargs)
+        else:
+            vae = AutoencoderKL.from_pretrained(source, **kwargs)  # default
+
+        if dtype is not None:
+            vae = vae.to(dtype=dtype)
+
+        vae = vae.to(self.device).eval()
+        self._vae = vae
+        self._vae_dtype = dtype
+        self._vae_scaling = float(getattr(getattr(vae, "config", None), "scaling_factor", 1.0) or 1.0)
+        self._vae_latents_scaled = bool(cfg.get("latents_scaled", False))
+        self._vae_cache_namespace = self._build_vae_cache_namespace(cfg)
+        return self._vae
+
+    def decode_latents(self, latents: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        """Decode [B,C,H,W] (or [C,H,W]) latents to [-1,1] RGB; returns float32 on model device."""
         if latents is None or not VAE_AVAILABLE:
             return None
 
+        squeeze = False
         if latents.dim() == 3:
-            latents = latents.unsqueeze(0)
-            squeeze_result = True
-        else:
-            squeeze_result = False
-
+            latents, squeeze = latents.unsqueeze(0), True
         if latents.dim() != 4:
-            raise ValueError(
-                f"Expected latents to have shape [B, C, H, W]; received tensor with shape {tuple(latents.shape)}."
-            )
+            raise ValueError(f"Expected latents [B,C,H,W], got {tuple(latents.shape)}")
 
-        batch_size = latents.shape[0]
-        name_list = self._prepare_batch_vae_names(vae_names, batch_size)
-        if all(name is None for name in name_list):
+        vae = self._get_vae()
+        if vae is None:
             return None
 
-        grouped_indices: Dict[Optional[str], List[int]] = defaultdict(list)
-        for idx, name in enumerate(name_list):
-            grouped_indices[name].append(idx)
+        with torch.inference_mode():
+            z = latents.to(device=self.device, dtype=getattr(self._vae, "dtype", None) or latents.dtype)
+            if self._vae_latents_scaled:
+                z = z / self._vae_scaling
+            decoded = vae.decode(z).sample
+            decoded = torch.clamp(decoded, -1.0, 1.0).to(self.device, dtype=torch.float32)
 
-        decoded_outputs: List[Optional[torch.Tensor]] = [None] * batch_size
+        return decoded[0] if squeeze and decoded.dim() == 4 and decoded.size(0) == 1 else decoded
 
-        for name, indices in grouped_indices.items():
-            ensured = self._ensure_vae(name)
-            if ensured is None:
-                return None
-            vae, spec = ensured
-
-            params = next(vae.parameters())
-            vae_device = params.device
-            vae_dtype = params.dtype
-
-            latent_chunk = latents[indices].to(device=vae_device, dtype=vae_dtype)
-
-            with torch.no_grad():
-                scaling = getattr(getattr(vae, "config", None), "scaling_factor", 1.0) or 1.0
-                if spec.latents_scaled:
-                    latent_chunk = latent_chunk / scaling
-                decoded = vae.decode(latent_chunk).sample
-                decoded = torch.clamp(decoded, -1.0, 1.0)
-
-            decoded = decoded.to(device=self.device, dtype=torch.float32)
-
-            for idx, tensor in zip(indices, decoded):
-                decoded_outputs[idx] = tensor
-
-        if any(entry is None for entry in decoded_outputs):
-            return None
-
-        stacked = torch.stack(decoded_outputs, dim=0)
-        if squeeze_result:
-            stacked = stacked[0]
-        return stacked
-
-    # ------------------------------------------------------------------ Validation helpers & caching
+    # ------------------------------ Validation + caching -------------------------
     def _get_validation_root_dir(self, dataset_name: str) -> str:
-        """Resolve and create the visualization root for a dataset."""
         root = osp.join(self.opt["path"]["visualization"], dataset_name)
         os.makedirs(root, exist_ok=True)
         return root
 
     def _get_cache_dir(self, dataset_name: str) -> str:
-        """Return the cache directory for decoded tensors."""
         root = self._get_validation_root_dir(dataset_name)
-        cache_dir = osp.join(root, "cache_folder")
+        cache_root_name = (self.opt.get("val") or {}).get("cache_dir_name") or "cache_folder"
+        cache_root = osp.join(root, cache_root_name)
+        namespace = getattr(self, "_vae_cache_namespace", "default")
+        cache_dir = osp.join(cache_root, namespace)
         os.makedirs(cache_dir, exist_ok=True)
         self._val_cache_dir = cache_dir
         return cache_dir
@@ -727,88 +474,58 @@ class SwinIRLatentModel(SwinIRModel):
     def _hash_str(text: str) -> str:
         return hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
 
-    def _decoded_cache_key(
-        self,
-        *,
-        img_name: str,
-        role: str,
-        vae_key: str,
-        spatial_hw: Tuple[int, int],
-    ) -> str:
-        base = f"{img_name}__{role}__{vae_key}__{spatial_hw[0]}x{spatial_hw[1]}"
+    def _decoded_cache_key(self, *, img_name: str, role: str, spatial_hw: Tuple[int, int]) -> str:
+        vae_tag = type(self._vae).__name__ if self._vae is not None else "no_vae"
+        namespace = getattr(self, "_vae_cache_namespace", "default")
+        base = f"{namespace}__{img_name}__{role}__{vae_tag}__{spatial_hw[0]}x{spatial_hw[1]}"
         return f"{base}__{self._hash_str(base)}"
 
     def _pixel_metrics_requested(self) -> bool:
         metrics = (self.opt.get("val") or {}).get("metrics") or {}
         for cfg in metrics.values():
-            if isinstance(cfg, Mapping) and str(cfg.get("space", "latent")).lower() == "pixel":
+            if isinstance(cfg, dict) and str(cfg.get("space", "latent")).lower() == "pixel":
                 return True
         return False
 
-    def _decode_with_cache(
-        self,
-        latents: Optional[torch.Tensor],
-        *,
-        img_name: str,
-        role: str,
-        dataset_name: str,
-    ) -> Optional[torch.Tensor]:
-        """Decode latents to RGB tensors, caching LQ/GT results on disk."""
+    def _decode_with_cache(self, latents: Optional[torch.Tensor], *, img_name: str, role: str,
+                           dataset_name: str) -> Optional[torch.Tensor]:
         if latents is None or not VAE_AVAILABLE:
             return None
 
+        # ensure 4D
         squeeze = False
         if latents.dim() == 3:
-            latents = latents.unsqueeze(0)
-            squeeze = True
-
+            latents, squeeze = latents.unsqueeze(0), True
         if latents.dim() != 4:
-            raise ValueError(
-                f"Expected latents with shape [B, C, H, W]; received {tuple(latents.shape)}."
-            )
+            raise ValueError(f"Expected latents [B,C,H,W], got {tuple(latents.shape)}")
 
-        batch_size = latents.shape[0]
-        name_list = self._prepare_batch_vae_names(self._current_vae_names, batch_size)
-        ensured = self._ensure_vae(name_list[0] if name_list else None)
-        if ensured is None:
-            return None
-        _, spec = ensured
-        vae_key = spec.cache_key
-        spatial_hw = (latents.shape[-2], latents.shape[-1])
+        H, W = latents.shape[-2:]
+        key = self._decoded_cache_key(img_name=img_name, role=role, spatial_hw=(H, W))
 
-        cache_key = self._decoded_cache_key(
-            img_name=img_name,
-            role=role,
-            vae_key=vae_key,
-            spatial_hw=spatial_hw,
-        )
-
-        if cache_key in self._val_decode_mem_cache:
-            cached = self._val_decode_mem_cache[cache_key]
+        if key in self._val_decode_mem_cache:
+            cached = self._val_decode_mem_cache[key]
             return cached if not squeeze else cached
 
         disk_path = None
         if role in {"lq", "gt"} and self._val_cache_dir:
-            disk_path = osp.join(self._val_cache_dir, f"{cache_key}.pt")
+            disk_path = osp.join(self._val_cache_dir, f"{key}.pt")
             if osp.exists(disk_path):
                 try:
-                    tensor = torch.load(disk_path, map_location="cpu")
-                    if isinstance(tensor, torch.Tensor):
-                        self._val_decode_mem_cache[cache_key] = tensor
-                        return tensor if not squeeze else tensor
+                    t = torch.load(disk_path, map_location="cpu")
+                    if isinstance(t, torch.Tensor):
+                        self._val_decode_mem_cache[key] = t
+                        return t if not squeeze else t
                 except Exception:
-                    pass  # fall back to re-decode on failure
+                    pass  # fall through
 
-        decoded = self.decode_latents(latents, vae_names=self._current_vae_names)
+        decoded = self.decode_latents(latents)
         if decoded is None:
             return None
-
         if decoded.dim() == 4 and decoded.size(0) == 1:
             decoded = decoded.squeeze(0)
 
         decoded_cpu = decoded.detach().to("cpu", dtype=torch.float16).contiguous()
-
-        self._val_decode_mem_cache[cache_key] = decoded_cpu
+        self._val_decode_mem_cache[key] = decoded_cpu
 
         if disk_path is not None:
             try:
@@ -818,280 +535,165 @@ class SwinIRLatentModel(SwinIRModel):
 
         return decoded_cpu if not squeeze else decoded_cpu
 
-    def calculate_metric_in_space(
-        self,
-        pred_latent,
-        gt_latent,
-        metric_name,
-        metric_opt,
-        *,
-        decoded_pred: Optional[torch.Tensor] = None,
-        decoded_gt: Optional[torch.Tensor] = None,
-    ):
-        """Calculate metric in specified space (latent or pixel)"""
-        metric_space = metric_opt.get("space", "latent")
+    # ------------------------------ Metrics & viz --------------------------------
+    def calculate_metric_in_space(self, pred_latent, gt_latent, metric_name, metric_opt,
+                                  *, decoded_pred: Optional[torch.Tensor] = None,
+                                  decoded_gt: Optional[torch.Tensor] = None):
+        """Compute metric in 'latent' or 'pixel' space."""
+        space = metric_opt.get("space", "latent")
 
-        if metric_space == "latent":
-            # Calculate metrics directly on latent tensors
+        if space == "latent":
             if metric_opt["type"] == "L1Loss":
                 return F.l1_loss(pred_latent, gt_latent).item()
-            elif metric_opt["type"] == "MSELoss":
+            if metric_opt["type"] == "MSELoss":
                 return F.mse_loss(pred_latent, gt_latent).item()
-            else:
-                return 0.0
+            return 0.0
 
-        elif metric_space == "pixel":
+        # pixel space
+        if decoded_pred is None or decoded_gt is None:
+            decoded_pred = self.decode_latents(pred_latent)
+            decoded_gt = self.decode_latents(gt_latent)
             if decoded_pred is None or decoded_gt is None:
-                # Decode latents to images once for all pixel-space metrics
-                decoded_pred = self.decode_latents(pred_latent, vae_names=self._current_vae_names)
-                decoded_gt = self.decode_latents(gt_latent, vae_names=self._current_vae_names)
-                if decoded_pred is None or decoded_gt is None:
-                    print(
-                        f"Warning: Unable to decode latents, skipping pixel space metric: {metric_name}"
-                    )
-                    return 0.0
-                if decoded_pred.dim() == 4 and decoded_pred.size(0) == 1:
-                    decoded_pred = decoded_pred.squeeze(0)
-                if decoded_gt.dim() == 4 and decoded_gt.size(0) == 1:
-                    decoded_gt = decoded_gt.squeeze(0)
-                decoded_pred = decoded_pred.detach().to("cpu", dtype=torch.float32)
-                decoded_gt = decoded_gt.detach().to("cpu", dtype=torch.float32)
-            else:
-                decoded_pred = decoded_pred.detach().to("cpu", dtype=torch.float32)
-                decoded_gt = decoded_gt.detach().to("cpu", dtype=torch.float32)
-
-            if decoded_pred.dim() == 3:
-                decoded_pred = decoded_pred.unsqueeze(0)
-            if decoded_gt.dim() == 3:
-                decoded_gt = decoded_gt.unsqueeze(0)
-
-            # Handle L1Loss directly on tensors
-            if metric_opt["type"] == "L1Loss":
-                return F.l1_loss(decoded_pred, decoded_gt).item()
-
-            # Handle metrics that use the basicsr `calculate_metric` dispatcher
-            elif metric_opt["type"] in [
-                "calculate_psnr",
-                "calculate_ssim",
-                "calculate_psnr_pt",
-                "calculate_ssim_pt",
-            ]:
-                from basicsr.metrics import calculate_metric
-
-                metric_data = {}
-
-                # Check if it's a PyTorch metric (expects tensors in range [0, 1])
-                if metric_opt["type"].endswith("_pt"):
-                    # Convert decoded tensors from [-1, 1] to [0, 1]
-                    pred_img_01 = (decoded_pred + 1.0) / 2.0
-                    gt_img_01 = (decoded_gt + 1.0) / 2.0
-                    # Use the required keys: 'img' and 'img2'
-                    metric_data = dict(img=pred_img_01, img2=gt_img_01)
-                # Otherwise, it's a NumPy metric (expects ndarray in range [0, 255])
-                else:
-                    # Use the existing helper to convert [-1, 1] tensor to [0, 255] numpy array
-                    pred_img_np = self.tensor_to_numpy_image(decoded_pred)
-                    gt_img_np = self.tensor_to_numpy_image(decoded_gt)
-                    # Use the required keys: 'img' and 'img2'
-                    metric_data = dict(img=pred_img_np, img2=gt_img_np)
-
-                # Call the generic metric calculator
-                result = calculate_metric(metric_data, metric_opt)
-
-                # Ensure the result is a standard Python float for logging
-                if isinstance(result, torch.Tensor):
-                    return result.item()
-                else:
-                    # NumPy metrics already return floats, so just return
-                    return result
-            else:
-                # Handle unknown pixel-space metric types gracefully
+                print(f"Warning: Unable to decode latents; skip metric: {metric_name}")
                 return 0.0
+            if decoded_pred.dim() == 4 and decoded_pred.size(0) == 1:
+                decoded_pred = decoded_pred.squeeze(0)
+            if decoded_gt.dim() == 4 and decoded_gt.size(0) == 1:
+                decoded_gt = decoded_gt.squeeze(0)
+            decoded_pred = decoded_pred.detach().to("cpu", dtype=torch.float32)
+            decoded_gt = decoded_gt.detach().to("cpu", dtype=torch.float32)
+
+        if decoded_pred.dim() == 3:
+            decoded_pred = decoded_pred.unsqueeze(0)
+        if decoded_gt.dim() == 3:
+            decoded_gt = decoded_gt.unsqueeze(0)
+
+        if metric_opt["type"] == "L1Loss":
+            return F.l1_loss(decoded_pred, decoded_gt).item()
+
+        elif metric_opt["type"] in ["calculate_psnr", "calculate_ssim",
+                                    "calculate_psnr_pt", "calculate_ssim_pt"]:
+            from basicsr.metrics import calculate_metric
+            if metric_opt["type"].endswith("_pt"):
+                # expects tensors in [0,1]
+                pred01 = (decoded_pred + 1.0) / 2.0
+                gt01 = (decoded_gt + 1.0) / 2.0
+                data = dict(img=pred01, img2=gt01)
+            else:
+                # expects numpy arrays in [0,255]
+                pred_np = self.tensor_to_numpy_image(decoded_pred)
+                gt_np = self.tensor_to_numpy_image(decoded_gt)
+                data = dict(img=pred_np, img2=gt_np)
+            res = calculate_metric(data, metric_opt)
+            return res.item() if isinstance(res, torch.Tensor) else res
 
         return 0.0
 
     def tensor_to_numpy_image(self, tensor):
-        """Convert tensor to a numpy image array for plotting.
-        Input shape: [C, H, W] or [B, C, H, W] in [-1, 1] range.
-        Output shape: [H, W, C] in [0, 255] uint8 range (RGB).
-        """
-        image = tensor.detach().cpu().clamp(-1.0, 1.0)
-        image = (image + 1.0) * 0.5  # to [0, 1]
-        image = image.mul(255.0).clamp(0.0, 255.0).byte()
-        if image.dim() == 4:
-            image = image.squeeze(0)
-        return image.permute(1, 2, 0).numpy()
+        """[C,H,W] or [B,C,H,W] in [-1,1] -> [H,W,C] uint8 RGB."""
+        img = tensor.detach().cpu().clamp(-1, 1)
+        img = (img + 1.0) * 0.5
+        img = img.mul(255.0).clamp(0, 255).byte()
+        if img.dim() == 4:
+            img = img.squeeze(0)
+        return img.permute(1, 2, 0).numpy()
 
     def _visualize_latent_channels(self, latents, title, ax, max_channels=4):
-        """Visualize first few channels of latents on a matplotlib axis."""
-        channels_to_show = min(max_channels, latents.shape[1])
-        latents_cpu = latents.detach().cpu()
-
-        if channels_to_show == 1:
-            im = ax.imshow(latents_cpu[0, 0].numpy(), cmap="viridis")
+        """Show first channels of latents; grid up to 2x2."""
+        ch = min(max_channels, latents.shape[1])
+        lat = latents.detach().cpu()
+        if ch == 1:
+            im = ax.imshow(lat[0, 0].numpy(), cmap="viridis")
             ax.set_title(f"{title}\nCh 0")
             cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-            cbar.set_label("Activation Value", rotation=270, labelpad=15)
+            cbar.set_label("Activation", rotation=270, labelpad=15)
         else:
-            h, w = latents_cpu.shape[-2:]
-            combined = torch.zeros(h * 2, w * 2)
-            for i in range(min(4, channels_to_show)):
-                row, col = i // 2, i % 2
-                combined[row * h : (row + 1) * h, col * w : (col + 1) * w] = (
-                    latents_cpu[0, i]
-                )
-
-            im = ax.imshow(combined.numpy(), cmap="viridis")
-            ax.set_title(f"{title}\nCh 0-{channels_to_show-1}")
+            h, w = lat.shape[-2:]
+            grid = torch.zeros(h * 2, w * 2)
+            for i in range(min(4, ch)):
+                r, c = divmod(i, 2)
+                grid[r * h:(r + 1) * h, c * w:(c + 1) * w] = lat[0, i]
+            im = ax.imshow(grid.numpy(), cmap="viridis")
+            ax.set_title(f"{title}\nCh 0-{ch-1}")
             cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-            cbar.set_label("Activation Value", rotation=270, labelpad=15)
-
+            cbar.set_label("Activation", rotation=270, labelpad=15)
         ax.axis("off")
-
-    def _save_comparison_plot(
-        self,
-        save_path,
-        img_name,
-        lq_latent,
-        pred_latent,
-        gt_latent,
-        decoded_lq,
-        decoded_pred,
-        decoded_gt,
-        log_to_wandb=False,
-        current_iter=None,
-    ):
-        """Creates and saves the full 2x4 visualization plot.
-
-        Args:
-            log_to_wandb: If True, also log the figure to wandb
-            current_iter: Current iteration number for wandb logging
-        """
+    
+    def _save_comparison_plot(self, save_path, img_name, lq_latent, pred_latent, gt_latent,
+                              decoded_lq, decoded_pred, decoded_gt, log_to_wandb=False,
+                              current_iter=None):
+        """2x4 panel: latent input/pred/gt/diff and decoded input/pred/gt/diff."""
         fig, axes = plt.subplots(2, 4, figsize=(24, 12))
 
-        # --- Row 1: Latent Tensors ---
-        # Col 1: Low-quality (input) latents
-        lh, lw = lq_latent.shape[-2:]
+        # row 1: latents
         self._visualize_latent_channels(
-            lq_latent, f"Input Latents\n{lh}x{lw} spatial, 16 channels", axes[0, 0]
+            lq_latent, f"Input Latents\n{lq_latent.shape[-2]}x{lq_latent.shape[-1]}, C={lq_latent.shape[1]}", axes[0, 0]
+        )
+        self._visualize_latent_channels(
+            pred_latent, f"Pred Latents\n{pred_latent.shape[-2]}x{pred_latent.shape[-1]}, C={pred_latent.shape[1]}",
+            axes[0, 1]
+        )
+        self._visualize_latent_channels(
+            gt_latent, f"GT Latents\n{gt_latent.shape[-2]}x{gt_latent.shape[-1]}, C={gt_latent.shape[1]}",
+            axes[0, 2]
         )
 
-        # Col 2: Predicted high-quality latents
-        ph, pw = pred_latent.shape[-2:]
-        self._visualize_latent_channels(
-            pred_latent,
-            f"Predicted Latents\n{ph}x{pw} spatial, 16 channels",
-            axes[0, 1],
-        )
-
-        # Col 3: Ground-truth high-quality latents
-        gh, gw = gt_latent.shape[-2:]
-        self._visualize_latent_channels(
-            gt_latent,
-            f"Ground Truth Latents\n{gh}x{gw} spatial, 16 channels",
-            axes[0, 2],
-        )
-
-        # Col 4: Difference between predicted and ground-truth latents
-        diff_latents = torch.abs(gt_latent - pred_latent)
-        diff_mean = diff_latents.mean(dim=1, keepdim=True)
-        im = axes[0, 3].imshow(diff_mean[0, 0].cpu().numpy(), cmap="hot")
-        axes[0, 3].set_title(
-            f"Latent Difference |GT - Pred|\nAveraged across 16 channels"
-        )
+        diff = torch.abs(gt_latent - pred_latent).mean(dim=1, keepdim=True)
+        im = axes[0, 3].imshow(diff[0, 0].cpu().numpy(), cmap="hot")
+        axes[0, 3].set_title("Latent |GT - Pred| (mean over C)")
         axes[0, 3].axis("off")
         cbar = plt.colorbar(im, ax=axes[0, 3], fraction=0.046, pad=0.04)
-        cbar.set_label("Difference Magnitude", rotation=270, labelpad=15)
+        cbar.set_label("Diff", rotation=270, labelpad=15)
 
-        # --- Row 2: Decoded Images ---
-        if (
-            decoded_lq is not None
-            and decoded_pred is not None
-            and decoded_gt is not None
-        ):
-            # Col 1: Decoded LQ
+        # row 2: decoded
+        if decoded_lq is not None and decoded_pred is not None and decoded_gt is not None:
             axes[1, 0].imshow(self.tensor_to_numpy_image(decoded_lq))
-            axes[1, 0].set_title(
-                f"Decoded from Input Latents\n{decoded_lq.shape[-2]}x{decoded_lq.shape[-1]} image"
-            )
+            axes[1, 0].set_title(f"Decoded LQ\n{decoded_lq.shape[-2]}x{decoded_lq.shape[-1]}")
             axes[1, 0].axis("off")
 
-            # Col 2: Decoded Prediction
             axes[1, 1].imshow(self.tensor_to_numpy_image(decoded_pred))
-            axes[1, 1].set_title(
-                f"Decoded from Predicted Latents\n{decoded_pred.shape[-2]}x{decoded_pred.shape[-1]} image"
-            )
+            axes[1, 1].set_title(f"Decoded Pred\n{decoded_pred.shape[-2]}x{decoded_pred.shape[-1]}")
             axes[1, 1].axis("off")
 
-            # Col 3: Decoded Ground Truth
             axes[1, 2].imshow(self.tensor_to_numpy_image(decoded_gt))
-            axes[1, 2].set_title(
-                f"Decoded from Ground Truth Latents\n{decoded_gt.shape[-2]}x{decoded_gt.shape[-1]} image"
-            )
+            axes[1, 2].set_title(f"Decoded GT\n{decoded_gt.shape[-2]}x{decoded_gt.shape[-1]}")
             axes[1, 2].axis("off")
 
-            # Col 4: Image Difference
-            diff_decoded = torch.abs(decoded_gt - decoded_pred)
-            axes[1, 3].imshow(self.tensor_to_numpy_image(diff_decoded))
-            axes[1, 3].set_title(
-                f"Image Difference |GT - Pred|\n{diff_decoded.shape[-2]}x{diff_decoded.shape[-1]} image"
-            )
+            diff_dec = torch.abs(decoded_gt - decoded_pred)
+            axes[1, 3].imshow(self.tensor_to_numpy_image(diff_dec))
+            axes[1, 3].set_title(f"Decoded |GT - Pred|\n{diff_dec.shape[-2]}x{diff_dec.shape[-1]}")
             axes[1, 3].axis("off")
         else:
             for i in range(4):
-                axes[1, i].text(
-                    0.5,
-                    0.5,
-                    "VAE not available\nCannot decode images",
-                    ha="center",
-                    va="center",
-                )
+                axes[1, i].text(0.5, 0.5, "VAE not available\nCannot decode", ha="center", va="center")
                 axes[1, i].axis("off")
 
-        # --- Final Touches & Saving ---
-        # Calculate metrics for title
         mse = F.mse_loss(pred_latent, gt_latent).item()
         mae = F.l1_loss(pred_latent, gt_latent).item()
-        fig.suptitle(
-            f"Latent Upscaler Visualization: {img_name}\n"
-            f"Latent MSE: {mse:.6f}, Latent MAE: {mae:.6f}",
-            fontsize=16,
-        )
+        fig.suptitle(f"Latent Upscaler: {img_name} | MSE: {mse:.6f}, MAE: {mae:.6f}", fontsize=16)
 
         plt.tight_layout()
         plt.subplots_adjust(top=0.85, hspace=0.4, wspace=0.3)
+        # plt.savefig(save_path, dpi=150, bbox_inches="tight")
 
-        # Save to file
-        plt.savefig(save_path, dpi=150, bbox_inches="tight")
-
-        # Log to wandb if requested
         if log_to_wandb and WANDB_AVAILABLE and wandb.run is not None:
             try:
-                # Log the matplotlib figure directly
-                wandb.log(
-                    {
-                        f"validation/{img_name}": wandb.Image(fig),
-                        "iteration": current_iter,
-                    }
-                )
+                wandb.log({f"validation/{img_name}": wandb.Image(fig), "iteration": current_iter})
             except Exception as e:
-                logger = get_root_logger()
-                logger.warning(f"Failed to log image to wandb: {e}")
+                get_root_logger().warning(f"wandb log failed: {e}")
 
-        plt.close(fig)  # Close figure to free memory
+        plt.close(fig)
 
+    # ------------------------------ Validation -----------------------------------
     def nondist_validation(self, dataloader, current_iter, tb_logger, save_img):
-        """Validation with caching for decoded tensors and separated metric/plot flows."""
+        """Validation with optional pixel-space metrics and cached decode."""
         dataset_name = dataloader.dataset.opt["name"]
-        with_metrics = self.opt["val"]["metrics"] is not None
-        use_pbar = self.opt["val"].get("pbar", False)
+        val_opt = self.opt.get("val") or {}
+        with_metrics = val_opt.get("metrics") is not None
+        use_pbar = bool(val_opt.get("pbar", False))
 
-        log_to_wandb = (
-            self.opt.get("logger", {}).get("wandb", {}).get("project") is not None
-        )
-        max_wandb_images = (
-            self.opt.get("logger", {}).get("wandb", {}).get("max_val_images", 8)
-        )
+        log_to_wandb = (self.opt.get("logger", {}).get("wandb", {}).get("project") is not None)
+        max_wandb_images = int(self.opt.get("logger", {}).get("wandb", {}).get("max_val_images", 8))
         wandb_image_count = 0
         need_pixel_metrics = with_metrics and self._pixel_metrics_requested()
 
@@ -1104,209 +706,94 @@ class SwinIRLatentModel(SwinIRModel):
         evaluated_images = 0
         if with_metrics:
             if not hasattr(self, "metric_results"):
-                self.metric_results = {
-                    name: 0 for name in self.opt["val"]["metrics"].keys()
-                }
+                self.metric_results = {name: 0 for name in val_opt["metrics"].keys()}
             self._initialize_best_metric_results(dataset_name)
-            for metric in self.metric_results.keys():
-                self.metric_results[metric] = 0
+            for k in list(self.metric_results.keys()):
+                self.metric_results[k] = 0
 
-        pbar = None
-        pbar_unit = "image"
+        total_images = 0
         if use_pbar:
-            total_images: Optional[int] = None
             try:
                 total_images = len(dataloader.dataset)  # type: ignore[arg-type]
             except (TypeError, AttributeError):
-                total_images = None
-
-            if total_images is not None:
-                pbar = tqdm(total=total_images, unit="image")
-            else:
-                pbar_unit = "batch"
-                total_batches: Optional[int] = None
                 try:
-                    total_batches = len(dataloader)
+                    total_images = len(dataloader)
                 except TypeError:
-                    total_batches = None
-                pbar = (
-                    tqdm(total=total_batches, unit=pbar_unit)
-                    if total_batches is not None
-                    else tqdm(unit=pbar_unit)
-                )
+                    total_images = 0
 
-        for batch_idx, val_data in enumerate(tqdm(dataloader)):
+        pbar = tqdm(total=total_images, unit="image", disable=(not use_pbar))
+
+        for batch_idx, val_data in enumerate(dataloader):
             self.feed_data(val_data)
             self.test()
 
-            lq_latents = self.lq.detach()
-            pred_latents = self.output.detach()
-            gt_latents = self.gt.detach() if hasattr(self, "gt") else None
+            lq_lat = self.lq.detach()
+            pred_lat = self.output.detach()
+            gt_lat = self.gt.detach() if hasattr(self, "gt") else None
 
-            if torch.is_tensor(lq_latents) and lq_latents.dim() == 3:
-                lq_latents = lq_latents.unsqueeze(0)
-            if torch.is_tensor(pred_latents) and pred_latents.dim() == 3:
-                pred_latents = pred_latents.unsqueeze(0)
-            if torch.is_tensor(gt_latents) and gt_latents.dim() == 3:
-                gt_latents = gt_latents.unsqueeze(0)
+            if lq_lat.dim() == 3: lq_lat = lq_lat.unsqueeze(0)
+            if pred_lat.dim() == 3: pred_lat = pred_lat.unsqueeze(0)
+            if torch.is_tensor(gt_lat) and gt_lat.dim() == 3: gt_lat = gt_lat.unsqueeze(0)
 
-            batch_size = lq_latents.shape[0] if torch.is_tensor(lq_latents) else 1
-
+            B = lq_lat.shape[0]
             batch_lq_paths = val_data.get("lq_path")
-            if isinstance(batch_lq_paths, (list, tuple)):
-                lq_paths = list(batch_lq_paths)
-            else:
-                lq_paths = [batch_lq_paths]
+            lq_paths = list(batch_lq_paths) if isinstance(batch_lq_paths, (list, tuple)) else [batch_lq_paths]
 
-            for sample_idx in range(batch_size):
-                img_path = lq_paths[sample_idx] if sample_idx < len(lq_paths) else None
-                img_name = (
-                    osp.splitext(osp.basename(img_path))[0]
-                    if isinstance(img_path, str)
-                    else f"sample_{batch_idx}_{sample_idx}"
-                )
+            for i in range(B):
+                img_path = lq_paths[i] if i < len(lq_paths) else None
+                img_name = osp.splitext(osp.basename(img_path))[0] if isinstance(img_path, str) else f"sample_{batch_idx}_{i}"
 
-                lq_sample = (
-                    lq_latents[sample_idx : sample_idx + 1]
-                    if torch.is_tensor(lq_latents)
-                    else None
-                )
-                pred_sample = (
-                    pred_latents[sample_idx : sample_idx + 1]
-                    if torch.is_tensor(pred_latents)
-                    else None
-                )
-                gt_sample = (
-                    gt_latents[sample_idx : sample_idx + 1]
-                    if torch.is_tensor(gt_latents)
-                    else None
-                )
+                lq_i = lq_lat[i:i+1]
+                pred_i = pred_lat[i:i+1]
+                gt_i = gt_lat[i:i+1] if torch.is_tensor(gt_lat) else None
 
-                if lq_sample is None or pred_sample is None:
-                    continue
+                dec_lq = dec_pred = dec_gt = None
+                if VAE_AVAILABLE and (save_img or need_pixel_metrics) and gt_i is not None:
+                    dec_lq = self._decode_with_cache(lq_i, img_name=img_name, role="lq", dataset_name=dataset_name)
+                    dec_gt = self._decode_with_cache(gt_i, img_name=img_name, role="gt", dataset_name=dataset_name)
+                    dec_pred = self._decode_with_cache(pred_i, img_name=img_name, role="pred", dataset_name=dataset_name)
 
-                decoded_lq_cpu: Optional[torch.Tensor] = None
-                decoded_pred_cpu: Optional[torch.Tensor] = None
-                decoded_gt_cpu: Optional[torch.Tensor] = None
-
-                if VAE_AVAILABLE and pred_sample is not None:
-                    if save_img and gt_sample is not None:
-                        decoded_lq_cpu = self._decode_with_cache(
-                            lq_sample,
-                            img_name=img_name,
-                            role="lq",
-                            dataset_name=dataset_name,
-                        )
-                        decoded_gt_cpu = self._decode_with_cache(
-                            gt_sample,
-                            img_name=img_name,
-                            role="gt",
-                            dataset_name=dataset_name,
-                        )
-                        decoded_pred_cpu = self._decode_with_cache(
-                            pred_sample,
-                            img_name=img_name,
-                            role="pred",
-                            dataset_name=dataset_name,
-                        )
-                    if need_pixel_metrics and gt_sample is not None:
-                        if decoded_gt_cpu is None:
-                            decoded_gt_cpu = self._decode_with_cache(
-                                gt_sample,
-                                img_name=img_name,
-                                role="gt",
-                                dataset_name=dataset_name,
-                            )
-                        if decoded_pred_cpu is None:
-                            decoded_pred_cpu = self._decode_with_cache(
-                                pred_sample,
-                                img_name=img_name,
-                                role="pred",
-                                dataset_name=dataset_name,
-                            )
-
-                # --- Visualization ---
-                if (
-                    save_img
-                    and gt_sample is not None
-                    and lq_sample is not None
-                    and pred_sample is not None
-                ):
+                # Visualization
+                if save_img and gt_i is not None:
                     if self.opt["is_train"]:
-                        save_path = osp.join(
-                            self.opt["path"]["visualization"],
-                            img_name,
-                            f"{img_name}_{current_iter}.png",
-                        )
+                        save_path = osp.join(self.opt["path"]["visualization"], img_name, f"{img_name}_{current_iter}.png")
                     else:
-                        suffix = self.opt["val"]["suffix"] or self.opt["name"]
-                        save_path = osp.join(
-                            self.opt["path"]["visualization"],
-                            dataset_name,
-                            f"{img_name}_{suffix}.png",
-                        )
+                        suffix = val_opt.get("suffix") or self.opt["name"]
+                        save_path = osp.join(self.opt["path"]["visualization"], dataset_name, f"{img_name}_{suffix}.png")
                     os.makedirs(osp.dirname(save_path), exist_ok=True)
 
-                    should_log_wandb = log_to_wandb and wandb_image_count < max_wandb_images
-                    if should_log_wandb:
+                    should_log = log_to_wandb and (wandb_image_count < max_wandb_images)
+                    if should_log:
                         wandb_image_count += 1
 
                     self._save_comparison_plot(
-                        save_path,
-                        img_name,
-                        lq_sample.cpu(),
-                        pred_sample.cpu(),
-                        gt_sample.cpu(),
-                        decoded_lq_cpu.float() if decoded_lq_cpu is not None else None,
-                        decoded_pred_cpu.float() if decoded_pred_cpu is not None else None,
-                        decoded_gt_cpu.float() if decoded_gt_cpu is not None else None,
-                        log_to_wandb=should_log_wandb,
-                        current_iter=current_iter,
+                        save_path, img_name,
+                        lq_i.cpu(), pred_i.cpu(), gt_i.cpu(),
+                        None if dec_lq is None else dec_lq.float(),
+                        None if dec_pred is None else dec_pred.float(),
+                        None if dec_gt is None else dec_gt.float(),
+                        log_to_wandb=should_log,
+                        current_iter=current_iter
                     )
 
-                # --- Metrics Calculation ---
-                if (
-                    with_metrics
-                    and gt_sample is not None
-                    and pred_sample is not None
-                ):
-                    for name, opt_ in self.opt["val"]["metrics"].items():
-                        metric_value = self.calculate_metric_in_space(
-                            pred_sample,
-                            gt_sample,
-                            name,
-                            opt_,
-                            decoded_pred=decoded_pred_cpu,
-                            decoded_gt=decoded_gt_cpu,
+                # Metrics
+                if with_metrics and gt_i is not None:
+                    for name, opt_ in val_opt["metrics"].items():
+                        v = self.calculate_metric_in_space(
+                            pred_i, gt_i, name, opt_, decoded_pred=dec_pred, decoded_gt=dec_gt
                         )
-                        self.metric_results[name] += metric_value
+                        self.metric_results[name] += v
+
                 evaluated_images += 1
-
-                if pbar and pbar_unit == "image":
+                if use_pbar:
                     pbar.update(1)
-                    pbar.set_description(f"Test {img_name}")
+                    pbar.set_description(f"Val {img_name}")
 
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-
-            if pbar and pbar_unit != "image":
-                pbar.update(1)
-                pbar.set_description(f"Batch {batch_idx}")
-
-        if pbar:
+        if use_pbar:
             pbar.close()
 
         if with_metrics and evaluated_images > 0:
-            # Loop through the metrics that were calculated
-            for metric_name in self.metric_results.keys():
-                # Average the metric value over the validation set
-                self.metric_results[metric_name] /= evaluated_images
-                # Update the best result for THIS specific metric using its correct name
-                self._update_best_metric_result(
-                    dataset_name,
-                    metric_name,
-                    self.metric_results[metric_name],
-                    current_iter,
-                )
-            # After all metrics have been updated, log their final values
+            for k in self.metric_results.keys():
+                self.metric_results[k] /= evaluated_images
+                self._update_best_metric_result(dataset_name, k, self.metric_results[k], current_iter)
             self._log_validation_metric_values(current_iter, dataset_name, tb_logger)

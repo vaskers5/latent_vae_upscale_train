@@ -1,8 +1,14 @@
 # Basic configuration for precomputing latent embeddings compatible with the test dataset.
 # dataset_root: /data/kazanplova/datasets/latent_upscale_validation_120_samples
-cache_root: /data/kazanplova/latent_vae_upscale_train/midjourney_full_dataset_crops_new/embeddings
-dataset_root: /data/kazanplova/latent_vae_upscale_train/midjourney_full_dataset_crops_new/images
-
+# cache_root: /data/kazanplova/datasets/latent_upscale_validation_120_samples/embeddings
+# Example of processing multiple folders:
+# datasets:
+#   - [/data/path/to/images_a, /data/path/to/cache_a]
+#   - [/data/path/to/images_b, /data/path/to/cache_b]
+datasets:
+  - [/data/kazanplova/datasets/full_latent_upscale_dataset_train/gpt4_crops, /data/kazanplova/datasets/full_latent_upscale_dataset_train/gpt4_crops/embeddings]
+  - [/data/kazanplova/datasets/full_latent_upscale_dataset_train/recraft_data_crops/, /data/kazanplova/datasets/full_latent_upscale_dataset_train/recraft_data_crops/embeddings]
+  - [/data/kazanplova/datasets/full_latent_upscale_dataset_train/nano_banana_crops`, /data/kazanplova/datasets/full_latent_upscale_dataset_train/gpt4_crops/embeddings]
 # dataset_root: /data/kazanplova/datasets/openim_cropped/train
 # cache_root: /data/kazanplova/datasets/openim_cropped/train_latents
 # CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 PYTHONPATH="$PWD" accelerate launch --num_processes 6 --main_process_port 29500 scripts/precompute_embeddings.py --config configs/embeddings_precompute.yaml 
@@ -12,25 +18,16 @@ defaults:
   store_distribution: true
   # image_csv: ./clear_images.csv
   devices:
-    - cuda:0
-    - cuda:1
+    # - cuda:0
+    # - cuda:1
     - cuda:2
     - cuda:3
-    # - cuda:4
-    # - cuda:5
+    - cuda:4
+    - cuda:5
     # - cuda:6
     # - cuda:7
 
 models:
-  # sdxl_vae:
-  #   hf_repo: stabilityai/sdxl-vae
-  #   vae_kind: kl
-  #   cache_subdir: sdxl_vae
-  #   resolutions_with_batchsize:
-  #     # - [128, 1024]
-  #     # - [256, 256]
-  #     - [512, 64]
-  #     - [1024, 16]
   flux_vae:
     hf_repo: wolfgangblack/flux_vae
     vae_kind: kl
@@ -39,30 +36,4 @@ models:
       # - [128, 1024]
       - [256, 256]
       - [512, 64]
-  # sd3_vae_anime_ft:
-  #   hf_repo: Disty0/sd3_vae_anime_ft
-  #   vae_kind: kl
-  #   cache_subdir: sd3_vae_anime_ft
-  #   resolutions_with_batchsize:
-  #     - [128, 1024]
-  #     - [256, 128]
-  #     - [512, 32]
-  # ostris_vae:
-  #   hf_repo: ostris/vae-kl-f8-d16
-  #   vae_kind: kl
-  #   weights_dtype: float32
-  #   cache_subdir: ostris_vae
-  #   resolutions_with_batchsize:
-  #     - [128, 1024]
-  #     - [256, 256]
-  #     - [512, 64]
-  # AuraDiffusion_16ch_vae:
-  #   hf_repo: AuraDiffusion/16ch-vae
-  #   vae_kind: kl
-  #   weights_dtype: float32
-  #   cache_subdir: AuraDiffusion_16ch_vae
-  #   resolutions_with_batchsize:
-  #     - [128, 1024]
-  #     - [256, 256]
-  #     - [512, 64]
-    
+

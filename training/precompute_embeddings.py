@@ -196,12 +196,47 @@ def _parse_model_configs(raw: Dict[str, Any]) -> List[ModelConfig]:
     return models
 
 
-def _gather_models(config: Dict[str, Any]) -> Tuple[Path, Path, Dict[str, Any], List[ModelConfig]]:
-    dataset_root = Path(config["dataset_root"]).expanduser().resolve()
-    cache_root = Path(config["cache_root"]).expanduser().resolve()
+def _parse_dataset_pairs(config: Dict[str, Any]) -> List[Tuple[Path, Path]]:
+    dataset_pairs_cfg = config.get("datasets") or config.get("dataset_pairs")
+    dataset_pairs: List[Tuple[Path, Path]] = []
+    if dataset_pairs_cfg is not None:
+        if not isinstance(dataset_pairs_cfg, Sequence):
+            raise TypeError("The 'datasets' configuration must be a sequence of [images, cache] pairs.")
+        for idx, pair in enumerate(dataset_pairs_cfg):
+            if (
+                not isinstance(pair, Sequence)
+                or isinstance(pair, (str, bytes))
+                or len(pair) != 2
+            ):
+                raise ValueError(
+                    "Each dataset entry must be a two-item sequence: [images_folder, cache_folder]."
+                )
+            dataset_path, cache_path = pair
+            dataset_pairs.append(
+                (
+                    Path(dataset_path).expanduser().resolve(),
+                    Path(cache_path).expanduser().resolve(),
+                )
+            )
+    else:
+        if "dataset_root" not in config or "cache_root" not in config:
+            raise ValueError(
+                "Configuration must define either 'dataset_root' and 'cache_root', or the 'datasets' list."
+            )
+        dataset_pairs.append(
+            (
+                Path(config["dataset_root"]).expanduser().resolve(),
+                Path(config["cache_root"]).expanduser().resolve(),
+            )
+        )
+    return dataset_pairs
+
+
+def _gather_models(config: Dict[str, Any]) -> Tuple[List[Tuple[Path, Path]], Dict[str, Any], List[ModelConfig]]:
+    dataset_pairs = _parse_dataset_pairs(config)
     defaults = config.get("defaults", {})
     models = _parse_model_configs(config.get("models", {}))
-    return dataset_root, cache_root, defaults, models
+    return dataset_pairs, defaults, models
 
 
 def _normalize_cuda_device(device: DeviceSpec) -> Optional[str]:
@@ -327,7 +362,7 @@ def _encode_resolution(
 
 def run_precompute(args: argparse.Namespace) -> None:
     config = load_config([args.config])
-    dataset_root, cache_root, defaults, models = _gather_models(config)
+    dataset_pairs, defaults, models = _gather_models(config)
     num_workers = defaults.get("num_workers", 0)
     embeddings_dtype = _parse_dtype(defaults.get("embeddings_dtype"), default=torch.float32)
     store_distribution = bool(defaults.get("store_distribution", False))
@@ -347,7 +382,8 @@ def run_precompute(args: argparse.Namespace) -> None:
             print(
                 f"[Embeddings] Using CUDA visible devices: {formatted_devices}"
             )
-        cache_root.mkdir(parents=True, exist_ok=True)
+        for _, cache_root in dataset_pairs:
+            cache_root.mkdir(parents=True, exist_ok=True)
         print(
             f"[Embeddings] Starting precompute with {accelerator.num_processes} process(es) on {accelerator.device}."
         )
@@ -359,55 +395,66 @@ def run_precompute(args: argparse.Namespace) -> None:
         vae = accelerator.prepare(vae)
         encode_dtype = next(accelerator.unwrap_model(vae).parameters()).dtype
 
-        for task in model_cfg.tasks:
-            resolution_dir = dataset_root / f"{task.resolution}px"
-            if not resolution_dir.exists():
-                if accelerator.is_main_process:
-                    print(f"[Embeddings] Skipping {task.resolution}px (missing directory: {resolution_dir})")
-                continue
-            embeddings_dir = cache_root / model_cfg.cache_subdir / f"{task.resolution}px"
-            embeddings_dir.mkdir(parents=True, exist_ok=True)
-
-            images_to_process = []
-            for img_batch in tqdm(torch.utils.data.DataLoader(SimpleEmbeddingsDataset(embeddings_dir, resolution_dir),
-                                                              batch_size=task.batch_size, num_workers=num_workers)):
-                for img in img_batch:
-                    if img != "":
-                        images_to_process.append(img)
-
-            dataset = ImageFolderDataset(
-                paths=images_to_process,
-            )
-            per_device_batch_size = task.batch_size
-            dataloader = _build_dataloader(
-                dataset,
-                accelerator=accelerator,
-                batch_size=per_device_batch_size,
-                num_workers=num_workers,
-                pin_memory=torch.cuda.is_available(),
-                collate_fn=_collate_batch,
-            )
-            dataloader = accelerator.prepare(dataloader)
-
+        for dataset_root, cache_root in dataset_pairs:
             if accelerator.is_main_process:
-                global_bs = per_device_batch_size * accelerator.num_processes
                 print(
-                    f"[Embeddings] Encoding {len(dataset)} images at {task.resolution}px with per-device batch size {per_device_batch_size} (global {global_bs})."
+                    f"[Embeddings] Processing dataset '{dataset_root}' with cache '{cache_root}'."
                 )
 
-            _encode_resolution(
-                accelerator=accelerator,
-                vae=vae,
-                dataloader=dataloader,
-                dataset_dir=resolution_dir,
-                embeddings_dir=embeddings_dir,
-                resolution=task.resolution,
-                total_items=len(dataset),
-                embeddings_dtype=embeddings_dtype,
-                encode_dtype=encode_dtype,
-                store_distribution=store_distribution,
-                defaults=defaults,
-            )
+            for task in model_cfg.tasks:
+                resolution_dir = dataset_root / f"{task.resolution}px"
+                if not resolution_dir.exists():
+                    if accelerator.is_main_process:
+                        print(f"[Embeddings] Skipping {task.resolution}px (missing directory: {resolution_dir})")
+                    continue
+                embeddings_dir = cache_root / model_cfg.cache_subdir / f"{task.resolution}px"
+                embeddings_dir.mkdir(parents=True, exist_ok=True)
+
+                images_to_process: List[str] = []
+                for img_batch in tqdm(
+                    torch.utils.data.DataLoader(
+                        SimpleEmbeddingsDataset(embeddings_dir, resolution_dir),
+                        batch_size=task.batch_size,
+                        num_workers=num_workers,
+                    )
+                ):
+                    for img in img_batch:
+                        if img != "":
+                            images_to_process.append(img)
+
+                dataset = ImageFolderDataset(
+                    paths=images_to_process,
+                )
+                per_device_batch_size = task.batch_size
+                dataloader = _build_dataloader(
+                    dataset,
+                    accelerator=accelerator,
+                    batch_size=per_device_batch_size,
+                    num_workers=num_workers,
+                    pin_memory=torch.cuda.is_available(),
+                    collate_fn=_collate_batch,
+                )
+                dataloader = accelerator.prepare(dataloader)
+
+                if accelerator.is_main_process:
+                    global_bs = per_device_batch_size * accelerator.num_processes
+                    print(
+                        f"[Embeddings] Encoding {len(dataset)} images at {task.resolution}px with per-device batch size {per_device_batch_size} (global {global_bs})."
+                    )
+
+                _encode_resolution(
+                    accelerator=accelerator,
+                    vae=vae,
+                    dataloader=dataloader,
+                    dataset_dir=resolution_dir,
+                    embeddings_dir=embeddings_dir,
+                    resolution=task.resolution,
+                    total_items=len(dataset),
+                    embeddings_dtype=embeddings_dtype,
+                    encode_dtype=encode_dtype,
+                    store_distribution=store_distribution,
+                    defaults=defaults,
+                )
 
         accelerator.wait_for_everyone()
         del vae

@@ -74,12 +74,23 @@ class BaseModel():
 
     def model_ema(self, decay=0.999):
         net_g = self.get_bare_model(self.net_g)
+        net_g_ema = self.get_bare_model(self.net_g_ema)
 
         net_g_params = dict(net_g.named_parameters())
-        net_g_ema_params = dict(self.net_g_ema.named_parameters())
+        net_g_ema_params = dict(net_g_ema.named_parameters())
 
+        missing_keys = []
         for k in net_g_ema_params.keys():
+            if k not in net_g_params:
+                missing_keys.append(k)
+                continue
             net_g_ema_params[k].data.mul_(decay).add_(net_g_params[k].data, alpha=1 - decay)
+
+        if missing_keys:
+            logger = get_root_logger()
+            logger.warning(
+                'EMA skipped %d parameter(s) missing in net_g: %s',
+                len(missing_keys), ', '.join(missing_keys))
 
     def get_current_log(self):
         return self.log_dict
@@ -136,8 +147,15 @@ class BaseModel():
         """Get bare model, especially under wrapping with
         DistributedDataParallel or DataParallel.
         """
-        if isinstance(net, (DataParallel, DistributedDataParallel)):
-            net = net.module
+        while True:
+            if isinstance(net, (DataParallel, DistributedDataParallel)):
+                net = net.module
+                continue
+            # torch.compile wraps modules in torch._dynamo.eval_frame.OptimizedModule
+            if hasattr(net, '_orig_mod'):
+                net = net._orig_mod
+                continue
+            break
         return net
 
     @master_only
